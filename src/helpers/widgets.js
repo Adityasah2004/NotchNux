@@ -61,6 +61,19 @@ function setSource(cr, rgb, a = 1) {
     cr.setSourceRGBA(rgb[0], rgb[1], rgb[2], rgb.length > 3 ? rgb[3] : a);
 }
 
+// Trace a rounded-corner rectangle sub-path (caller fills/strokes). Cairo has
+// no primitive for this, so stitch four corner arcs. Radius is clamped so it
+// can never exceed half the shorter side.
+function roundRectPath(cr, x, y, w, h, radius) {
+    let r = Math.min(radius, w / 2, h / 2);
+    cr.newSubPath();
+    cr.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+    cr.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+    cr.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+    cr.arc(x + r, y + r, r, Math.PI, 1.5 * Math.PI);
+    cr.closePath();
+}
+
 // ============================================================
 // Spinning vinyl record
 // ============================================================
@@ -344,24 +357,51 @@ class AnalogClock extends St.DrawingArea {
         let cr = this.get_context();
         let s = this._size;
         let c = s / 2;
-        let r = c - 3;
 
-        // Flat minimal face: a single soft disc, no rim clutter. The tint is
-        // barely there so the numerals and hands carry the design.
+        // --- Rounded-corner dark square: the clock's outer body. ---
+        // Inset a hair so the corners' antialiasing isn't clipped by the actor
+        // bounds, and use a generous corner radius for the "squircle" feel.
+        const pad = 2;
+        const sq = s - pad * 2;
+        roundRectPath(cr, pad, pad, sq, sq, sq * 0.24);
+        setSource(cr, FACE);                 // #131317 dark body
+        cr.fillPreserve();
+        // Faint rim so the square reads against the (also dark) panel.
+        cr.setLineWidth(1);
+        setSource(cr, [1, 1, 1, 0.06]);
+        cr.stroke();
+
+        // --- Contrasting light circle face inside the square. ---
+        const r = sq / 2 - Math.max(3, sq * 0.05);   // circle radius
+        const FACE_LIGHT = [0.925, 0.933, 0.949];    // near-white dial face
         cr.arc(c, c, r, 0, 2 * Math.PI);
-        setSource(cr, [1, 1, 1, 0.03]);
+        setSource(cr, FACE_LIGHT);
         cr.fill();
 
-        // Cardinal numerals only — 12 / 3 / 6 / 9 — set just inside the rim.
-        // Cairo's toy text API (selectFontFace/showText) renders nothing on
-        // St's DrawingArea context, so lay the glyphs out with PangoCairo,
-        // which does draw reliably in the Shell.
-        let fontSize = Math.round(s * 0.13);
+        // --- Hour ticks: a short line at every hour around the rim. ---
+        cr.setLineCap(Cairo.LineCap.ROUND);
+        const tickOuter = r - r * 0.06;
+        for (let i = 0; i < 12; i++) {
+            let a = i * Math.PI / 6 - Math.PI / 2;
+            // Cardinals get a longer, bolder tick; the rest are short hairlines.
+            let cardinal = i % 3 === 0;
+            let inner = tickOuter - (cardinal ? r * 0.16 : r * 0.09);
+            cr.setLineWidth(cardinal ? 2 : 1);
+            setSource(cr, cardinal ? [0.08, 0.08, 0.10, 0.85] : [0.08, 0.08, 0.10, 0.35]);
+            cr.moveTo(c + Math.cos(a) * inner, c + Math.sin(a) * inner);
+            cr.lineTo(c + Math.cos(a) * tickOuter, c + Math.sin(a) * tickOuter);
+            cr.stroke();
+        }
+
+        // --- Cardinal numerals — 12 / 3 / 6 / 9 — dark on the light face. ---
+        // Cairo's toy text API renders nothing on St's DrawingArea context, so
+        // lay the glyphs out with PangoCairo, which does draw in the Shell.
+        let fontSize = Math.round(s * 0.12);
         let layout = PangoCairo.create_layout(cr);
         let desc = Pango.FontDescription.from_string(`Sans Bold ${fontSize}px`);
         layout.set_font_description(desc);
-        setSource(cr, [1, 1, 1, 0.85]);
-        const numR = r - fontSize;   // radius the numerals sit on
+        setSource(cr, [0.08, 0.08, 0.10, 0.92]);
+        const numR = r - fontSize * 0.95;   // radius the numerals sit on
         const nums = [
             { n: '12', a: -Math.PI / 2 },
             { n: '3',  a: 0 },
@@ -383,7 +423,8 @@ class AnalogClock extends St.DrawingArea {
         let hours = d.getHours() % 12;
         let mins = d.getMinutes();
         let secs = d.getSeconds();
-        // Thin, round-capped hands with a short back-tail for balance.
+        // Thin, round-capped hands with a short back-tail for balance. On the
+        // light face the hour/minute hands are near-black; second stays accent.
         cr.setLineCap(Cairo.LineCap.ROUND);
         let hand = (angleFrac, len, width, rgb) => {
             let a = angleFrac * 2 * Math.PI - Math.PI / 2;
@@ -393,17 +434,16 @@ class AnalogClock extends St.DrawingArea {
             cr.lineTo(c + Math.cos(a) * len, c + Math.sin(a) * len);
             cr.stroke();
         };
-        // Hour, minute (soft white), second (accent, thinnest).
-        hand((hours + mins / 60) / 12, r * 0.48, 3, [0.949, 0.949, 0.957]);
-        hand((mins + secs / 60) / 60, r * 0.68, 2, [0.949, 0.949, 0.957]);
-        hand(secs / 60, r * 0.74, 1, ACCENT);
+        hand((hours + mins / 60) / 12, r * 0.48, 3.5, [0.10, 0.10, 0.13]);
+        hand((mins + secs / 60) / 60, r * 0.70, 2.5, [0.10, 0.10, 0.13]);
+        hand(secs / 60, r * 0.76, 1, ACCENT);
 
-        // Hub: accent dot ringed by the face colour for a floating look.
+        // Hub: accent dot ringed by the dark hand colour for a pinned look.
         cr.arc(c, c, 3.5, 0, 2 * Math.PI);
         setSource(cr, ACCENT);
         cr.fill();
         cr.arc(c, c, 1.4, 0, 2 * Math.PI);
-        setSource(cr, [0.075, 0.075, 0.094]);
+        setSource(cr, [0.10, 0.10, 0.13]);
         cr.fill();
 
         cr.$dispose();

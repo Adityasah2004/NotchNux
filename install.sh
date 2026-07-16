@@ -68,6 +68,7 @@ install_files() {
 
     install -Dm644 "$SRC_DIR/metadata.json"  "$DEST_DIR/metadata.json"
     install -Dm644 "$SRC_DIR/extension.js"   "$DEST_DIR/extension.js"
+    install -Dm644 "$SRC_DIR/prefs.js"       "$DEST_DIR/prefs.js"
     install -Dm644 "$SRC_DIR/stylesheet.css" "$DEST_DIR/stylesheet.css"
     cp -r "$SRC_DIR/src" "$DEST_DIR/"
 

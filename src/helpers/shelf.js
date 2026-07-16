@@ -183,6 +183,42 @@ export class ShelfHelper {
         }
     }
 
+    // Pull whatever file(s) are on the Wayland clipboard (e.g. a Ctrl+C'd file
+    // in Nautilus, which is advertised as text/uri-list) and add them to the
+    // shelf. This is our stand-in for external drag-and-drop, which Wayland
+    // won't route into a shell extension's own actors. Async because we shell
+    // out to wl-paste and read its output. `callback(addedCount)` runs on the
+    // main loop; addedCount is -1 if wl-paste isn't available.
+    pasteFilesFromClipboard(callback) {
+        let done = (n) => { if (callback) callback(n); };
+        let launcher = new Gio.SubprocessLauncher({
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+        });
+        let proc;
+        try {
+            proc = launcher.spawnv(['wl-paste', '--no-newline', '--type', 'text/uri-list']);
+        } catch (e) {
+            console.error('NotchNux: wl-paste not available for clipboard paste', e);
+            done(-1);
+            return;
+        }
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            let added = 0;
+            try {
+                let [, stdout] = p.communicate_utf8_finish(res);
+                // A uri-list is CRLF-separated URIs; comment lines start with '#'.
+                let uris = (stdout || '').split(/\r?\n/)
+                    .map(s => s.trim())
+                    .filter(s => s.length > 0 && !s.startsWith('#'));
+                for (let uri of uris)
+                    if (uri.startsWith('file://') && this.addFile(uri)) added++;
+            } catch (e) {
+                console.error('NotchNux: Failed to read clipboard files', e);
+            }
+            done(added);
+        });
+    }
+
     // Open the desktop portal's file chooser and add every selected file to
     // the shelf. Async: `callback(addedCount)` runs on the main loop once the
     // dialog closes. Uses org.freedesktop.portal.FileChooser directly so we
@@ -275,6 +311,113 @@ export class ShelfHelper {
             );
         } catch (e) {
             console.error('NotchNux: Error saving notes file', e);
+        }
+    }
+
+    // --- Quick Share via GSConnect (the Linux "nearby share") ---
+    // GSConnect exposes each paired device on the session bus as a GApplication
+    // whose object path is .../Device/<id>. Device metadata lives on the
+    // ...GSConnect.Device interface; file sending is the `shareFile` GAction
+    // (param (sb) = path/uri + "open on device" bool) invoked through
+    // org.gtk.Actions.Activate. We talk to it directly so we don't depend on
+    // GSConnect's JS internals.
+    static GSC_NAME = 'org.gnome.Shell.Extensions.GSConnect';
+    static GSC_BASE = '/org/gnome/Shell/Extensions/GSConnect';
+
+    // Return the currently reachable devices as [{ id, name, path, type }].
+    // Only connected AND paired devices can actually receive a file, so we
+    // filter to those. Synchronous D-Bus calls (the dashboard renders on the
+    // main loop and this is a couple of cheap local calls).
+    getShareDevices() {
+        let out = [];
+        let bus = Gio.DBus.session;
+        try {
+            // ObjectManager gives us every exported object in one call.
+            let reply = bus.call_sync(
+                ShelfHelper.GSC_NAME,
+                ShelfHelper.GSC_BASE,
+                'org.freedesktop.DBus.ObjectManager',
+                'GetManagedObjects',
+                null,
+                new GLib.VariantType('(a{oa{sa{sv}}})'),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+            let [objects] = reply.deepUnpack();
+            for (let path in objects) {
+                let ifaces = objects[path];
+                let dev = ifaces['org.gnome.Shell.Extensions.GSConnect.Device'];
+                if (!dev) continue;
+                let connected = dev['Connected'] ? dev['Connected'].deepUnpack() : false;
+                let paired = dev['Paired'] ? dev['Paired'].deepUnpack() : false;
+                if (!connected || !paired) continue;
+                out.push({
+                    id: dev['Id'] ? dev['Id'].deepUnpack() : path,
+                    name: dev['Name'] ? dev['Name'].deepUnpack() : 'Device',
+                    type: dev['Type'] ? dev['Type'].deepUnpack() : 'phone',
+                    path: path,
+                });
+            }
+        } catch (e) {
+            // GSConnect not installed / not running — no devices, no error UI.
+            if (!`${e}`.includes('ServiceUnknown') && !`${e}`.includes('NameHasNoOwner'))
+                console.error('NotchNux: Failed to list GSConnect devices', e);
+        }
+        return out;
+    }
+
+    // True when GSConnect is on the bus at all (so we can decide whether to
+    // show the "install GSConnect" hint vs. a "no devices connected" hint).
+    isShareServiceAvailable() {
+        try {
+            let bus = Gio.DBus.session;
+            let reply = bus.call_sync(
+                'org.freedesktop.DBus',
+                '/org/freedesktop/DBus',
+                'org.freedesktop.DBus',
+                'NameHasOwner',
+                new GLib.Variant('(s)', [ShelfHelper.GSC_NAME]),
+                new GLib.VariantType('(b)'),
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null
+            );
+            return reply.deepUnpack()[0];
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Send a shelf file to the given device path via GSConnect's shareFile
+    // action. Fire-and-forget: GSConnect handles the transfer and its own
+    // progress notification. Returns true if the call was dispatched.
+    sendFileToDevice(devicePath, filePath) {
+        try {
+            let uri = Gio.File.new_for_path(filePath).get_uri();
+            // shareFile param is (sb): (uri, openOnDevice). Wrapped as the
+            // single tuple GVariant that org.gtk.Actions.Activate expects in
+            // its parameter array.
+            let param = new GLib.Variant('(sb)', [uri, false]);
+            Gio.DBus.session.call(
+                ShelfHelper.GSC_NAME,
+                devicePath,
+                'org.gtk.Actions',
+                'Activate',
+                new GLib.Variant('(sava{sv})', ['shareFile', [param], {}]),
+                null,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                null,
+                (src, res) => {
+                    try { src.call_finish(res); }
+                    catch (e) { console.error('NotchNux: shareFile dispatch failed', e); }
+                }
+            );
+            return true;
+        } catch (e) {
+            console.error(`NotchNux: Failed to send ${filePath} to ${devicePath}`, e);
+            return false;
         }
     }
 

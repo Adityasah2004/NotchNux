@@ -75,6 +75,18 @@ export class ConfigStore {
         this._data = this._load();
     }
 
+    // Absolute path of the backing JSON file. The shell watches this so edits
+    // made by the separate prefs.js process get applied live.
+    get path() {
+        return this._path;
+    }
+
+    // Re-read the file from disk, discarding the in-memory copy. Called by the
+    // shell when its file monitor sees prefs.js has written new settings.
+    reload() {
+        this._data = this._load();
+    }
+
     _defaults() {
         let tabs = {};
         for (let t of TAB_DEFS)
