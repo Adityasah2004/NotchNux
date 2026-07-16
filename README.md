@@ -46,28 +46,28 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 <div align="center">
 
 **Music** — vinyl art, scrubber, shuffle/repeat and a volume dial
-![Studio dashboard](assets/studio.png)
+![Music dashboard](assets/music.png)
 
 **Weather** — analog clock, current conditions and details
-![Alerts dashboard](assets/alerts.png)
-
-**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
-![Calendar dashboard](assets/calendar.png)
-
-**Calendar** — a scrollable day strip with your GNOME Online Accounts events
-![Tray dashboard](assets/tray.png)
-
-**Alerts** — grouped notification history with a live unread count
 ![Weather dashboard](assets/weather.png)
 
+**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
+![Tray dashboard](assets/tray.png)
+
+**Calendar** — a scrollable day strip with your GNOME Online Accounts events
+![Calendar dashboard](assets/calendar.png)
+
+**Alerts** — grouped notification history with a live unread count
+![Alerts dashboard](assets/alerts.png)
+
 **Shelf** — a click-to-browse / paste-a-file zone with Quick Share to paired devices
-![Notification peek](assets/peek-screenshot.png)
+![Shelf dashboard](assets/shelf.png)
 
 **Studio** — live webcam preview plus camera & audio recording
-![Music dashboard](assets/music.png) 
+![Studio dashboard](assets/studio.png)
 
 **Notification peek** — the pill smoothly expands into a banner with actions
-![Shelf dashboard](assets/shelf.png)
+![Notification peek](assets/peek-screenshot.png)
 
 **Preferences** — a native GTK/libadwaita settings window for accent, tabs and features
 ![Preferences window](assets/preferences.png)
