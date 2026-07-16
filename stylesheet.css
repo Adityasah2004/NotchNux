@@ -1,0 +1,1652 @@
+/* NotchNux — "Nook" dashboard
+ *
+ * A dark glass panel that hangs off the top edge of the screen: flat top,
+ * curved bottom corners, a bright hairline rim that reads like the light
+ * frame in the concept. One focused panel per tab, blue (#7aa2ff) accent.
+ *
+ * NOTE: St's CSS is a restricted subset (no conic gradients, no CSS
+ * animation, no custom properties). The vinyl disc, volume knob, radial
+ * meters and analog clock are therefore drawn in Cairo (see helpers/widgets.js);
+ * this file styles only the flat chrome around them.
+ */
+
+/* ---------- The hanging glass panel ---------- */
+.notchnux-island {
+    background-color: #0d0d10;
+    /* Flat top (flush with the screen edge), curved bottom corners only. */
+    border-radius: 0px 0px 22px 22px;
+    /* A single hairline rim defines the edge; a soft, low shadow just lifts it
+     * off the panel. Kept intentionally minimal — no heavy drop cloud. */
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-top: 1px solid rgba(255, 255, 255, 0.10);
+    padding: 0px 16px;
+    box-shadow: 0px 6px 18px rgba(0, 0, 0, 0.28);
+    color: #f4f4f6;
+    font-size: 13px;
+    transition: border-radius 300ms ease-out, box-shadow 300ms ease-out, padding 300ms ease-out;
+}
+
+.notchnux-island-expanded {
+    border-radius: 0px 0px 28px 28px;
+    padding: 16px 20px 20px 20px;
+    /* Slightly deeper when open, but still restrained. */
+    box-shadow: 0px 10px 28px rgba(0, 0, 0, 0.35);
+}
+
+/* Transient notification-peek: between the pill and the full dashboard in
+ * size. Rounder and a touch more padded than the pill so the banner reads as
+ * a card, but nowhere near as open as the dashboard. */
+.notchnux-island-peek {
+    border-radius: 0px 0px 24px 24px;
+    padding: 10px 16px 12px 16px;
+    box-shadow: 0px 8px 22px rgba(0, 0, 0, 0.32);
+}
+
+/* ---------- Notification peek banner ---------- */
+.nook-notif-peek {
+    background-color: transparent;
+    padding: 0;
+    spacing: 8px;
+}
+.nook-notif-peek-main {
+    background-color: transparent;
+    border: none;
+    padding: 0;
+}
+.nook-notif-peek-main:hover {
+    background-color: transparent;
+}
+.nook-notif-peek-row {
+    spacing: 12px;
+    padding: 2px 2px;
+}
+.nook-notif-peek-actions {
+    spacing: 8px;
+    padding: 0 2px;
+}
+.nook-notif-peek-action {
+    padding: 7px 12px;
+    border-radius: 9px;
+    font-size: 12px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.92);
+    background-color: rgba(255, 255, 255, 0.09);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    transition: background-color 120ms ease-out;
+}
+.nook-notif-peek-action:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+.nook-notif-peek-action:active {
+    background-color: rgba(255, 255, 255, 0.22);
+}
+.nook-notif-peek-iconbin {
+    width: 40px;
+    height: 40px;
+    border-radius: 11px;
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.nook-notif-peek-iconbin StIcon {
+    color: rgba(255, 255, 255, 0.9);
+}
+.nook-notif-peek-text {
+    spacing: 2px;
+}
+.nook-notif-peek-title {
+    font-weight: bold;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.95);
+}
+.nook-notif-peek-body {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.62);
+}
+
+/* ---------- Collapsed pill ---------- */
+.notchnux-pill-content {
+    background-color: transparent;
+    spacing: 9px;
+    padding: 0 4px;
+}
+
+/* When the island is expanded the pill stays pinned as a top strip above the
+ * dashboard. Give it a little breathing room below so it reads as its own row
+ * rather than crowding the tab bar. */
+.notchnux-island-expanded .notchnux-pill-content {
+    margin-bottom: 14px;
+}
+
+/* Same idea in the transient notification peek: pill stays on top, banner
+ * below it, with a touch of separation. */
+.notchnux-island-peek .notchnux-pill-content {
+    margin-bottom: 10px;
+}
+
+.notchnux-pill-icon {
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.notchnux-pill-clock {
+    font-weight: bold;
+    font-size: 13px;
+    letter-spacing: 0.3px;
+    color: rgba(255, 255, 255, 0.92);
+}
+
+/* ---- Pill: mic / camera privacy indicators (grouped, far right) ---- */
+/* Default (idle) is white; state modifiers recolour. */
+.notchnux-pill-priv-box {
+    spacing: 5px;
+    padding-left: 6px;
+}
+.notchnux-pill-priv {
+    color: rgba(255, 255, 255, 0.85);
+}
+.notchnux-pill-priv.priv-green {
+    color: #57d977;
+}
+.notchnux-pill-priv.priv-red {
+    color: #ff6b5e;
+}
+
+/* ---- Pill: left music zone (eq bars + scrolling title + play/pause) ---- */
+.notchnux-pill-music {
+    spacing: 7px;
+}
+
+.notchnux-pill-title-clip {
+    width: 96px;
+    height: 16px;
+}
+
+.notchnux-pill-title {
+    font-size: 12px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* ---- Pill: right battery zone ---- */
+.notchnux-pill-battery {
+    spacing: 4px;
+}
+
+.notchnux-pill-battery-pct {
+    font-size: 12px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.88);
+}
+
+/* ---------- Dashboard shell ---------- */
+.notchnux-dashboard-content {
+    background-color: transparent;
+}
+
+/* ---------- Tab bar: a grouped pill container ---------- */
+.notchnux-dashboard-header-wrap {
+    spacing: 10px;
+    margin-bottom: 18px;
+}
+
+/* Horizontal fade on the scrollable tab carousel: content dissolves toward the
+ * edges when there are more tabs than fit, hinting that the strip scrolls. The
+ * fade only appears on the side(s) with off-screen content. */
+.notchnux-dashboard-header {
+    -st-hfade-offset: 28px;
+}
+
+.notchnux-tab-strip {
+    spacing: 2px;
+    padding: 3px;
+    background-color: rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+}
+
+.notchnux-tab-btn {
+    padding: 6px 13px;
+    border-radius: 9px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 12.5px;
+    font-weight: bold;
+    background-color: transparent;
+    border: 1px solid transparent;
+    transition: all 160ms ease-out;
+}
+
+.notchnux-tab-btn:hover {
+    color: rgba(255, 255, 255, 0.85);
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.notchnux-tab-btn-active {
+    color: #eaf0ff;
+    background-color: rgba(122, 162, 255, 0.18);
+    border: 1px solid rgba(122, 162, 255, 0.4);
+}
+
+.notchnux-tab-icon {
+    margin-right: 6px;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.notchnux-tab-btn-active .notchnux-tab-icon {
+    color: #a7bfff;
+}
+
+/* Live count pill beside the Alerts tab label — hidden when the count is 0. */
+.notchnux-tab-count {
+    margin-left: 6px;
+    padding: 0px 6px;
+    border-radius: 9px;
+    background-color: #7aa2ff;
+    color: #0d0d10;
+    font-size: 10px;
+    font-weight: bold;
+}
+
+.notchnux-tab-btn-active .notchnux-tab-count {
+    background-color: #eaf0ff;
+}
+
+.notchnux-settings-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.65);
+    transition: all 150ms ease-out;
+}
+
+.notchnux-settings-btn:hover,
+.notchnux-settings-btn-active {
+    color: #eaf0ff;
+    background-color: rgba(122, 162, 255, 0.18);
+    border: 1px solid rgba(122, 162, 255, 0.34);
+}
+
+/* ---------- Generic panel wrapper ---------- */
+.notchnux-panel {
+    spacing: 16px;
+    x-expand: true;
+    y-expand: true;
+}
+
+/* ============================================================
+ * NOOK — media player
+ * ============================================================ */
+.nook-media-body {
+    spacing: 20px;
+}
+
+.nook-media-mid {
+    spacing: 2px;
+}
+
+.nook-vinyl-art-frame {
+    width: 52px;
+    height: 52px;
+    border-radius: 26px;
+    background-color: rgba(12, 12, 16, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 0 0 2px rgba(19, 19, 23, 0.9);
+}
+
+.nook-vinyl-art {
+    width: 52px;
+    height: 52px;
+    border-radius: 26px;
+}
+
+.nook-eyebrow-row {
+    spacing: 10px;
+    margin-bottom: 2px;
+}
+
+.nook-eyebrow {
+    font-size: 10px;
+    font-weight: bold;
+    color: #7aa2ff;
+    /* letter-spacing approximates the concept's tracked caps */
+    letter-spacing: 1.5px;
+}
+
+.nook-eq {
+    spacing: 2px;
+    height: 12px;
+    width: 22px;
+}
+
+.nook-eq-bar {
+    width: 3px;
+    height: 12px;
+    background-color: #7aa2ff;
+    border-radius: 2px;
+}
+
+.nook-track-title {
+    font-size: 19px;
+    font-weight: bold;
+    color: #f4f4f6;
+    margin-top: 3px;
+}
+
+.nook-track-artist {
+    font-size: 12.5px;
+    color: rgba(255, 255, 255, 0.55);
+    margin-top: 1px;
+}
+
+.nook-transport {
+    spacing: 12px;
+    margin-top: 14px;
+}
+
+.nook-transport-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    color: rgba(255, 255, 255, 0.75);
+    background-color: transparent;
+    transition: all 150ms ease-out;
+}
+
+.nook-transport-btn:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.nook-transport-primary {
+    width: 42px;
+    height: 42px;
+    color: #0d0d10;
+    background-color: #7aa2ff;
+    box-shadow: 0px 2px 8px rgba(122, 162, 255, 0.28);
+}
+
+.nook-transport-primary:hover {
+    background-color: #a7bfff;
+    color: #0d0d10;
+}
+
+/* Volume knob column */
+.nook-knob-col {
+    spacing: 7px;
+}
+
+.nook-knob-btn {
+    background-color: transparent;
+    border-radius: 999px;
+}
+
+.nook-knob-num {
+    font-size: 16px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-scroll-hint {
+    spacing: 3px;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 9px;
+    font-weight: bold;
+    letter-spacing: 1px;
+}
+
+/* Media timeline scrubber (full width, below controls + knob) */
+.nook-timeline {
+    spacing: 5px;
+    margin-top: 2px;
+    padding: 0 4px;
+}
+
+.nook-timeline-track {
+    padding: 6px 0;
+    border-radius: 999px;
+    background-color: transparent;
+}
+
+.nook-timeline-base {
+    height: 5px;
+    min-height: 5px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.14);
+}
+
+.nook-timeline-fill {
+    height: 5px;
+    min-height: 5px;
+    border-radius: 999px;
+    /* background-color is set inline to the current accent */
+}
+
+.nook-timeline-labels {
+    padding: 0 2px;
+}
+
+.nook-timeline-elapsed,
+.nook-timeline-total {
+    font-size: 10px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.5);
+    font-feature-settings: "tnum";
+}
+
+/* ============================================================
+ * TRAY — system meters, devices, toggles
+ * ============================================================ */
+.nook-meters-row {
+    spacing: 5px;
+}
+
+.nook-meter-tile {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    padding: 12px 4px;
+    spacing: 8px;
+}
+
+/* Network tiles (DOWN / UP): each shows a rate split value+unit in the ring,
+ * same footprint as the other meter tiles. */
+.nook-meter-tile-net {
+    padding: 12px 4px;
+}
+
+/* Down/up rates stacked below the NET ring — roomy, left-aligned arrows so
+ * they read as a clean two-line readout instead of crammed ring text. */
+.nook-meter-subrates {
+    spacing: 3px;
+    margin-top: 2px;
+}
+.nook-meter-subrate {
+    font-size: 10.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.75);
+    text-align: center;
+}
+
+.nook-meter-num {
+    font-size: 13px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+/* Compact readout for tiles whose value is a longer string (e.g. "1.2 MB/s"
+ * or the two-line ↓/↑ network rates). */
+.nook-meter-num-sm {
+    font-size: 9px;
+    text-align: center;
+}
+
+/* NET ring center now holds just the down rate split as value + unit (two
+ * short tokens), so it can be larger and clearer than the old crammed pair. */
+.nook-meter-rates {
+    spacing: 1px;
+}
+.nook-meter-rates .nook-meter-num-sm {
+    font-size: 11px;
+    line-height: 1.1;
+}
+
+/* Interactive meter tile (brightness) — reactive so scroll adjusts it. */
+.nook-meter-knob-btn {
+    background-color: transparent;
+    border-radius: 999px;
+    padding: 0;
+    transition: background-color 150ms ease-out;
+}
+
+.nook-meter-knob-btn:hover {
+    background-color: rgba(232, 176, 106, 0.10);
+}
+
+.nook-meter-label-row {
+    spacing: 4px;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 10.5px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+}
+
+.nook-tray-lower {
+    spacing: 12px;
+}
+
+/* Devices card */
+.nook-devices-card {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    padding: 12px 14px;
+    spacing: 11px;
+    /* No fixed width: the card flexes (x_expand) to fill the space left by the
+     * fixed-width toggle grid, so the lower row never overruns the panel. */
+    min-width: 240px;
+}
+
+.nook-card-eyebrow {
+    font-size: 10px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.4);
+    letter-spacing: 1.5px;
+    margin-bottom: 2px;
+}
+
+.nook-device-row {
+    spacing: 9px;
+}
+
+/* Paired Bluetooth rows are buttons: give them a padded, hover-highlighted
+ * pill so it reads as tappable to connect/disconnect. */
+.nook-device-row-btn {
+    padding: 3px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background-color 150ms ease-out;
+}
+.nook-device-row-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.nook-device-icon {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.nook-device-name {
+    font-size: 12.5px;
+    color: #eaeaee;
+}
+
+.nook-batt-track {
+    width: 44px;
+    height: 6px;
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.14);
+    spacing: 0px;
+}
+
+.nook-batt-fill {
+    height: 6px;
+    border-radius: 4px;
+    background-color: #7aa2ff;
+}
+
+.nook-batt-low {
+    background-color: #e8b06a;
+}
+
+.nook-device-pct {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.55);
+    width: 32px;
+    text-align: right;
+}
+
+/* Quick-toggle grid */
+.nook-toggle-grid {
+    spacing: 8px;
+}
+
+.nook-toggle {
+    width: 96px;
+    height: 62px;
+    padding: 10px 12px;
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    color: rgba(255, 255, 255, 0.7);
+    transition: all 150ms ease-out;
+}
+
+.nook-toggle:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+}
+
+.nook-toggle-on {
+    background-color: rgba(122, 162, 255, 0.16);
+    border: 1px solid rgba(122, 162, 255, 0.4);
+    color: #eaf0ff;
+}
+
+.nook-toggle-icon {
+    color: rgba(255, 255, 255, 0.45);
+    margin-bottom: 4px;
+}
+
+/* ---- Airplane-mode cross cluster ---- */
+.nook-cluster {
+    /* size is set inline; this just centers the group in the lower row */
+}
+
+/* Arms share .nook-toggle look but size/position come from code. Shaped like
+ * flower petals radiating from the center circle: the two center-facing corners
+ * curve deeply (large radius) to cradle the circle, while the outer corners
+ * stay generously rounded so each arm reads as a soft teardrop/petal. */
+.nook-arm {
+    padding: 8px 6px;
+}
+
+.nook-arm-top {
+    border-radius: 28px 28px 48px 48px;
+}
+.nook-arm-bottom {
+    border-radius: 48px 48px 28px 28px;
+}
+.nook-arm-left {
+    border-radius: 28px 48px 48px 28px;
+}
+.nook-arm-right {
+    border-radius: 48px 28px 28px 48px;
+}
+
+/* Central circular airplane toggle. */
+.nook-air-btn {
+    border-radius: 999px;
+    background-color: rgba(20, 22, 30, 0.96);
+    border: 2px solid rgba(255, 255, 255, 0.10);
+    color: rgba(255, 255, 255, 0.7);
+    transition: all 150ms ease-out;
+}
+.nook-air-btn:hover {
+    background-color: rgba(30, 33, 44, 0.98);
+    border: 2px solid rgba(255, 255, 255, 0.18);
+}
+.nook-air-on {
+    background-color: rgba(122, 162, 255, 0.22);
+    border: 2px solid rgba(122, 162, 255, 0.55);
+    color: #eaf0ff;
+}
+.nook-air-icon {
+    color: rgba(255, 255, 255, 0.6);
+}
+.nook-air-on .nook-air-icon {
+    color: #bcd0ff;
+}
+.nook-air-sub {
+    font-size: 9px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 2px;
+}
+.nook-air-on .nook-air-sub {
+    color: #a7bfff;
+}
+
+.nook-toggle-on .nook-toggle-icon {
+    color: #a7bfff;
+}
+
+.nook-toggle-name {
+    font-size: 11.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.85);
+    text-align: center;
+}
+
+.nook-toggle-sub {
+    font-size: 9.5px;
+    color: rgba(255, 255, 255, 0.45);
+    text-align: center;
+}
+
+/* ============================================================
+ * WEATHER — analog clock, conditions, hourly
+ * ============================================================ */
+.nook-weather-top {
+    spacing: 16px;
+}
+
+.nook-clock-col {
+    spacing: 6px;
+    width: 138px;
+    padding: 6px 0px;
+}
+
+.nook-clock-digital {
+    font-size: 19px;
+    font-weight: bold;
+    color: #f4f4f6;
+    text-align: center;
+}
+
+.nook-clock-date {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+    text-align: center;
+}
+
+.nook-cond-col {
+    spacing: 5px;
+}
+
+.nook-loc-row {
+    spacing: 7px;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 12px;
+}
+
+.nook-weather-icon-btn {
+    width: 24px;
+    height: 24px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.65);
+    transition: all 150ms ease-out;
+}
+
+.nook-weather-icon-btn:hover {
+    background-color: rgba(122, 162, 255, 0.18);
+    color: #eaf0ff;
+}
+
+.nook-temp-row {
+    spacing: 6px;
+}
+
+.nook-temp {
+    font-size: 43px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-cond-icon {
+    color: #a7bfff;
+}
+
+.nook-cond-text {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.7);
+    margin-top: 2px;
+}
+
+.nook-cond-hl {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.5);
+    margin-top: 0px;
+    margin-bottom: 6px;
+}
+
+.nook-wx-grid {
+    spacing: 7px;
+}
+
+.nook-wx-stat {
+    spacing: 7px;
+    width: 138px;
+    padding: 7px 9px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.nook-wx-icon {
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.nook-wx-label {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.nook-wx-value {
+    font-size: 12px;
+    font-weight: bold;
+    color: #eaeaee;
+}
+
+/* ============================================================
+ * STUDIO — webcam preview, device pickers, recording
+ * ============================================================ */
+.nook-studio-panel {
+    padding: 6px;
+}
+.nook-studio-row {
+    spacing: 12px;
+}
+.nook-studio-col {
+    spacing: 8px;
+}
+
+/* The two big rounded squares: live camera + audio recorder. */
+.nook-cam-view,
+.nook-studio-audio {
+    border-radius: 18px;
+    background-color: rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.nook-cam-placeholder,
+.nook-studio-audio-icon {
+    color: rgba(255, 255, 255, 0.30);
+}
+
+/* Middle column of device drop-downs. */
+.nook-studio-mid {
+    spacing: 10px;
+    min-width: 120px;
+}
+.nook-studio-picker {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 7px 9px;
+    color: rgba(255, 255, 255, 0.85);
+    transition: background-color 150ms ease-out;
+}
+.nook-studio-picker:hover {
+    background-color: rgba(255, 255, 255, 0.10);
+}
+.nook-studio-picker-icon {
+    color: rgba(255, 255, 255, 0.55);
+    margin-right: 6px;
+}
+.nook-studio-picker-label {
+    font-size: 11px;
+    font-weight: bold;
+    max-width: 96px;
+}
+.nook-studio-picker-caret {
+    color: rgba(255, 255, 255, 0.40);
+    margin-left: 4px;
+}
+
+/* Record buttons under each square. */
+.nook-studio-rec {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 999px;
+    padding: 5px 14px;
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 11px;
+    font-weight: bold;
+    transition: all 150ms ease-out;
+}
+.nook-studio-rec:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+.nook-studio-rec-on {
+    background-color: rgba(232, 74, 74, 0.20);
+    border: 1px solid rgba(232, 74, 74, 0.55);
+    color: #ffd9d9;
+}
+.nook-studio-rec-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background-color: #e84a4a;
+    margin-right: 7px;
+}
+.nook-studio-error {
+    padding: 20px;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 11px;
+}
+
+/* Scrollable calendar agenda */
+.nook-calendar-panel {
+    spacing: 9px;
+}
+
+.nook-calendar-summary {
+    spacing: 12px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.nook-calendar-summary-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    color: #eaf0ff;
+    background-color: rgba(122, 162, 255, 0.18);
+    border: 1px solid rgba(122, 162, 255, 0.28);
+}
+
+.nook-calendar-summary-day {
+    font-size: 17px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-calendar-summary-date {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.55);
+    margin-top: 2px;
+}
+
+.nook-date-strip {
+    padding: 0px 2px 4px 2px;
+    height: 58px;
+}
+
+.nook-date-strip-row {
+    spacing: 7px;
+}
+
+.nook-date-pill {
+    width: 48px;
+    height: 54px;
+    padding: 5px 0px 4px 0px;
+    border-radius: 9px;
+    color: rgba(255, 255, 255, 0.52);
+    background-color: transparent;
+    border: 1px solid transparent;
+    transition: all 150ms ease-out;
+}
+
+.nook-date-pill:hover {
+    color: rgba(255, 255, 255, 0.85);
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+.nook-date-pill-active {
+    width: 58px;
+    color: #eaf0ff;
+    background-color: transparent;
+    border: 1px solid transparent;
+}
+
+.nook-date-pill-near {
+    width: 42px;
+}
+
+.nook-date-pill-far {
+    width: 34px;
+    color: rgba(255, 255, 255, 0.32);
+}
+
+.nook-date-pill-today {
+    width: 58px;
+    color: #92d6ff;
+}
+
+.nook-date-weekday {
+    font-size: 9px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.nook-date-number {
+    font-size: 17px;
+    font-weight: bold;
+    color: #f4f4f6;
+    margin-top: 1px;
+}
+
+.nook-date-pill-active .nook-date-number {
+    font-size: 24px;
+}
+
+.nook-date-pill-today .nook-date-number {
+    font-size: 23px;
+    color: #92d6ff;
+}
+
+.nook-date-pill-near .nook-date-number {
+    font-size: 15px;
+}
+
+.nook-date-pill-far .nook-date-number {
+    font-size: 13px;
+}
+
+.nook-date-pill-far .nook-date-weekday {
+    font-size: 8px;
+}
+
+.nook-date-today {
+    font-size: 7px;
+    font-weight: bold;
+    color: #92d6ff;
+    margin-top: 0px;
+}
+
+.nook-calendar {
+    spacing: 8px;
+    margin-top: 2px;
+}
+
+.nook-calendar-header {
+    spacing: 8px;
+}
+
+.nook-calendar-title {
+    font-size: 12px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-calendar-date {
+    font-size: 11px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.nook-calendar-scroll {
+    height: 154px;
+    padding-right: 3px;
+}
+
+.nook-calendar-full .nook-calendar-scroll {
+    height: 188px;
+}
+
+.nook-calendar-scroll StScrollBar {
+    min-width: 0px;
+    width: 0px;
+    opacity: 0;
+}
+
+.nook-calendar-list {
+    spacing: 7px;
+}
+
+.nook-calendar-day {
+    font-size: 10px;
+    font-weight: bold;
+    color: #7aa2ff;
+    letter-spacing: 1px;
+    margin-top: 3px;
+}
+
+.nook-calendar-event {
+    spacing: 10px;
+    padding: 9px 10px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.nook-calendar-time {
+    width: 48px;
+    spacing: 1px;
+}
+
+.nook-calendar-start {
+    font-size: 11px;
+    font-weight: bold;
+    color: #eaf0ff;
+}
+
+.nook-calendar-end {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.nook-calendar-event-title {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-calendar-event-location {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.52);
+    margin-top: 2px;
+}
+
+.nook-calendar-empty {
+    spacing: 5px;
+    padding: 16px 0px;
+}
+
+.nook-calendar-empty-icon {
+    color: rgba(122, 162, 255, 0.75);
+}
+
+.nook-calendar-empty-title {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-calendar-empty-sub {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.48);
+}
+
+/* Settings panel */
+.nook-settings-panel {
+    spacing: 12px;
+}
+
+.nook-settings-title-row {
+    spacing: 8px;
+}
+
+.nook-settings-title {
+    font-size: 16px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-settings-card {
+    spacing: 10px;
+    padding: 13px 14px;
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.nook-settings-copy {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.58);
+}
+
+.nook-settings-row {
+    spacing: 8px;
+}
+
+.nook-settings-action,
+.nook-settings-secondary {
+    min-height: 34px;
+    padding: 8px 13px;
+    border-radius: 10px;
+    font-size: 11.5px;
+    font-weight: bold;
+    transition: all 150ms ease-out;
+}
+
+.nook-settings-action {
+    background-color: rgba(122, 162, 255, 0.2);
+    border: 1px solid rgba(122, 162, 255, 0.36);
+    color: #eaf0ff;
+}
+
+.nook-settings-action:hover {
+    background-color: rgba(122, 162, 255, 0.28);
+}
+
+.nook-settings-secondary {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.nook-settings-secondary:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+}
+
+.nook-settings-entry {
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: 10px;
+    background-color: rgba(0, 0, 0, 0.24);
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    color: #f4f4f6;
+    font-size: 12px;
+    selection-background-color: rgba(122, 162, 255, 0.45);
+}
+
+/* Invalid hex entry flashes a red border, then reverts. */
+.nook-entry-error {
+    border: 1px solid rgba(255, 107, 94, 0.7);
+    background-color: rgba(255, 107, 94, 0.12);
+}
+
+/* Scrollable settings body — header stays pinned above it. */
+.nook-settings-scroll {
+    max-height: 460px;
+}
+
+/* Invisible scrollbar — the settings panel still scrolls (wheel / drag) but the
+ * bar is collapsed to zero width so it never draws a visible track / gutter. */
+.nook-settings-scroll StScrollBar {
+    min-width: 0px;
+    width: 0px;
+    opacity: 0;
+}
+
+.nook-settings-body {
+    spacing: 12px;
+    padding-right: 4px;
+}
+
+/* ---- Appearance: accent swatches ---- */
+.nook-swatch-row {
+    spacing: 8px;
+    padding: 2px 0;
+}
+
+.nook-swatch {
+    width: 26px;
+    height: 26px;
+    border-radius: 13px;
+    border: 2px solid rgba(255, 255, 255, 0.12);
+    transition: all 120ms ease-out;
+}
+
+.nook-swatch:hover {
+    border: 2px solid rgba(255, 255, 255, 0.4);
+}
+
+.nook-swatch-active {
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5);
+}
+
+/* Small colour chip next to the hex entry showing the live value. */
+.nook-hex-preview {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+/* ---- Tabs: draggable order list + enable toggles ---- */
+.nook-taborder-list {
+    spacing: 6px;
+    padding: 2px 0;
+}
+
+.nook-taborder-row {
+    spacing: 10px;
+    padding: 8px 10px;
+    border-radius: 11px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    transition: background-color 120ms ease-out;
+}
+
+.nook-taborder-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.nook-taborder-dragging {
+    background-color: rgba(122, 162, 255, 0.16);
+    border: 1px solid rgba(122, 162, 255, 0.4);
+}
+
+.nook-taborder-disabled {
+    color: rgba(255, 255, 255, 0.35);
+}
+
+.nook-drag-handle {
+    color: rgba(255, 255, 255, 0.35);
+}
+
+.nook-taborder-icon {
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.nook-taborder-label {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.nook-taborder-disabled .nook-taborder-label,
+.nook-taborder-disabled .nook-taborder-icon {
+    color: rgba(255, 255, 255, 0.4);
+}
+
+/* ---- Features: labelled rows with a toggle ---- */
+.nook-feature-row {
+    spacing: 10px;
+    padding: 6px 2px;
+}
+
+.nook-feature-label {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.88);
+}
+
+.nook-feature-desc {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+/* ---- Reusable pill toggle switch ---- */
+.nook-toggle {
+    width: 42px;
+    height: 24px;
+    border-radius: 12px;
+    padding: 2px;
+    background-color: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    transition: background-color 150ms ease-out;
+}
+
+.nook-toggle:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+.nook-toggle-on {
+    background-color: rgba(122, 162, 255, 0.6);
+    border: 1px solid rgba(122, 162, 255, 0.7);
+}
+
+.nook-toggle-on:hover {
+    background-color: rgba(122, 162, 255, 0.72);
+}
+
+.nook-toggle-knob {
+    width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    background-color: #ffffff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
+/* Slide the knob to the right when on. St has no transitions on layout,
+ * so the shift comes from the alignment set on the actor at build time;
+ * see _buildToggle. This class documents the on-state knob offset. */
+.nook-toggle-on .nook-toggle-knob {
+    margin-left: 18px;
+}
+
+/* ============================================================
+ * ALERTS — grouped notification tray
+ * ============================================================ */
+.nook-alerts-panel {
+    spacing: 10px;
+}
+
+.nook-alerts-header {
+    spacing: 8px;
+    margin-bottom: 2px;
+}
+
+.nook-alerts-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: #f4f4f6;
+    margin-right: 8px;
+}
+
+.nook-alerts-badge {
+    background-color: #7aa2ff;
+    border-radius: 10px;
+    padding: 1px 7px;
+    color: #0d0d10;
+    font-size: 10.5px;
+    font-weight: bold;
+}
+
+.nook-clear-btn {
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 11px;
+    font-weight: bold;
+    padding: 4px 8px;
+    border-radius: 8px;
+    transition: all 150ms ease-out;
+}
+
+.nook-clear-btn:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+.nook-clear-btn StIcon {
+    margin-right: 4px;
+}
+
+/* Bounded so the dashboard doesn't grow to fit every notification; the
+ * queue scrolls inside this instead. */
+.nook-alerts-scroll {
+    max-height: 340px;
+}
+
+/* Invisible scrollbar — the alerts list still scrolls (wheel / drag) but the
+ * bar itself is collapsed to zero width so it never draws a visible track. */
+.nook-alerts-scroll StScrollBar {
+    min-width: 0px;
+    width: 0px;
+    opacity: 0;
+}
+
+.nook-alerts-list {
+    spacing: 9px;
+}
+
+.nook-alert-card {
+    spacing: 11px;
+    padding: 12px 13px;
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Clickable (expandable) cards get a subtle hover to signal interactivity. */
+.nook-alert-expandable:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.nook-alert-chevron {
+    color: rgba(255, 255, 255, 0.4);
+    margin-left: 6px;
+}
+
+.nook-alert-accent {
+    background-color: rgba(122, 162, 255, 0.1);
+    border: 1px solid rgba(122, 162, 255, 0.28);
+}
+
+.nook-alert-badge {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    color: #ffffff;
+}
+
+.nook-alert-title {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-alert-body {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.62);
+    margin-top: 2px;
+}
+
+.nook-alerts-more {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 4px;
+}
+
+.nook-alerts-empty {
+    spacing: 6px;
+    padding: 24px 0px;
+}
+
+.nook-alerts-empty-icon {
+    color: rgba(255, 255, 255, 0.3);
+    margin-bottom: 6px;
+}
+
+.nook-alerts-empty-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.nook-alerts-empty-sub {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+/* ============================================================
+ * SHELF — temporary file holding + quick-share
+ * ============================================================ */
+.nook-shelf-panel {
+    spacing: 10px;
+}
+
+.nook-shelf-header {
+    spacing: 8px;
+    margin-bottom: 2px;
+}
+
+.nook-shelf-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: #f4f4f6;
+    margin-right: 8px;
+}
+
+.nook-shelf-badge {
+    background-color: #7aa2ff;
+    border-radius: 10px;
+    padding: 1px 7px;
+    color: #0d0d10;
+    font-size: 10.5px;
+    font-weight: bold;
+}
+
+.nook-shelf-add {
+    font-size: 11px;
+    font-weight: bold;
+    padding: 4px 8px;
+    border-radius: 8px;
+    transition: all 150ms ease-out;
+}
+
+.nook-shelf-add:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+.nook-shelf-add StIcon {
+    margin-right: 4px;
+}
+
+/* Bounded like the alerts list so long shelves scroll instead of stretching
+ * the dashboard. */
+.nook-shelf-scroll {
+    max-height: 240px;
+}
+
+.nook-shelf-scroll StScrollBar {
+    min-width: 0px;
+    width: 0px;
+    opacity: 0;
+}
+
+.nook-shelf-list {
+    spacing: 8px;
+}
+
+.nook-shelf-row {
+    spacing: 11px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.nook-shelf-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.nook-shelf-row-icon {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.nook-shelf-row-name {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: #f4f4f6;
+    max-width: 300px;
+}
+
+.nook-shelf-row-size {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 1px;
+}
+
+.nook-shelf-row-actions {
+    spacing: 2px;
+}
+
+.nook-shelf-action {
+    color: rgba(255, 255, 255, 0.55);
+    padding: 5px;
+    border-radius: 8px;
+    transition: all 120ms ease-out;
+}
+
+.nook-shelf-action:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.nook-shelf-empty {
+    spacing: 6px;
+    padding: 18px 0px;
+}
+
+.nook-shelf-empty-icon {
+    color: rgba(255, 255, 255, 0.3);
+    margin-bottom: 6px;
+}
+
+.nook-shelf-empty-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.nook-shelf-empty-sub {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+/* Quick-share notes box below the file list. */
+.nook-share-box {
+    spacing: 6px;
+    margin-top: 4px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.nook-share-title {
+    font-size: 11px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.nook-share-copy {
+    font-size: 11px;
+    font-weight: bold;
+    padding: 3px 8px;
+    border-radius: 8px;
+    transition: all 150ms ease-out;
+}
+
+.nook-share-copy:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+.nook-share-copy StIcon {
+    margin-right: 4px;
+}
+
+.nook-share-entry {
+    font-size: 12px;
+    color: #f4f4f6;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    min-height: 40px;
+}
+
+.nook-share-entry:focus {
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background-color: rgba(255, 255, 255, 0.07);
+}
+
+.nook-share-status {
+    font-size: 10.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.55);
+}

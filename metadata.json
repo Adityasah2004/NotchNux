@@ -1,0 +1,14 @@
+{
+  "uuid": "notchnux@adityasah.programs",
+  "name": "NotchNux",
+  "description": "A dynamic pill-shaped Notch and dashboard panel for media, system monitoring, weather, files shelf, and connected devices.",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ]
+}

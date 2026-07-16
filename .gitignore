@@ -1,0 +1,11 @@
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+
+# Claude Code local state
+.claude/
+
+# Build / packaging output
+*.zip
+dist/
