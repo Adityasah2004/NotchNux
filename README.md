@@ -33,11 +33,11 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 | 🎵 | **Music / MPRIS** | Full player with album art, a spinning vinyl, scrubber, shuffle/repeat, and a volume dial — works with any MPRIS player (Spotify, browsers, etc.). |
 | 🌤️ | **Weather** | Current conditions, an analog clock, humidity, wind, sunrise/sunset and hourly forecast. Auto-locates or set a manual location. |
 | 📷 | **Studio** | Live webcam preview (GStreamer) plus video and audio-only recording, with camera/mic device selection. |
-| 📅 | **Calendar** | Month view with your events pulled from GNOME Online Accounts. |
+| 📅 | **Calendar** | A scrollable day strip with your events pulled from GNOME Online Accounts — scroll the dates to jump between days. |
 | 🔔 | **Alerts** | Notification history, and a **peek** mode where the pill expands into a banner with action buttons the moment a notification arrives. |
-| 🗂️ | **Shelf** | A drag-and-drop scratch space for files plus a quick notes pad, stored under `~/.local/share/notchnux`. |
-| 🖥️ | **Tray / System** | Live CPU, memory, network throughput, battery and a brightness slider. |
-| 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs. Toggle individual features on/off. |
+| 🗂️ | **Shelf** | A click-to-browse / paste-a-file scratch space, plus **Quick Share** to send files to your phone and other paired [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) devices. |
+| 🖥️ | **Tray / System** | Live CPU, memory, swap, disk and network throughput; connected-device battery levels; and quick toggles for sound, screenshot, airplane mode, focus and screen lock. |
+| 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |
 
 ### Collapsed pill indicators
 - 📆 Date & time (pill sizes to its content so the clock never truncates)
@@ -49,14 +49,32 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 
 <div align="center">
 
+**Music** — vinyl art, scrubber, shuffle/repeat and a volume dial
+![Music dashboard](assets/music.png)
+
+**Weather** — analog clock, current conditions and details
+![Weather dashboard](assets/weather.png)
+
+**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
+![Tray dashboard](assets/tray.png)
+
+**Calendar** — a scrollable day strip with your GNOME Online Accounts events
+![Calendar dashboard](assets/calendar.png)
+
+**Alerts** — grouped notification history with a live unread count
+![Alerts dashboard](assets/alerts.png)
+
+**Shelf** — a click-to-browse / paste-a-file zone with Quick Share to paired devices
+![Shelf dashboard](assets/shelf.png)
+
+**Studio** — live webcam preview plus camera & audio recording
+![Studio dashboard](assets/studio.png)
+
 **Notification peek** — the pill smoothly expands into a banner with actions
-![Notification peek](assets/notification.png)
+![Notification peek](assets/peek-screenshot.png)
 
-**Dashboard · Weather tab** — analog clock, conditions and forecast
-![Weather dashboard](assets/dashboard-weather.png)
-
-**Dashboard · Music tab** — vinyl art, scrubber and a volume dial
-![Music dashboard](assets/dashboard-music.png)
+**Preferences** — a native GTK/libadwaita settings window for accent, tabs and features
+![Preferences window](assets/preferences.png)
 
 </div>
 
@@ -103,9 +121,9 @@ dbus-run-session -- gnome-shell --nested --wayland
 
 - **Click the pill** to open the dashboard; click outside (or the pill) to collapse it.
 - **Switch tabs** with the carousel at the top of the dashboard.
-- **Open settings** (⚙️ in the dashboard) to change the accent color, reorder or hide tabs, and toggle features.
+- **Open preferences** (⚙️ in the dashboard, or `gnome-extensions prefs notchnux@adityasah.programs`) to change the accent color, reorder or hide tabs, and toggle features. Changes apply to the live notch instantly — no shell reload needed.
 
-Configuration is stored as plain JSON under `~/.config/notchnux/config.json` — no GSettings schema required.
+Configuration is stored as plain JSON under `~/.config/notchnux/config.json` — no GSettings schema required. The preferences window and the running notch share this file, so edits made in either place take effect immediately.
 
 ## ⚙️ Configuration & data locations
 
@@ -113,8 +131,9 @@ Configuration is stored as plain JSON under `~/.config/notchnux/config.json` —
 |---|---|
 | `~/.config/notchnux/config.json` | Accent color, tab order & visibility, feature toggles |
 | `~/.config/notchnux/settings.json` | Manual weather location |
-| `~/.local/share/notchnux/shelf/` | Files dropped into the Shelf |
-| `~/.local/share/notchnux/notes.txt` | Notes pad content |
+| `~/.local/share/notchnux/shelf/` | Files added to the Shelf |
+
+> **Quick Share** sends files through the [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) extension. Install and pair a device in GSConnect to send files to your phone from the Shelf. Pasting a copied file into the Shelf uses `wl-clipboard` (`wl-paste`) on Wayland.
 
 ## 🐛 Troubleshooting
 
