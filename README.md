@@ -20,11 +20,7 @@ A pill that lives at the top of your screen, morphs to show what you're doing, a
 
 NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a glance it shows the date, time, battery and privacy (mic/camera) indicators. While music plays, the track title scrolls across it. When a notification arrives, the pill **morphs into a banner** with action buttons. Click it and it opens into a **tabbed dashboard** — a little control center that follows your accent color.
 
-<div align="center">
 
-![NotchNux expanded on the bar with app + media context](assets/pill-expanded-bar.png)
-
-</div>
 
 ## 🧩 Features
 
@@ -50,28 +46,28 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 <div align="center">
 
 **Music** — vinyl art, scrubber, shuffle/repeat and a volume dial
-![Music dashboard](assets/music.png)
-
-**Weather** — analog clock, current conditions and details
-![Weather dashboard](assets/weather.png)
-
-**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
-![Tray dashboard](assets/tray.png)
-
-**Calendar** — a scrollable day strip with your GNOME Online Accounts events
-![Calendar dashboard](assets/calendar.png)
-
-**Alerts** — grouped notification history with a live unread count
-![Alerts dashboard](assets/alerts.png)
-
-**Shelf** — a click-to-browse / paste-a-file zone with Quick Share to paired devices
-![Shelf dashboard](assets/shelf.png)
-
-**Studio** — live webcam preview plus camera & audio recording
 ![Studio dashboard](assets/studio.png)
 
-**Notification peek** — the pill smoothly expands into a banner with actions
+**Weather** — analog clock, current conditions and details
+![Alerts dashboard](assets/alerts.png)
+
+**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
+![Calendar dashboard](assets/calendar.png)
+
+**Calendar** — a scrollable day strip with your GNOME Online Accounts events
+![Tray dashboard](assets/tray.png)
+
+**Alerts** — grouped notification history with a live unread count
+![Weather dashboard](assets/weather.png)
+
+**Shelf** — a click-to-browse / paste-a-file zone with Quick Share to paired devices
 ![Notification peek](assets/peek-screenshot.png)
+
+**Studio** — live webcam preview plus camera & audio recording
+![Music dashboard](assets/music.png) 
+
+**Notification peek** — the pill smoothly expands into a banner with actions
+![Shelf dashboard](assets/shelf.png)
 
 **Preferences** — a native GTK/libadwaita settings window for accent, tabs and features
 ![Preferences window](assets/preferences.png)
