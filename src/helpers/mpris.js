@@ -42,6 +42,9 @@ export class MprisHelper {
                 proxy.disconnect(proxy._propertiesChangedId);
         }
         this.players.clear();
+        // Abandon any in-flight async proxy builds so their completion
+        // callbacks bail out instead of resurrecting a player post-destroy.
+        this._pendingPlayers?.clear();
     }
 
     // Spotify (and some other players) are unreliable about emitting D-Bus
@@ -150,18 +153,39 @@ export class MprisHelper {
 
     _addPlayer(busName) {
         if (this.players.has(busName)) return;
+        // Proxy construction does a blocking GetAll against the player when
+        // done synchronously — a busy browser spawning an MPRIS player (e.g.
+        // an autoplaying video) would stall the whole shell. Build it async
+        // and track in-flight names so a re-entrant add is a no-op.
+        this._pendingPlayers ??= new Set();
+        if (this._pendingPlayers.has(busName)) return;
+        this._pendingPlayers.add(busName);
 
+        Gio.DBusProxy.new_for_bus(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            null,
+            busName,
+            MPRIS_PATH,
+            MPRIS_PLAYER_INTERFACE,
+            null,
+            (obj, res) => {
+                // Removed (player vanished) while the proxy was in flight.
+                if (!this._pendingPlayers.delete(busName)) return;
+                let proxy;
+                try {
+                    proxy = Gio.DBusProxy.new_for_bus_finish(res);
+                } catch (e) {
+                    console.error(`NotchNux: Error setting up MPRIS proxy for ${busName}`, e);
+                    return;
+                }
+                this._finishAddPlayer(busName, proxy);
+            }
+        );
+    }
+
+    _finishAddPlayer(busName, proxy) {
         try {
-            let proxy = Gio.DBusProxy.new_for_bus_sync(
-                Gio.BusType.SESSION,
-                Gio.DBusProxyFlags.NONE,
-                null,
-                busName,
-                MPRIS_PATH,
-                MPRIS_PLAYER_INTERFACE,
-                null
-            );
-
             // Watch properties changed (track metadata, playback status)
             proxy._propertiesChangedId = proxy.connect(
                 'g-properties-changed',
@@ -198,6 +222,9 @@ export class MprisHelper {
     }
 
     _removePlayer(busName) {
+        // If the async proxy build is still in flight, dropping the pending
+        // marker makes its completion callback bail out.
+        this._pendingPlayers?.delete(busName);
         let proxy = this.players.get(busName);
         if (proxy) {
             if (proxy._propertiesChangedId) {
@@ -450,20 +477,29 @@ export class MprisHelper {
     // Position is intentionally NOT emitted via PropertiesChanged by the MPRIS
     // spec, so it must be fetched live rather than read from the proxy cache.
     // Returns 0 if unavailable.
-    getPosition() {
-        if (!this.activePlayerBus) return 0;
+    // Async: a slow player (busy browser) must not block the shell — the old
+    // sync variant could stall the compositor up to its 800ms timeout.
+    // Calls back with 0 if unavailable.
+    getPositionAsync(cb) {
+        if (!this.activePlayerBus) { cb(0); return; }
         try {
-            let reply = Gio.DBus.session.call_sync(
+            Gio.DBus.session.call(
                 this.activePlayerBus, MPRIS_PATH, 'org.freedesktop.DBus.Properties',
                 'Get',
                 new GLib.Variant('(ss)', [MPRIS_PLAYER_INTERFACE, 'Position']),
-                null, Gio.DBusCallFlags.NONE, 800, null);
-            let [variant] = reply.deep_unpack();
-            let pos = variant instanceof GLib.Variant ? variant.deep_unpack() : variant;
-            return Number(pos) || 0;
+                null, Gio.DBusCallFlags.NONE, 800, null,
+                (conn, res) => {
+                    try {
+                        let [variant] = conn.call_finish(res).deep_unpack();
+                        let pos = variant instanceof GLib.Variant ? variant.deep_unpack() : variant;
+                        cb(Number(pos) || 0);
+                    } catch (e) {
+                        // Player may not implement Position, or vanished mid-call.
+                        cb(0);
+                    }
+                });
         } catch (e) {
-            // Player may not implement Position, or vanished mid-call.
-            return 0;
+            cb(0);
         }
     }
 
