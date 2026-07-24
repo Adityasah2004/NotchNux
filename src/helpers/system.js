@@ -782,9 +782,19 @@ export class SystemHelper {
         });
     }
 
+    // Serve the last snapshot and refresh it in the background: a synchronous
+    // GetManagedObjects against a busy bluetoothd can stall the shell for
+    // hundreds of ms, and this runs every 3s while the Tray tab is open. The
+    // first call returns [] and the list pops in on the next repaint tick.
     _getBluezDevices() {
-        let list = [];
-        let result = Gio.DBus.system.call_sync(
+        this._refreshBluezDevices();
+        return this._bluezCache ?? [];
+    }
+
+    _refreshBluezDevices() {
+        if (this._bluezRefreshing) return;
+        this._bluezRefreshing = true;
+        Gio.DBus.system.call(
             'org.bluez',
             '/',
             'org.freedesktop.DBus.ObjectManager',
@@ -793,8 +803,20 @@ export class SystemHelper {
             null,
             Gio.DBusCallFlags.NONE,
             2000,
-            null);
+            null,
+            (conn, res) => {
+                this._bluezRefreshing = false;
+                try {
+                    let result = conn.call_finish(res);
+                    this._bluezCache = this._parseBluezObjects(result);
+                } catch (e) {
+                    // BlueZ unavailable or timed out; keep the last snapshot.
+                }
+            });
+    }
 
+    _parseBluezObjects(result) {
+        let list = [];
         let [objects] = result.recursiveUnpack();
         for (let [path, ifaces] of Object.entries(objects)) {
             let dev = ifaces['org.bluez.Device1'];
