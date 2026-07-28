@@ -1448,7 +1448,18 @@ export const NotchNux = GObject.registerClass({
         this._timelineLenUs = lenUs;
         this._timelineTrackId = info.trackId ?? null;
         // Seed the position from a live read so the bar isn't empty on open.
-        this._timelinePosUs = info.hasMedia ? this._mpris.getPosition() : 0;
+        // Async: the reply lands a few ms later and just repaints the fill.
+        this._timelinePosUs = 0;
+        if (info.hasMedia) {
+            this._mpris.getPositionAsync(pos => {
+                try {
+                    this._timelinePosUs = pos;
+                    this._updateTimelineFill();
+                } catch (e) {
+                    // The tab may have been rebuilt/destroyed before the reply.
+                }
+            });
+        }
 
         let wrap = new St.BoxLayout({ style_class: 'nook-timeline', vertical: true, x_expand: true });
 
