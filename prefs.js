@@ -18,7 +18,7 @@ import GObject from 'gi://GObject';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS, normalizeHex } from './src/helpers/config.js';
+import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex } from './src/helpers/config.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -34,6 +34,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         window.add(page);
 
         this._addAppearanceGroup(page, config);
+        this._addWallpaperGroup(page, config, window);
         this._addTabsGroup(page, config);
         this._addFeaturesGroup(page, config);
         this._addQuickShareGroup(page);
@@ -153,6 +154,234 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         hexEntry.add_controller(focusCtl);
         hexRow.add_suffix(hexEntry);
         group.add(hexRow);
+    }
+
+    // ---- Wallpaper: rotate through a folder of images ----
+    // GNOME/Wayland only accepts static image wallpapers, so this rotates
+    // JPG/PNG/WebP/etc. through the desktop background GSettings. Every control
+    // writes straight back through config.setWallpaper(); the shell watches the
+    // file and re-applies the rotation live. The dashboard's Wallpaper tab is
+    // the visual switcher; this group is where the behaviour is configured.
+    _addWallpaperGroup(page, config, window) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Wallpaper',
+            description: 'Rotate the desktop wallpaper through a folder of images. Only still images are supported — GNOME on Wayland can’t render video or live wallpapers behind the desktop.',
+        });
+        page.add(group);
+
+        const wp = config.wallpaper;
+        // Shared patch helper: merge one field and persist.
+        const patch = (p) => config.setWallpaper(p);
+
+        // Folder chooser. Shows the current folder as the subtitle.
+        const folderRow = new Adw.ActionRow({
+            title: 'Folder',
+            subtitle: wp.folder || 'No folder selected',
+        });
+        const folderBtn = new Gtk.Button({
+            icon_name: 'folder-open-symbolic',
+            valign: Gtk.Align.CENTER,
+            tooltip_text: 'Choose wallpaper folder',
+        });
+        folderBtn.add_css_class('flat');
+        folderBtn.connect('clicked', () => {
+            const dialog = new Gtk.FileDialog({ title: 'Choose wallpaper folder' });
+            if (wp.folder) {
+                try {
+                    dialog.set_initial_folder(Gio.File.new_for_path(wp.folder));
+                } catch (e) {}
+            }
+            dialog.select_folder(window, null, (dlg, res) => {
+                try {
+                    const file = dlg.select_folder_finish(res);
+                    if (file) {
+                        const path = file.get_path();
+                        patch({ folder: path });
+                        folderRow.set_subtitle(path);
+                    }
+                } catch (e) {
+                    // User cancelled — dismissal raises a Gtk.DialogError; ignore.
+                }
+            });
+        });
+        folderRow.add_suffix(folderBtn);
+        folderRow.activatable_widget = folderBtn;
+        group.add(folderRow);
+
+        // Master on/off for the timer.
+        const rotateRow = new Adw.SwitchRow({
+            title: 'Rotate automatically',
+            subtitle: 'Switch to the next wallpaper on a timer',
+            active: wp.rotationEnabled,
+        });
+        rotateRow.connect('notify::active', () => patch({ rotationEnabled: rotateRow.get_active() }));
+        group.add(rotateRow);
+
+        // Interval: a value spinner + a unit dropdown (seconds/minutes/hours).
+        // We store seconds; the UI picks the friendliest unit for the stored
+        // value so re-opening prefs shows "5 minutes", not "300 seconds".
+        const UNITS = [
+            { label: 'seconds', factor: 1 },
+            { label: 'minutes', factor: 60 },
+            { label: 'hours', factor: 3600 },
+        ];
+        // Choose the largest unit that divides the stored seconds cleanly.
+        let unitIdx = 1;
+        for (let i = UNITS.length - 1; i >= 0; i--) {
+            if (wp.intervalSec % UNITS[i].factor === 0) { unitIdx = i; break; }
+        }
+        const intervalRow = new Adw.ActionRow({
+            title: 'Interval',
+            subtitle: 'How long each wallpaper stays before switching',
+        });
+        const intervalBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            valign: Gtk.Align.CENTER,
+        });
+        const spin = new Gtk.SpinButton({
+            adjustment: new Gtk.Adjustment({
+                lower: 1, upper: 100000, step_increment: 1, page_increment: 10,
+                value: Math.max(1, Math.round(wp.intervalSec / UNITS[unitIdx].factor)),
+            }),
+            valign: Gtk.Align.CENTER,
+        });
+        const unitDrop = Gtk.DropDown.new_from_strings(UNITS.map(u => u.label));
+        unitDrop.set_selected(unitIdx);
+        unitDrop.set_valign(Gtk.Align.CENTER);
+        const commitInterval = () => {
+            const factor = UNITS[unitDrop.get_selected()].factor;
+            const seconds = Math.max(5, Math.round(spin.get_value()) * factor);
+            patch({ intervalSec: seconds });
+        };
+        spin.connect('value-changed', commitInterval);
+        unitDrop.connect('notify::selected', commitInterval);
+        intervalBox.append(spin);
+        intervalBox.append(unitDrop);
+        intervalRow.add_suffix(intervalBox);
+        group.add(intervalRow);
+
+        // Order: sequential vs random.
+        const orderRow = new Adw.ComboRow({
+            title: 'Order',
+            subtitle: 'Play the folder in order, or shuffle',
+            model: Gtk.StringList.new(['Sequential', 'Random']),
+            selected: wp.order === 'random' ? 1 : 0,
+        });
+        orderRow.connect('notify::selected', () => {
+            patch({ order: orderRow.get_selected() === 1 ? 'random' : 'sequential' });
+        });
+        group.add(orderRow);
+
+        // Rotate portrait images so they fill a landscape screen. EXIF
+        // orientation is honoured, and only portrait images are turned; the
+        // originals are never modified (a rotated copy is cached and used).
+        const landscapeRow = new Adw.SwitchRow({
+            title: 'Rotate portrait to landscape',
+            subtitle: 'Turn portrait images 90° so they fit a landscape display',
+            active: wp.autoLandscape,
+        });
+        landscapeRow.connect('notify::active', () => patch({ autoLandscape: landscapeRow.get_active() }));
+        group.add(landscapeRow);
+
+        // Sharpen + grade images for a crisper desktop. Originals are never
+        // modified; an enhanced copy is cached and applied. The expander's own
+        // switch is the master on/off; inside, Auto uses tuned defaults while
+        // Manual reveals sliders for sharpness, contrast and saturation.
+        const enhanceRow = new Adw.ExpanderRow({
+            title: 'Enhance for crispness',
+            subtitle: 'Sharpen and boost contrast so wallpapers render crisper and more detailed',
+            show_enable_switch: true,
+            enable_expansion: wp.enhance,
+        });
+        enhanceRow.connect('notify::enable-expansion', () => patch({ enhance: enhanceRow.get_enable_expansion() }));
+        group.add(enhanceRow);
+
+        // Auto vs Manual. In Auto the sliders are hidden and the tuned defaults
+        // apply; switching to Manual reveals and enables them.
+        const modeRow = new Adw.ComboRow({
+            title: 'Enhancement',
+            subtitle: 'Auto uses tuned defaults; Manual lets you dial it in',
+            model: Gtk.StringList.new(['Auto', 'Manual']),
+            selected: wp.enhanceMode === 'manual' ? 1 : 0,
+        });
+        enhanceRow.add_row(modeRow);
+
+        // Helper: build a slider row backed by a Gtk.Scale over a numeric field.
+        // The stored value shows directly on the scale with two decimals.
+        // Returns the row so callers can show/hide it per mode.
+        const makeSlider = (title, subtitle, key, range, current) => {
+            const row = new Adw.ActionRow({ title, subtitle });
+            const adj = new Gtk.Adjustment({
+                lower: range.min, upper: range.max,
+                step_increment: 0.01, page_increment: 0.1,
+                value: current,
+            });
+            const scale = new Gtk.Scale({
+                orientation: Gtk.Orientation.HORIZONTAL,
+                adjustment: adj,
+                draw_value: true,
+                value_pos: Gtk.PositionType.RIGHT,
+                digits: 2,
+                hexpand: true,
+                valign: Gtk.Align.CENTER,
+                width_request: 200,
+            });
+            // Only persist once the drag settles / the user stops, not on every
+            // pixel of motion — keeps the config writes (and cache rebuilds) sane.
+            let pending = 0;
+            adj.connect('value-changed', () => {
+                if (pending) GLib.Source.remove(pending);
+                pending = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+                    pending = 0;
+                    patch({ [key]: adj.get_value() });
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+            row.add_suffix(scale);
+            enhanceRow.add_row(row);
+            return row;
+        };
+
+        const sharpenRow = makeSlider(
+            'Sharpness', 'Edge detail added back (unsharp mask)',
+            'enhanceSharpen', ENHANCE_RANGE.sharpen, wp.enhanceSharpen);
+        const contrastRow = makeSlider(
+            'Contrast', 'Push darks down and lights up',
+            'enhanceContrast', ENHANCE_RANGE.contrast, wp.enhanceContrast);
+        const saturationRow = makeSlider(
+            'Saturation', 'Deepen colours',
+            'enhanceSaturation', ENHANCE_RANGE.saturation, wp.enhanceSaturation);
+
+        // Show the sliders only in Manual mode.
+        const syncManual = () => {
+            const manual = modeRow.get_selected() === 1;
+            sharpenRow.visible = manual;
+            contrastRow.visible = manual;
+            saturationRow.visible = manual;
+        };
+        modeRow.connect('notify::selected', () => {
+            patch({ enhanceMode: modeRow.get_selected() === 1 ? 'manual' : 'auto' });
+            syncManual();
+        });
+        syncManual();
+
+        // Auto-pause toggles.
+        const batteryRow = new Adw.SwitchRow({
+            title: 'Pause on battery',
+            subtitle: 'Stop rotating while running on battery power',
+            active: wp.pauseOnBattery,
+        });
+        batteryRow.connect('notify::active', () => patch({ pauseOnBattery: batteryRow.get_active() }));
+        group.add(batteryRow);
+
+        const fsRow = new Adw.SwitchRow({
+            title: 'Pause in fullscreen',
+            subtitle: 'Stop rotating while an app is fullscreen (games, video)',
+            active: wp.pauseOnFullscreen,
+        });
+        fsRow.connect('notify::active', () => patch({ pauseOnFullscreen: fsRow.get_active() }));
+        group.add(fsRow);
     }
 
     // ---- Tabs: enable toggles + drag reorder ----

@@ -5,6 +5,23 @@ All notable changes to NotchNux are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-30
+
+### Added
+- **Wallpaper rotation**: a new **Wallpaper** dashboard tab plus a **Wallpaper**
+  group in the preferences window. Rotate the desktop background through a
+  chosen folder of images on a custom interval (seconds/minutes/hours), in
+  sequential or random order, with optional auto-pause on battery and in
+  fullscreen. The dashboard tab is a horizontal filmstrip of thumbnails —
+  scroll through them or click one to switch immediately; landing on an image
+  makes it current and restarts the rotation timer.
+  - Only still images (JPG/PNG/WebP/etc.) are supported: GNOME on Wayland
+    renders the background itself and accepts a static image URI only, so
+    video/GIF/live wallpapers can't be drawn behind the desktop.
+  - New `WallpaperHelper` (`src/helpers/wallpaper.js`) owns folder scanning,
+    the `org.gnome.desktop.background` GSettings writes, the rotation timer,
+    and auto-pause; settings persist to `config.json` under a `wallpaper` key.
+
 ## [1.1.0] - 2026-07-16
 
 ### Added

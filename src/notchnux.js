@@ -8,12 +8,14 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.js';
 
 import { SystemHelper } from './helpers/system.js';
 import { MprisHelper } from './helpers/mpris.js';
 import { WeatherHelper } from './helpers/weather.js';
 import { MediaHelper } from './helpers/media.js';
 import { ShelfHelper } from './helpers/shelf.js';
+import { WallpaperHelper } from './helpers/wallpaper.js';
 import { Vinyl, AlbumArtDisc, Knob, RingMeter, AnalogClock, EqBars, CameraView, ACCENT, AMBER, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS } from './helpers/config.js';
 
@@ -123,6 +125,9 @@ export const NotchNux = GObject.registerClass({
         // so each shell start begins with an empty holding area.
         this._shelf = new ShelfHelper();
         this._shelf.clearShelf();
+        // Rotates the desktop wallpaper through a user-chosen folder. Driven
+        // entirely by config; started/paused below once helpers are up.
+        this._wallpaper = new WallpaperHelper();
 
         // Inner rounded surface — this is what the user sees.
         this._surface = new St.BoxLayout({
@@ -184,6 +189,72 @@ export const NotchNux = GObject.registerClass({
         // Watch the config file so edits made in the separate prefs.js process
         // apply to the live notch without a shell restart.
         this._watchConfig();
+
+        // Apply the panel hide/reclaim preference now that everything is mounted.
+        this._applyPanelVisibility();
+
+        // Bring up wallpaper rotation with the persisted settings, and start
+        // watching battery/fullscreen so it can auto-pause.
+        this._wallpaper.configure(this._config.wallpaper);
+        this._startWallpaperPauseMonitor();
+    }
+
+    // Feed the wallpaper rotator the current battery + fullscreen state and keep
+    // it updated. UPower's display device emits notify::state/notify::percentage
+    // through the client; fullscreen changes come from the display's
+    // in-fullscreen-changed signal. We poll once immediately so the initial
+    // state is correct even before the first signal.
+    _startWallpaperPauseMonitor() {
+        let pushState = () => {
+            let onBattery = false;
+            try {
+                let client = this._system._upowerClient;
+                let dev = client ? client.get_display_device() : null;
+                // state 2 = discharging (i.e. on battery). Anything else (charging,
+                // fully charged, AC with no battery) counts as not on battery.
+                if (dev && dev.state === 2)
+                    onBattery = true;
+            } catch (e) {}
+            let inFullscreen = false;
+            try {
+                // Any monitor in fullscreen pauses rotation.
+                let n = global.display.get_n_monitors();
+                for (let i = 0; i < n; i++) {
+                    if (global.display.get_monitor_in_fullscreen(i)) {
+                        inFullscreen = true;
+                        break;
+                    }
+                }
+            } catch (e) {}
+            this._wallpaper.setPauseState({ onBattery, inFullscreen });
+        };
+
+        pushState();
+
+        try {
+            let client = this._system._upowerClient;
+            let dev = client ? client.get_display_device() : null;
+            if (dev) {
+                this._wpBatteryDevice = dev;
+                this._wpBatteryStateId = dev.connect('notify::state', pushState);
+            }
+        } catch (e) {}
+
+        try {
+            this._wpFullscreenId = global.display.connect('in-fullscreen-changed', pushState);
+        } catch (e) {}
+    }
+
+    _stopWallpaperPauseMonitor() {
+        if (this._wpBatteryStateId && this._wpBatteryDevice) {
+            try { this._wpBatteryDevice.disconnect(this._wpBatteryStateId); } catch (e) {}
+        }
+        this._wpBatteryStateId = 0;
+        this._wpBatteryDevice = null;
+        if (this._wpFullscreenId) {
+            try { global.display.disconnect(this._wpFullscreenId); } catch (e) {}
+            this._wpFullscreenId = 0;
+        }
     }
 
     // Snapshot of the config values the shell reacts to, used to diff against
@@ -196,6 +267,7 @@ export const NotchNux = GObject.registerClass({
             accent: this._config.accent,
             tabsKey: JSON.stringify(this._config.visibleTabs),
             features,
+            wallpaperKey: JSON.stringify(this._config.wallpaper),
         };
     }
 
@@ -247,6 +319,15 @@ export const NotchNux = GObject.registerClass({
                 this._onFeatureToggled(f.id, next.features[f.id]);
         }
 
+        // Wallpaper settings changed in prefs: push them into the rotator (this
+        // restarts its timer). If the Wallpaper tab is showing, repaint it so
+        // the new folder/order is reflected.
+        if (next.wallpaperKey !== prev.wallpaperKey) {
+            this._wallpaper.configure(this._config.wallpaper);
+            if (this._activeTab === 'wallpaper' && this.isExpanded)
+                this._renderActiveTab();
+        }
+
         // Tab order / enabled set changed: rebuild the carousel. This also
         // re-reads visibleTabs, so it must run after reload().
         if (next.tabsKey !== prev.tabsKey) {
@@ -265,6 +346,10 @@ export const NotchNux = GObject.registerClass({
         this._destroyCalendarServer();
         this._teardownStudio();
         if (this._media) { this._media.destroy(); this._media = null; }
+        // Stop the wallpaper rotator and its pause monitor before tearing down
+        // SystemHelper, since the monitor is connected to its UPower device.
+        this._stopWallpaperPauseMonitor();
+        if (this._wallpaper) { this._wallpaper.destroy(); this._wallpaper = null; }
         this._system.destroy();
         this._mpris.destroy();
         if (this._artSession) {
@@ -275,6 +360,8 @@ export const NotchNux = GObject.registerClass({
         this._artCache.clear();
 
         this._teardownNotificationWatch();
+        this._destroyPowerMenu();
+        this._restorePanel();
         if (this._configMonitor) {
             if (this._configMonitorId)
                 this._configMonitor.disconnect(this._configMonitorId);
@@ -766,6 +853,23 @@ export const NotchNux = GObject.registerClass({
         // Populate the alerts count badge with the current notification total.
         this._updateTabCountBadge();
 
+        // Power button: opens a small menu with the standard session actions
+        // (suspend / log out / restart / power off / lock). Gated on the
+        // showPowerButton feature toggle so it can be hidden entirely.
+        this._powerButton = new St.Button({
+            style_class: 'notchnux-power-btn',
+            reactive: true,
+            can_focus: true,
+            x_align: Clutter.ActorAlign.END });
+        this._powerButton.set_child(new St.Icon({
+            icon_name: 'system-shutdown-symbolic',
+            icon_size: 15,
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER }));
+        this._buildPowerMenu();
+        this._powerButton.connect('clicked', () => this._powerMenu.toggle());
+        this._powerButton.visible = this._config.isFeatureEnabled('showPowerButton');
+
         this._settingsButton = new St.Button({
             style_class: 'notchnux-settings-btn',
             reactive: true,
@@ -794,6 +898,7 @@ export const NotchNux = GObject.registerClass({
             vertical: true });
 
         headerWrap.add_child(headerRow);
+        headerWrap.add_child(this._powerButton);
         headerWrap.add_child(this._settingsButton);
         this._dashboard.add_child(headerWrap);
         this._dashboard.add_child(this._contentContainer);
@@ -803,6 +908,118 @@ export const NotchNux = GObject.registerClass({
         this._activeTab = this._tabOrder.includes('media') ? 'media' : this._tabOrder[0];
         if (this._tabButtons[this._activeTab])
             this._tabButtons[this._activeTab].add_style_class_name('notchnux-tab-btn-active');
+    }
+
+    // Build the power button's popup menu. Each item drives GNOME's own
+    // SystemActions, which owns the confirm dialogs and availability checks
+    // (e.g. suspend is hidden where unsupported). The menu is owned by a
+    // PopupMenuManager and mounted in Main.uiGroup so it floats above the notch.
+    _buildPowerMenu() {
+        // A dashboard rebuild recreates the button, so drop any prior menu.
+        this._destroyPowerMenu();
+        if (!this._systemActions)
+            this._systemActions = SystemActions.getDefault();  // module fn, not a class
+
+        this._powerMenuManager = new PopupMenu.PopupMenuManager(this._powerButton);
+        this._powerMenu = new PopupMenu.PopupMenu(this._powerButton, 0.5, St.Side.TOP);
+        this._powerMenu.actor.add_style_class_name('notchnux-power-menu');
+        Main.uiGroup.add_child(this._powerMenu.actor);
+        this._powerMenu.close();
+        this._powerMenuManager.addMenu(this._powerMenu);
+
+        const addAction = (label, iconName, actionName) => {
+            let item = new PopupMenu.PopupImageMenuItem(label, iconName);
+            item.connect('activate', () => {
+                // Collapse the notch first so the confirm dialog isn't behind it.
+                this.collapse();
+                try {
+                    this._systemActions.activateAction(actionName);
+                } catch (e) {
+                    console.error(`NotchNux: system action '${actionName}' failed.`, e);
+                }
+            });
+            this._powerMenu.addMenuItem(item);
+            return item;
+        };
+
+        addAction('Lock', 'system-lock-screen-symbolic', 'lock-screen');
+        addAction('Suspend', 'media-playback-pause-symbolic', 'suspend');
+        this._powerMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        addAction('Log Out…', 'system-log-out-symbolic', 'logout');
+        addAction('Restart…', 'view-refresh-symbolic', 'restart');
+        addAction('Power Off…', 'system-shutdown-symbolic', 'power-off');
+    }
+
+    _destroyPowerMenu() {
+        if (this._powerMenu) {
+            this._powerMenu.destroy();
+            this._powerMenu = null;
+        }
+        this._powerMenuManager = null;
+    }
+
+    // Apply the current hidePanel / reclaimSpace config to the GNOME top panel.
+    //
+    // Two independent effects:
+    //   - hidePanel     : hide the panelBox so the bar isn't drawn.
+    //   - reclaimSpace  : also stop the panelBox from reserving work-area space,
+    //                     so maximized windows extend up into the top strip.
+    //
+    // reclaimSpace only makes sense while the panel is hidden; a visible panel
+    // that doesn't reserve space would overlap windows. Everything here is
+    // reversible — _restorePanel() undoes it exactly.
+    _applyPanelVisibility() {
+        let hide = this._config.isFeatureEnabled('hidePanel');
+        let reclaim = hide && this._config.isFeatureEnabled('reclaimSpace');
+
+        let lm = Main.layoutManager;
+        let panelBox = lm?.panelBox;
+        if (!panelBox) return;
+
+        // Visibility: hide/show the whole panel box.
+        panelBox.visible = !hide;
+
+        // Struts: flip the panelBox's affectsStruts flag in the layout manager's
+        // tracked-actor list, then recompute regions so the work area updates.
+        // We remember the original value the first time we touch it so we can
+        // restore it verbatim on teardown / toggle-off.
+        try {
+            let tracked = lm._findActor
+                ? lm._trackedActors?.[lm._findActor(panelBox)]
+                : (lm._trackedActors ?? []).find(a => a.actor === panelBox);
+            if (tracked) {
+                if (this._panelStrutsOriginal === undefined)
+                    this._panelStrutsOriginal = tracked.affectsStruts;
+                tracked.affectsStruts = reclaim ? false : this._panelStrutsOriginal;
+                if (typeof lm._queueUpdateRegions === 'function')
+                    lm._queueUpdateRegions();
+            }
+        } catch (e) {
+            console.error('NotchNux: Failed to adjust panel struts.', e);
+        }
+    }
+
+    // Undo everything _applyPanelVisibility changed: show the panel again and
+    // restore its original strut behaviour. Safe to call when nothing was hidden.
+    _restorePanel() {
+        let lm = Main.layoutManager;
+        let panelBox = lm?.panelBox;
+        if (!panelBox) return;
+        panelBox.visible = true;
+        try {
+            if (this._panelStrutsOriginal !== undefined) {
+                let tracked = lm._findActor
+                    ? lm._trackedActors?.[lm._findActor(panelBox)]
+                    : (lm._trackedActors ?? []).find(a => a.actor === panelBox);
+                if (tracked)
+                    tracked.affectsStruts = this._panelStrutsOriginal;
+                this._panelStrutsOriginal = undefined;
+                if (typeof lm._queueUpdateRegions === 'function')
+                    lm._queueUpdateRegions();
+            }
+        } catch (e) {
+            console.error('NotchNux: Failed to restore panel struts.', e);
+        }
     }
 
     // Tear down and rebuild the entire dashboard from current config. Called
@@ -939,6 +1156,7 @@ export const NotchNux = GObject.registerClass({
             case 'calendar': this._renderCalendarTab(); break;
             case 'notifications': this._renderNotificationsTab(); break;
             case 'shelf': this._renderShelfTab(); break;
+            case 'wallpaper': this._renderWallpaperTab(); break;
         }
         // Re-fit to the new content height, unless expand() is driving its own
         // open animation (it renders first, then animates size itself).
@@ -2286,6 +2504,16 @@ export const NotchNux = GObject.registerClass({
                 // Re-run the live refresh so the marquee starts/stops.
                 this._refreshLive();
                 break;
+            case 'showPowerButton':
+                if (this._powerButton)
+                    this._powerButton.visible = on;
+                break;
+            case 'hidePanel':
+                this._applyPanelVisibility();
+                break;
+            case 'reclaimSpace':
+                this._applyPanelVisibility();
+                break;
         }
     }
 
@@ -3624,6 +3852,202 @@ export const NotchNux = GObject.registerClass({
     }
 
     // ============================================================
+    // Tab: Wallpaper — a visual switcher over the folder configured in prefs.
+    // GNOME/Wayland only draws still images behind the desktop, so this rotates
+    // JPG/PNG/WebP/etc. The rotation timer, folder, interval, order and
+    // auto-pause all live in the prefs window (see _addWallpaperGroup); this tab
+    // is purely the picker: scroll the strip (or click a thumbnail) to switch,
+    // and whichever image you land on becomes current and restarts the timer.
+    // ============================================================
+    _renderWallpaperTab() {
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-wp-panel', vertical: true, x_expand: true, y_expand: true });
+
+        let wpCfg = this._config.wallpaper;
+        let items = this._wallpaper.getWallpapers();
+
+        // Header: title + current filename. Rotation is configured from the
+        // dashboard's own settings gear (this tab is purely the picker), so we
+        // deliberately don't repeat a settings shortcut here.
+        let header = new St.BoxLayout({ style_class: 'nook-wp-header', vertical: false, x_expand: true });
+        let titleBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        titleBox.add_child(new St.Label({ text: 'Wallpaper', style_class: 'nook-wp-title' }));
+        let currentItem = items.find(w => w.current);
+        this._wpSubtitle = new St.Label({
+            text: currentItem ? currentItem.name
+                : (items.length ? 'Scroll to pick a wallpaper' : ''),
+            style_class: 'nook-wp-subtitle',
+        });
+        titleBox.add_child(this._wpSubtitle);
+        header.add_child(titleBox);
+        panel.add_child(header);
+
+        // Empty states: no folder configured, or a folder with no images.
+        if (!wpCfg.folder) {
+            panel.add_child(this._buildWallpaperEmpty(
+                'preferences-desktop-wallpaper-symbolic',
+                'No wallpaper folder set',
+                'Choose a folder in settings to rotate through your images.'));
+            this._contentContainer.add_child(panel);
+            return;
+        }
+        if (items.length === 0) {
+            panel.add_child(this._buildWallpaperEmpty(
+                'image-missing-symbolic',
+                'No images in this folder',
+                'Add JPG, PNG or WebP images to the folder you picked.'));
+            this._contentContainer.add_child(panel);
+            return;
+        }
+
+        // Horizontal filmstrip of thumbnails. Clicking one applies it; wheeling
+        // over the strip steps the selection and live-applies (throttled).
+        let scroll = new St.ScrollView({ style_class: 'nook-wp-scroll', x_expand: true });
+        scroll.set_policy(St.PolicyType.AUTOMATIC, St.PolicyType.NEVER);
+        let strip = new St.BoxLayout({ style_class: 'nook-wp-strip', vertical: false });
+
+        this._wpThumbs = [];
+        this._wpActivePath = currentItem ? currentItem.path : null;
+        for (let it of items) {
+            let cell = this._buildWallpaperThumb(it);
+            this._wpThumbs.push(cell);
+            strip.add_child(cell);
+        }
+        scroll.set_child(strip);
+        this._wpScroll = scroll;
+
+        // Wheel/trackpad over the strip = step selection and apply. Throttled so
+        // a fast flick doesn't fire a dozen gsettings writes.
+        scroll.connect('scroll-event', (actor, event) => {
+            let dir = event.get_scroll_direction();
+            let now = GLib.get_monotonic_time();
+            if (now - (this._lastWpScrollAt || 0) < 220000)
+                return Clutter.EVENT_STOP;
+            if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.LEFT)
+                this._stepWallpaper(-1);
+            else if (dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT)
+                this._stepWallpaper(1);
+            else
+                return Clutter.EVENT_PROPAGATE;
+            this._lastWpScrollAt = now;
+            return Clutter.EVENT_STOP;
+        });
+
+        panel.add_child(scroll);
+
+        // Bring the current thumbnail into view after layout settles.
+        this._scrollWallpaperIntoView();
+
+        this._contentContainer.add_child(panel);
+    }
+
+    // One thumbnail cell: a preview of the image with its name under it. The
+    // current wallpaper is marked with a highlight class. Clicking applies it.
+    _buildWallpaperThumb(item) {
+        let cell = new St.Button({
+            style_class: item.current ? 'nook-wp-cell nook-wp-cell-active' : 'nook-wp-cell',
+            reactive: true, can_focus: true,
+        });
+        cell._wpPath = item.path;
+        let box = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER });
+
+        // Fill a landscape frame with the image using a CSS background (cover),
+        // rather than an St.Icon — an icon's fixed square icon_size letterboxes
+        // the picture and ignores the landscape thumb box. The preview path is
+        // the landscape-rotated copy when auto-landscape is on, so portrait
+        // images show turned exactly as they'll be applied.
+        let previewPath = this._wallpaper.previewPathFor(item.path);
+        let previewUri = Gio.File.new_for_path(previewPath).get_uri();
+        let thumb = new St.Widget({ style_class: 'nook-wp-thumb' });
+        thumb.set_style(`background-image: url("${previewUri}"); background-size: cover; background-position: center;`);
+        box.add_child(thumb);
+
+        let name = new St.Label({ text: item.name, style_class: 'nook-wp-name' });
+        box.add_child(name);
+        cell.set_child(box);
+
+        if (item.current)
+            cell.set_style(`border-color: ${accentHex()};`);
+
+        cell.connect('clicked', () => this._applyWallpaper(item.path));
+        return cell;
+    }
+
+    _buildWallpaperEmpty(icon, title, sub) {
+        let box = new St.BoxLayout({ style_class: 'nook-wp-empty', vertical: true, x_expand: true, y_expand: true,
+            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
+        box.add_child(new St.Icon({ icon_name: icon, icon_size: 32, style_class: 'nook-wp-empty-icon', x_align: Clutter.ActorAlign.CENTER }));
+        box.add_child(new St.Label({ text: title, style_class: 'nook-wp-empty-title', x_align: Clutter.ActorAlign.CENTER }));
+        box.add_child(new St.Label({ text: sub, style_class: 'nook-wp-empty-sub', x_align: Clutter.ActorAlign.CENTER }));
+        return box;
+    }
+
+    // Step the selection by dir (±1) through the on-screen thumbnails and apply
+    // the newly-selected one. Wraps around at the ends.
+    _stepWallpaper(dir) {
+        if (!this._wpThumbs || this._wpThumbs.length === 0)
+            return;
+        let curIdx = this._wpThumbs.findIndex(c => c._wpPath === this._wpActivePath);
+        if (curIdx < 0)
+            curIdx = 0;
+        let n = this._wpThumbs.length;
+        let nextIdx = (curIdx + dir + n) % n;
+        this._applyWallpaper(this._wpThumbs[nextIdx]._wpPath);
+    }
+
+    // Apply `path`, then update the thumbnail highlight in place (no full tab
+    // re-render, so scrolling stays smooth) and scroll it into view.
+    _applyWallpaper(path) {
+        if (!this._wallpaper.setWallpaper(path))
+            return;
+        this._wpActivePath = path;
+        if (this._wpThumbs) {
+            for (let c of this._wpThumbs) {
+                let active = c._wpPath === path;
+                if (active) {
+                    c.add_style_class_name('nook-wp-cell-active');
+                    c.set_style(`border-color: ${accentHex()};`);
+                } else {
+                    c.remove_style_class_name('nook-wp-cell-active');
+                    c.set_style('');
+                }
+            }
+        }
+        // Refresh the header subtitle to the new filename.
+        if (this._wpSubtitle) {
+            let base = GLib.path_get_basename(path);
+            this._wpSubtitle.set_text(base);
+        }
+        this._scrollWallpaperIntoView();
+    }
+
+    // Ensure the active thumbnail is visible in the horizontal strip, matching
+    // the tab-strip auto-scroll behaviour used elsewhere.
+    _scrollWallpaperIntoView() {
+        if (!this._wpScroll || !this._wpThumbs)
+            return;
+        let active = this._wpThumbs.find(c => c._wpPath === this._wpActivePath);
+        if (!active)
+            return;
+        let adj = this._wpScroll.get_hadjustment();
+        if (!adj)
+            return;
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            try {
+                let [x, ] = active.get_transformed_position();
+                let [px, ] = this._wpScroll.get_transformed_position();
+                let rel = x - px + adj.value;
+                let w = active.width;
+                let maxScroll = Math.max(0, adj.upper - adj.page_size);
+                if (rel < adj.value)
+                    adj.value = Math.max(0, rel - 8);
+                else if (rel + w > adj.value + adj.page_size)
+                    adj.value = Math.min(maxScroll, rel + w - adj.page_size + 8);
+            } catch (e) {}
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // ============================================================
     // Interaction — open on hover/click, close only on outside click
     // or when the pointer leaves the whole widget.
     // ============================================================
@@ -3665,10 +4089,14 @@ export const NotchNux = GObject.registerClass({
                 GLib.Source.remove(this._expandTimeoutId);
                 this._expandTimeoutId = null;
             }
-            if (this.isExpanded && !this._collapseTimeoutId) {
+            // Don't collapse while one of our popup menus is open — the pointer
+            // has merely moved onto the menu (which lives in Main.uiGroup, not
+            // our subtree, so it reads as "left"). The menu's own click handling
+            // or a click-outside will close things.
+            if (this.isExpanded && !this._collapseTimeoutId && !this._anyOwnedMenuOpen()) {
                 this._collapseTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
                     this._collapseTimeoutId = null;
-                    if (!this._pointerInside && this.isExpanded)
+                    if (!this._pointerInside && this.isExpanded && !this._anyOwnedMenuOpen())
                         this.collapse();
                     return GLib.SOURCE_REMOVE;
                 });
@@ -3696,26 +4124,54 @@ export const NotchNux = GObject.registerClass({
         let [ax, ay] = this.get_transformed_position();
         let inside = ex >= ax && ex <= ax + this.get_width() &&
                      ey >= ay && ey <= ay + this.get_height();
-        // A Studio device picker's PopupMenu lives in Main.uiGroup, outside our
-        // box and not a descendant of ours. Clicking one of its items must NOT
-        // collapse the dashboard — treat any open menu (or its actor's subtree)
-        // as "inside" so device selection works.
-        if (!inside && this._clickInStudioMenu(event.get_source()))
+        // Our PopupMenus (Studio device pickers, the power menu) live in
+        // Main.uiGroup, outside our box and not descendants of ours. Clicking one
+        // of their items must NOT collapse the dashboard — treat a click in any
+        // owned menu as "inside" so selection works.
+        if (!inside && this._clickInOwnedMenu(event.get_source(), ex, ey))
             inside = true;
         if (!inside && !this._isDescendant(event.get_source()))
             this._collapseImmediately();
         return Clutter.EVENT_PROPAGATE;
     }
 
-    // True when `source` is (a descendant of) any currently-open Studio picker
-    // menu. Guards the click-outside collapse so picking a device doesn't close
-    // the whole dashboard.
-    _clickInStudioMenu(source) {
-        if (!this._studioMenus || this._studioMenus.length === 0) return false;
-        for (let menu of this._studioMenus) {
-            if (!menu || !menu.actor || !menu.isOpen) continue;
+    // All PopupMenus this widget owns and mounts in Main.uiGroup — the Studio
+    // device pickers plus the header power menu. Used by the click-outside guard.
+    _ownedMenus() {
+        let menus = (this._studioMenus ?? []).slice();
+        if (this._powerMenu)
+            menus.push(this._powerMenu);
+        return menus;
+    }
+
+    // True if any owned popup menu is currently open. Used to suspend the
+    // hover-out collapse while a menu is up.
+    _anyOwnedMenuOpen() {
+        return this._ownedMenus().some(m => m?.isOpen);
+    }
+
+    // True when a stage click at (source / ex,ey) landed in one of our owned
+    // menus. We check BOTH the source's ancestry AND the click coordinates
+    // against the menu actor's box, and deliberately do NOT gate on isOpen:
+    // activating a menu item closes the menu (isOpen flips to false) before this
+    // stage handler runs, so an isOpen check would wrongly treat the selecting
+    // click as "outside" and collapse the dashboard.
+    _clickInOwnedMenu(source, ex, ey) {
+        for (let menu of this._ownedMenus()) {
+            let actor = menu?.actor;
+            if (!actor) continue;
+            // Ancestry test.
             for (let a = source; a; a = a.get_parent()) {
-                if (a === menu.actor) return true;
+                if (a === actor) return true;
+            }
+            // Geometry test — the menu still occupies its region during the
+            // click even if it just closed. Only meaningful when mapped.
+            if (actor.mapped && ex !== undefined) {
+                let [mx, my] = actor.get_transformed_position();
+                let mw = actor.get_width();
+                let mh = actor.get_height();
+                if (ex >= mx && ex <= mx + mw && ey >= my && ey <= my + mh)
+                    return true;
             }
         }
         return false;

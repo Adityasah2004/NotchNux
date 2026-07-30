@@ -276,6 +276,24 @@
     border: 1px solid rgba(122, 162, 255, 0.34);
 }
 
+/* Power button sits beside the settings gear in the dashboard header. */
+.notchnux-power-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    margin-right: 6px;
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.65);
+    transition: all 150ms ease-out;
+}
+
+.notchnux-power-btn:hover {
+    color: #ffd3d3;
+    background-color: rgba(255, 92, 92, 0.20);
+    border: 1px solid rgba(255, 92, 92, 0.38);
+}
+
 /* ---------- Generic panel wrapper ---------- */
 .notchnux-panel {
     spacing: 16px;
@@ -1445,5 +1463,113 @@
     font-size: 10.5px;
     font-weight: bold;
     color: rgba(255, 255, 255, 0.55);
+    margin-top: 2px;
+}
+
+/* ------------------------------------------------------------------ *
+ * Wallpaper tab — horizontal filmstrip of thumbnails. Scroll or click *
+ * to switch; the active image gets an accent-coloured border.         *
+ * ------------------------------------------------------------------ */
+.nook-wp-panel {
+    spacing: 12px;
+}
+
+.nook-wp-header {
+    spacing: 8px;
+    margin-bottom: 2px;
+}
+
+.nook-wp-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: #f4f4f6;
+}
+
+.nook-wp-subtitle {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 1px;
+}
+
+.nook-wp-gear {
+    padding: 6px;
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.55);
+    transition: all 150ms ease-out;
+}
+
+.nook-wp-gear:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #f4f4f6;
+}
+
+.nook-wp-scroll {
+    max-height: 168px;
+}
+
+/* Show a slim horizontal scrollbar so the strip reads as scrollable. */
+.nook-wp-scroll StScrollBar {
+    min-height: 0px;
+    height: 4px;
+    opacity: 0.5;
+}
+
+.nook-wp-strip {
+    spacing: 10px;
+    padding: 4px 2px 8px 2px;
+}
+
+.nook-wp-cell {
+    padding: 4px;
+    border-radius: 12px;
+    border: 2px solid transparent;
+    background-color: rgba(255, 255, 255, 0.04);
+    transition: all 150ms ease-out;
+}
+
+.nook-wp-cell:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+}
+
+/* Active border colour is set inline from the accent; this just keeps the
+ * baseline appearance when no inline style has been applied yet. */
+.nook-wp-cell-active {
+    background-color: rgba(255, 255, 255, 0.09);
+    border: 2px solid #7aa2ff;
+}
+
+.nook-wp-thumb {
+    border-radius: 8px;
+    width: 132px;
+    height: 82px;
+}
+
+.nook-wp-name {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.55);
+    max-width: 132px;
+    margin-top: 5px;
+    text-align: center;
+}
+
+.nook-wp-empty {
+    spacing: 6px;
+    padding: 28px 16px;
+}
+
+.nook-wp-empty-icon {
+    color: rgba(255, 255, 255, 0.32);
+    margin-bottom: 4px;
+}
+
+.nook-wp-empty-title {
+    font-size: 12.5px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.nook-wp-empty-sub {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.42);
     margin-top: 2px;
 }

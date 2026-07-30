@@ -31,8 +31,48 @@ export const TAB_DEFS = [
     { id: 'studio',        label: 'Studio',   icon: 'camera-web-symbolic' },
     { id: 'calendar',      label: 'Calendar', icon: 'x-office-calendar-symbolic' },
     { id: 'notifications', label: 'Alerts',   icon: 'preferences-system-notifications-symbolic' },
-    { id: 'shelf',         label: 'Shelf',    icon: 'view-list-symbolic' }
+    { id: 'shelf',         label: 'Shelf',    icon: 'view-list-symbolic' },
+    { id: 'wallpaper',     label: 'Wallpaper', icon: 'preferences-desktop-wallpaper-symbolic' }
 ];
+
+// Auto-enhancement strengths — the tuned defaults used when the user leaves
+// enhancement in 'auto' mode. Kept here (rather than only in wallpaper.js) so
+// that 'manual' sliders can start from the exact same numbers, and so config
+// validation can clamp manual values to a sane range around them.
+//   sharpen    — unsharp-mask amount (0 = none, higher = crisper/haloed)
+//   contrast   — >1 pushes darks down / lights up around mid-grey
+//   saturation — >1 deepens colour
+export const ENHANCE_AUTO = {
+    sharpen: 0.6,
+    contrast: 1.06,
+    saturation: 1.08,
+};
+// Allowed slider ranges for manual enhancement.
+export const ENHANCE_RANGE = {
+    sharpen: { min: 0, max: 2 },
+    contrast: { min: 1, max: 1.5 },
+    saturation: { min: 1, max: 1.5 },
+};
+
+// Wallpaper-rotation defaults. The heavy config (folder, interval, order,
+// auto-pause) lives in the prefs window; the dashboard's Wallpaper tab is just
+// the visual switcher. `folder` empty means "not configured yet".
+export const WALLPAPER_DEFAULTS = {
+    folder: '',
+    intervalSec: 300,
+    order: 'sequential',     // 'sequential' | 'random'
+    rotationEnabled: false,
+    autoLandscape: false,    // rotate portrait images 90° into landscape
+    enhance: false,          // sharpen + contrast/saturation for a crisper look
+    // Enhancement tuning. In 'auto' the ENHANCE_AUTO values are used; in
+    // 'manual' the user's own sharpen/contrast/saturation below apply.
+    enhanceMode: 'auto',     // 'auto' | 'manual'
+    enhanceSharpen: ENHANCE_AUTO.sharpen,
+    enhanceContrast: ENHANCE_AUTO.contrast,
+    enhanceSaturation: ENHANCE_AUTO.saturation,
+    pauseOnBattery: true,
+    pauseOnFullscreen: true
+};
 
 // Feature toggles exposed in settings. `id` is the stored key; `default`
 // is used when the config file has no opinion yet.
@@ -42,7 +82,10 @@ export const FEATURE_DEFS = [
     { id: 'pillMarquee',       label: 'Scrolling track title', description: 'Scroll long track titles across the pill while playing.',  default: true },
     { id: 'weatherAutoRefresh', label: 'Auto-refresh weather', description: 'Periodically refresh weather in the background.',           default: true },
     { id: 'calendarSync',      label: 'Calendar sync',        description: 'Pull events from GNOME Online Accounts into the Calendar tab.', default: true },
-    { id: 'notifPeek',         label: 'Notification peek',    description: 'Expand the pill into a banner when a notification arrives.',   default: true }
+    { id: 'notifPeek',         label: 'Notification peek',    description: 'Expand the pill into a banner when a notification arrives.',   default: true },
+    { id: 'showPowerButton',   label: 'Power button',         description: 'Show a power menu (suspend, log out, restart, power off) in the dashboard header.', default: true },
+    { id: 'hidePanel',         label: 'Hide top panel',       description: 'Hide the GNOME top bar and rely on the notch instead.',        default: false },
+    { id: 'reclaimSpace',      label: 'Reclaim panel space',  description: 'Let maximized windows use the top strip the panel occupied (only applies when the panel is hidden).', default: false }
 ];
 
 const DEFAULT_ACCENT = '#7aa2ff';
@@ -98,7 +141,8 @@ export class ConfigStore {
             accent: DEFAULT_ACCENT,
             tabOrder: TAB_DEFS.map(t => t.id),
             tabs,
-            features
+            features,
+            wallpaper: { ...WALLPAPER_DEFAULTS }
         };
     }
 
@@ -115,6 +159,7 @@ export class ConfigStore {
                 data = { ...data, ...parsed };
                 data.tabs = { ...this._defaults().tabs, ...(parsed.tabs ?? {}) };
                 data.features = { ...this._defaults().features, ...(parsed.features ?? {}) };
+                data.wallpaper = { ...WALLPAPER_DEFAULTS, ...(parsed.wallpaper ?? {}) };
                 data.accent = normalizeHex(parsed.accent) ?? DEFAULT_ACCENT;
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
@@ -210,6 +255,39 @@ export class ConfigStore {
     }
     setFeatureEnabled(id, enabled) {
         this._data.features[id] = !!enabled;
+        this._save();
+    }
+
+    // ---- Wallpaper rotation ----
+    // Returned as a fresh object over the defaults so callers always get every
+    // key even if the stored blob is partial or missing.
+    get wallpaper() {
+        return { ...WALLPAPER_DEFAULTS, ...(this._data.wallpaper ?? {}) };
+    }
+    // Merge a partial update into the stored wallpaper settings. Validates the
+    // couple of fields that have a constrained shape; unknown keys pass through.
+    setWallpaper(patch) {
+        let next = { ...WALLPAPER_DEFAULTS, ...(this._data.wallpaper ?? {}), ...(patch ?? {}) };
+        next.folder = typeof next.folder === 'string' ? next.folder : '';
+        next.intervalSec = Math.max(5, parseInt(next.intervalSec, 10) || WALLPAPER_DEFAULTS.intervalSec);
+        next.order = next.order === 'random' ? 'random' : 'sequential';
+        next.rotationEnabled = !!next.rotationEnabled;
+        next.autoLandscape = !!next.autoLandscape;
+        next.enhance = !!next.enhance;
+        next.enhanceMode = next.enhanceMode === 'manual' ? 'manual' : 'auto';
+        // Clamp the manual strengths into their allowed ranges, falling back to
+        // the auto defaults for anything non-numeric.
+        let clampEnh = (v, def, range) => {
+            let n = Number(v);
+            if (!Number.isFinite(n)) n = def;
+            return Math.min(range.max, Math.max(range.min, n));
+        };
+        next.enhanceSharpen = clampEnh(next.enhanceSharpen, ENHANCE_AUTO.sharpen, ENHANCE_RANGE.sharpen);
+        next.enhanceContrast = clampEnh(next.enhanceContrast, ENHANCE_AUTO.contrast, ENHANCE_RANGE.contrast);
+        next.enhanceSaturation = clampEnh(next.enhanceSaturation, ENHANCE_AUTO.saturation, ENHANCE_RANGE.saturation);
+        next.pauseOnBattery = !!next.pauseOnBattery;
+        next.pauseOnFullscreen = !!next.pauseOnFullscreen;
+        this._data.wallpaper = next;
         this._save();
     }
 }
