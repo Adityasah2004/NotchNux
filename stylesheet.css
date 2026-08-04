@@ -547,11 +547,73 @@
     background-color: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 14px;
-    padding: 12px 14px;
-    spacing: 11px;
+    /* Trimmed vertical padding + tighter row spacing so the card is a little
+     * shorter, leaving room for the WiFi row beneath it. */
+    padding: 8px 14px;
+    spacing: 5px;
     /* No fixed width: the card flexes (x_expand) to fill the space left by the
      * fixed-width toggle grid, so the lower row never overruns the panel. */
     min-width: 240px;
+}
+/* Header row: eyebrow + Bluetooth mini-toggle, baseline-aligned. */
+.nook-devices-head {
+    spacing: 8px;
+}
+/* Device rows added straight to the card, capped at 3 with a "+N more…" line;
+ * card sizes to its content. */
+.nook-devices-list {
+    spacing: 6px;
+    margin-top: 2px;
+}
+
+/* "+N more…" row that opens the full list overlay. */
+.nook-more-row {
+    padding: 3px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background-color 150ms ease-out;
+}
+.nook-more-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.nook-more-label {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+/* A small square radio toggle (Bluetooth on the devices card, Wi-Fi on the
+ * WiFi card). Lights up when the radio is on. */
+.nook-mini-toggle {
+    padding: 5px;
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.75);
+    transition: background-color 150ms ease-out;
+}
+.nook-mini-toggle:hover {
+    background-color: rgba(255, 255, 255, 0.10);
+}
+.nook-mini-toggle-on {
+    background-color: rgba(120, 170, 255, 0.22);
+    color: #ffffff;
+}
+
+/* "Add device… / Add network…" footer button. */
+.nook-add-row {
+    padding: 4px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background-color 150ms ease-out;
+}
+.nook-add-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.nook-add-icon {
+    color: rgba(255, 255, 255, 0.55);
+}
+.nook-add-label {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.6);
+    margin-left: 9px;
 }
 
 .nook-card-eyebrow {
@@ -614,6 +676,215 @@
     font-size: 11px;
     color: rgba(255, 255, 255, 0.4);
 }
+
+/* Bottom band: WiFi card (left, flexes) beside the mirrored top-bar row.
+ * No margin-top: it's a direct child of .notchnux-panel, so it already gets the
+ * panel's 16px spacing — the same gap that sits between the stats and devices
+ * rows. An extra margin here would make the device→wifi gap look bigger. */
+.nook-tray-band {
+    spacing: 12px;
+}
+/* Left column stacks DEVICES over WIFI; right column stacks the toggle cluster
+ * over the TOP BAR. The vertical gap matches the horizontal card spacing. */
+.nook-tray-leftcol {
+    spacing: 12px;
+}
+.nook-tray-rightcol {
+    spacing: 12px;
+}
+/* The top-bar row now sits under the cluster (not beside WiFi); it grows to
+ * fill the column height (y_expand in JS), so give it a taller feel with more
+ * vertical padding. */
+.nook-tray-mirror-beside {
+    margin-top: 0;
+    max-width: 300px;
+    padding-top: 14px;
+    padding-bottom: 14px;
+}
+.nook-tray-mirror-beside .nook-tray-mirror-btn {
+    padding: 8px;
+}
+
+/* WiFi card: status + radio toggle + hotspot button, under the devices card. */
+.nook-wifi-card {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    padding: 9px 14px;
+    spacing: 6px;
+    min-width: 240px;
+}
+.nook-wifi-row {
+    spacing: 8px;
+}
+.nook-wifi-toggle {
+    padding: 3px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background-color 150ms ease-out;
+}
+.nook-wifi-toggle:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.nook-wifi-icon {
+    color: rgba(255, 255, 255, 0.85);
+}
+.nook-wifi-name {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.9);
+}
+.nook-wifi-sub {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.45);
+}
+/* Hotspot toggle button — a small square that lights up when the AP is live. */
+.nook-wifi-hotspot {
+    padding: 6px;
+    border-radius: 9px;
+    color: rgba(255, 255, 255, 0.8);
+    transition: background-color 150ms ease-out;
+}
+.nook-wifi-hotspot:hover {
+    background-color: rgba(255, 255, 255, 0.10);
+}
+.nook-wifi-hotspot-on {
+    background-color: rgba(120, 170, 255, 0.22);
+    color: #ffffff;
+}
+
+/* WiFi card header: eyebrow + hotspot + Wi-Fi radio toggle on one line. */
+.nook-wifi-head {
+    spacing: 8px;
+}
+/* Saved/known networks added straight to the card, capped at 3 with "+N more…". */
+.nook-wifi-list {
+    spacing: 3px;
+    margin-top: 2px;
+}
+.nook-wifi-net-row {
+    padding: 3px 6px;
+    margin: 0 -6px;
+    border-radius: 8px;
+    transition: background-color 150ms ease-out;
+}
+.nook-wifi-net-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.nook-wifi-net-icon {
+    color: rgba(255, 255, 255, 0.7);
+}
+.nook-wifi-net-name {
+    font-size: 12px;
+    color: #eaeaee;
+    margin-left: 8px;
+}
+.nook-wifi-net-sub {
+    font-size: 10px;
+    color: rgba(120, 200, 140, 0.9);
+}
+
+/* --- Scan overlay (Add Bluetooth device / Add Wi-Fi network) --- */
+/* Dimming scrim that covers the dashboard; the card centers within it. */
+.nook-scan-overlay {
+    background-color: rgba(10, 10, 12, 0.55);
+    border-radius: 18px;
+}
+.nook-scan-card {
+    background-color: rgba(28, 28, 32, 0.98);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 16px;
+    padding: 14px 16px;
+    spacing: 10px;
+    width: 340px;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+    /* Drop from just under the header rather than hug the very top edge. */
+    margin-top: 64px;
+}
+.nook-scan-header {
+    spacing: 8px;
+}
+.nook-scan-title {
+    font-size: 13px;
+    font-weight: bold;
+    color: #f2f2f4;
+}
+.nook-scan-close {
+    padding: 4px;
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.7);
+    transition: background-color 150ms ease-out;
+}
+.nook-scan-close:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+.nook-scan-status {
+    font-size: 10.5px;
+    color: rgba(255, 255, 255, 0.45);
+}
+.nook-scan-scroll {
+    max-height: 210px;
+}
+.nook-scan-body {
+    spacing: 3px;
+}
+.nook-scan-empty {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.4);
+    padding: 8px 2px;
+}
+.nook-scan-row {
+    padding: 7px 8px;
+    border-radius: 9px;
+    transition: background-color 150ms ease-out;
+}
+.nook-scan-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+.nook-scan-row-icon {
+    color: rgba(255, 255, 255, 0.8);
+}
+.nook-scan-row-name {
+    font-size: 12.5px;
+    color: #eaeaee;
+    margin-left: 10px;
+}
+.nook-scan-row-lock {
+    color: rgba(255, 255, 255, 0.5);
+    margin: 0 6px;
+}
+.nook-scan-row-sub {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.5);
+}
+/* Inline password entry for a secure Wi-Fi network. */
+.nook-scan-pw {
+    spacing: 8px;
+    padding: 4px 2px 8px 2px;
+}
+.nook-scan-entry {
+    font-size: 12px;
+    color: #f0f0f2;
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+.nook-scan-entry:focus {
+    border: 1px solid rgba(120, 170, 255, 0.7);
+    background-color: rgba(255, 255, 255, 0.12);
+}
+.nook-scan-connect {
+    font-size: 12px;
+    color: #ffffff;
+    background-color: rgba(120, 170, 255, 0.28);
+    border-radius: 8px;
+    padding: 6px 14px;
+    transition: background-color 150ms ease-out;
+}
+.nook-scan-connect:hover {
+    background-color: rgba(120, 170, 255, 0.42);
+}
+
 .nook-tray-tooltip {
     background-color: rgba(20, 20, 22, 0.95);
     border: 1px solid rgba(255, 255, 255, 0.10);
@@ -662,6 +933,22 @@
     color: rgba(255, 255, 255, 0.55);
     width: 32px;
     text-align: right;
+}
+
+/* "Connected" / "Paired" status badges on device rows. These carry words, not
+ * a "NN%" reading, so they drop the narrow fixed width and size to the text.
+ * Connected is accent-tinted to read as active; paired is muted (tap to
+ * connect). */
+.nook-device-badge-connected,
+.nook-device-badge-paired {
+    width: auto;
+    min-width: 52px;
+}
+.nook-device-badge-connected {
+    color: rgba(255, 255, 255, 0.85);
+}
+.nook-device-badge-paired {
+    color: rgba(255, 255, 255, 0.4);
 }
 
 /* Quick-toggle grid */

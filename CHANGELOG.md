@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Tray tab networking overhaul — device/network lists, radio toggles, and
+  in-notch scanning**:
+  - The **Devices card** is now shorter and scrolls: it shows about three
+    accessories at a time and scrolls when there are more, instead of capping at
+    three. A **Bluetooth radio toggle** sits in the card header, and an **Add
+    device…** row opens an in-notch overlay that powers Bluetooth on, scans for
+    nearby devices, and pairs + connects the one you tap (works for "Just Works"
+    devices; no PIN entry).
+  - The **Wi-Fi card** gains a dedicated **Wi-Fi radio toggle** (alongside the
+    existing hotspot button) and now lists your **saved/known networks** below the
+    status line — the connected one is badged, and tapping another activates it.
+    The list scrolls past ~3 entries. An **Add network…** row opens an overlay
+    that scans for available access points; secure networks reveal an inline
+    password field so you can join a new network without leaving the notch.
+  - New NetworkManager helpers back this (saved-connection listing, rescan,
+    access-point enumeration, activate-saved, and create-and-connect), plus BlueZ
+    helpers for adapter power, discovery start/stop, nearby-device enumeration and
+    pair-then-connect. All calls are async so the shell never blocks.
+
 - **Backdrop blur / "glass" appearance**: a new **Glass & Blur** group in
   preferences composites a real gaussian blur of the wallpaper and windows
   behind the notch (via `Shell.BlurEffect` in `BACKGROUND` mode). Choose a glass
@@ -21,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picking a style applies a complete look (tint + rim + strength) and moves the
   strength sliders to match — and a **Reset to defaults** button restores the
   shipped style and strengths in one click.
+- **WiFi row in the Tray tab**: a compact Wi-Fi card sits below the devices card
+  (beside the mirrored top-bar row), showing the radio state and the connected
+  network's name + signal. Click the row to toggle Wi-Fi on/off. A **hotspot**
+  button starts/stops a Wi-Fi hotspot — it reuses an existing hotspot connection
+  if you have one, otherwise creates a WPA2 access point and notifies you of the
+  generated SSID and password. Uses NetworkManager; the row hides itself when
+  there's no Wi-Fi hardware.
 - **Pick which indicators the Tray tab mirrors**: a new **Mirrored indicators**
   group in preferences lists every top-bar / Quick Settings indicator NotchNux can
   mirror, each with its own switch, so you can hide the ones you don't want in the

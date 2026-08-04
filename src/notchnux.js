@@ -179,6 +179,12 @@ export const NotchNux = GObject.registerClass({
         // Mic mute + mic/camera in-use changes repaint the pill indicators.
         this._system.onMicChanged = () => this._updatePrivacyIndicators();
         this._system.onPrivacyChanged = () => this._updatePrivacyIndicators();
+        // WiFi/NM state changes (incl. NM finishing its async startup) re-render
+        // the Tray tab so the WiFi row populates and stays live.
+        this._system.onWifiChanged = () => {
+            if (this.isExpanded && this._activeTab === 'system')
+                this._renderActiveTab();
+        };
 
         if (this._config.isFeatureEnabled('calendarSync'))
             this._initCalendarServer();
@@ -466,6 +472,10 @@ export const NotchNux = GObject.registerClass({
         if (this._trayToggleRefreshId) {
             GLib.Source.remove(this._trayToggleRefreshId);
             this._trayToggleRefreshId = 0;
+        }
+        if (this._trayReRenderId) {
+            GLib.Source.remove(this._trayReRenderId);
+            this._trayReRenderId = 0;
         }
     }
 
@@ -1680,6 +1690,9 @@ export const NotchNux = GObject.registerClass({
         // close any open device pickers before their actors are freed. Recording
         // (if any) intentionally survives a tab switch.
         this._teardownStudio();
+        // Close any open WiFi/Bluetooth scan overlay before its actors (and the
+        // tab content it floats over) are freed; also stops discovery/timers.
+        this._closeScanOverlay();
         this._contentContainer.destroy_all_children();
         switch (this._activeTab) {
             case 'media': this._renderMediaTab(); break;
@@ -2477,58 +2490,69 @@ export const NotchNux = GObject.registerClass({
         // x_expand lets it flex to fill the space left by the fixed-width toggle
         // grid instead of overrunning the panel with a hard-coded width.
         let devCard = new St.BoxLayout({ style_class: 'nook-devices-card', vertical: true, x_expand: true });
-        devCard.add_child(new St.Label({ text: 'DEVICES', style_class: 'nook-card-eyebrow' }));
-        let devices = this._system.getBluetoothDevices();
+        // Header row: eyebrow on the left, Bluetooth radio toggle on the right.
+        let devHead = new St.BoxLayout({ style_class: 'nook-devices-head', vertical: false, x_expand: true });
+        devHead.add_child(new St.Label({ text: 'DEVICES', style_class: 'nook-card-eyebrow',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        let btOn = this._system.getBluetoothPowered();
+        let btToggle = new St.Button({
+            style_class: 'nook-mini-toggle' + (btOn ? ' nook-mini-toggle-on' : ''),
+            reactive: true, can_focus: true, y_align: Clutter.ActorAlign.CENTER });
+        btToggle.set_child(new St.Icon({
+            icon_name: btOn ? 'bluetooth-active-symbolic' : 'bluetooth-disabled-symbolic',
+            icon_size: 14 }));
+        btToggle.connect('clicked', () => {
+            btToggle.reactive = false;
+            this._system.setBluetoothRadio(!btOn, () => this._scheduleTrayReRender());
+        });
+        devHead.add_child(btToggle);
+        devCard.add_child(devHead);
+
+        // The bluez list is fetched async: the first call returns an empty
+        // snapshot and the paired/connected devices land a tick later. Pass a
+        // callback so the card re-renders as soon as they populate instead of
+        // showing only "This device" until the next 3s poll.
+        let devices = this._system.getBluetoothDevices(() => this._scheduleTrayReRender());
         let bat = this._system.getBatteryInfo();
         let rows = [{ name: 'This device', icon: 'battery-good-symbolic', pct: bat.percentage }];
-        for (let d of devices.slice(0, 3))
+        // Show every paired/connected accessory inline (like the pair overlay,
+        // minus live scanning) so the user can connect straight from the card.
+        // The list grows with content and scrolls past ~4 rows.
+        for (let d of devices)
             rows.push({ name: d.name, icon: d.icon, pct: d.percentage,
-                status: d.connected ? 'On' : d.type,
+                status: d.connected ? 'Connected' : 'Paired',
                 // Carry the fields needed to toggle the connection on click.
                 dbusPath: d.dbusPath, connected: d.connected, bluetooth: true });
         if (rows.length === 1)
             rows.push({ name: 'No wireless devices', icon: 'bluetooth-disconnected-symbolic', pct: null });
-        for (let d of rows) {
-            // Paired Bluetooth devices become clickable so the whole row toggles
-            // its connection; everything else stays a plain, non-reactive row.
-            let clickable = d.bluetooth && d.dbusPath;
-            let row = clickable
-                ? new St.Button({ style_class: 'nook-device-row nook-device-row-btn', reactive: true, x_expand: true, can_focus: true })
-                : new St.BoxLayout({ style_class: 'nook-device-row', vertical: false, x_expand: true });
-            let inner = clickable
-                ? new St.BoxLayout({ vertical: false, x_expand: true })
-                : row;
-            inner.add_child(new St.Icon({ icon_name: d.icon, icon_size: 16, style_class: 'nook-device-icon', y_align: Clutter.ActorAlign.CENTER }));
-            inner.add_child(new St.Label({ text: d.name, style_class: 'nook-device-name', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-            if (Number.isFinite(d.pct)) {
-                const TRACK_W = 44;
-                let track = new St.BoxLayout({ style_class: 'nook-batt-track', y_align: Clutter.ActorAlign.CENTER });
-                let low = d.pct <= 25;
-                let fill = new St.Widget({ style_class: low ? 'nook-batt-fill nook-batt-low' : 'nook-batt-fill' });
-                // Normal fill follows the accent; the low state keeps its amber
-                // warning colour, so only tint when not low.
-                if (!low) fill.set_style(`background-color: ${accentHex()};`);
-                fill.set_width(Math.max(3, Math.round((TRACK_W / 100) * d.pct)));
-                track.add_child(fill);
-                inner.add_child(track);
-                inner.add_child(new St.Label({ text: `${d.pct}%`, style_class: 'nook-device-pct', y_align: Clutter.ActorAlign.CENTER }));
-            } else if (d.status) {
-                inner.add_child(new St.Label({ text: clickable && !d.connected ? 'Connect' : d.status,
-                    style_class: 'nook-device-pct', y_align: Clutter.ActorAlign.CENTER }));
-            }
-            if (clickable) {
-                row.set_child(inner);
-                let want = !d.connected;
-                row.connect('clicked', () => {
-                    row.reactive = false;
-                    this._system.setBluetoothConnected(d.dbusPath, want, (ok) => {
-                        this._renderActiveTab();
-                    });
-                });
-            }
-            devCard.add_child(row);
-        }
-        lower.add_child(devCard);
+
+        // Rows are added straight to the card (a ScrollView collapses to zero
+        // height in this side-by-side layout). To keep the card compact we cap
+        // at DEV_CAP rows and add a "+N more…" line that opens the full list in
+        // the pair overlay.
+        const DEV_CAP = 3;
+        let devList = new St.BoxLayout({ style_class: 'nook-devices-list', vertical: true, x_expand: true });
+        for (let d of rows.slice(0, DEV_CAP))
+            devList.add_child(this._buildDeviceRow(d));
+        let devExtra = rows.length - DEV_CAP;
+        if (devExtra > 0)
+            devList.add_child(this._buildMoreRow(`+${devExtra} more…`, () => this._openBluetoothScanOverlay()));
+        devCard.add_child(devList);
+
+        // Footer: scan for and pair a new device via the in-notch overlay.
+        let addDev = new St.Button({ style_class: 'nook-add-row', reactive: true, x_expand: true, can_focus: true });
+        let addDevInner = new St.BoxLayout({ vertical: false, x_expand: true });
+        addDevInner.add_child(new St.Icon({ icon_name: 'list-add-symbolic', icon_size: 14,
+            style_class: 'nook-add-icon', y_align: Clutter.ActorAlign.CENTER }));
+        addDevInner.add_child(new St.Label({ text: 'Add device…', style_class: 'nook-add-label',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        addDev.set_child(addDevInner);
+        addDev.connect('clicked', () => this._openBluetoothScanOverlay());
+        devCard.add_child(addDev);
+
+        // devCard is added to the left column further down (stacked above WiFi)
+        // rather than straight into the lower row, so the two cards together
+        // fill the toggle cluster's height with no gap below "Add device…".
 
         // Quick-toggles arranged in a plus around a central circular airplane
         // button. Each arm is a rounded tile whose center-facing corners are
@@ -2625,21 +2649,537 @@ export const NotchNux = GObject.registerClass({
         cluster.add_child(left);
         cluster.add_child(right);
         cluster.add_child(center);
-        lower.add_child(cluster);
 
-        panel.add_child(lower);
+        // Two-column lower area: the left column stacks DEVICES over WIFI so
+        // together they fill the right column's height (toggle cluster + TOP
+        // BAR) with no dead space. The right column stacks the cluster over the
+        // mirrored top-bar row.
+        let leftCol = new St.BoxLayout({ style_class: 'nook-tray-leftcol', vertical: true, x_expand: true });
+        leftCol.add_child(devCard);
+        let wifiCard = this._buildWifiCard();
+        if (wifiCard)
+            leftCol.add_child(wifiCard);
 
-        // --- Mirrored top-bar indicators (extensions + system status area) ---
+        let rightCol = new St.BoxLayout({ style_class: 'nook-tray-rightcol', vertical: true });
+        rightCol.add_child(cluster);
+
+        // Mirrored top-bar indicators (extensions + system status area).
         // Non-destructive: the real panel keeps its actors; we render a row of
         // icons that mirror Main.panel.statusArea and open each indicator's own
         // menu when clicked. Lets the notch stand in for the (often hidden) bar.
         if (this._config.isFeatureEnabled('mirrorTray')) {
             let tray = this._buildTrayMirror();
-            if (tray)
-                panel.add_child(tray);
+            if (tray) {
+                tray.add_style_class_name('nook-tray-mirror-beside');
+                // Grow to fill the space left under the cluster so its height
+                // matches the WiFi card beside it instead of hugging one icon row.
+                tray.y_expand = true;
+                tray.y_align = Clutter.ActorAlign.FILL;
+                rightCol.add_child(tray);
+            }
         }
 
+        lower.add_child(leftCol);
+        lower.add_child(rightCol);
+        panel.add_child(lower);
+
         this._contentContainer.add_child(panel);
+    }
+
+    // A muted "+N more…" row that reveals the full list in an overlay. Used to
+    // cap the DEVICES / WIFI cards at a few rows without a (collapsing)
+    // ScrollView.
+    _buildMoreRow(label, onClick) {
+        let row = new St.Button({ style_class: 'nook-more-row', reactive: true, x_expand: true, can_focus: true });
+        row.set_child(new St.Label({ text: label, style_class: 'nook-more-label',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        row.connect('clicked', onClick);
+        return row;
+    }
+
+    // Build one DEVICES-card row from a descriptor. Paired Bluetooth devices
+    // (those carrying a dbusPath) become buttons whose whole row toggles the
+    // connection on click; everything else is a plain, non-reactive row.
+    _buildDeviceRow(d) {
+        let clickable = d.bluetooth && d.dbusPath;
+        let row = clickable
+            ? new St.Button({ style_class: 'nook-device-row nook-device-row-btn', reactive: true, x_expand: true, can_focus: true })
+            : new St.BoxLayout({ style_class: 'nook-device-row', vertical: false, x_expand: true });
+        let inner = clickable
+            ? new St.BoxLayout({ vertical: false, x_expand: true })
+            : row;
+        inner.add_child(new St.Icon({ icon_name: d.icon, icon_size: 16, style_class: 'nook-device-icon', y_align: Clutter.ActorAlign.CENTER }));
+        inner.add_child(new St.Label({ text: d.name, style_class: 'nook-device-name', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        // A connected device with a known battery level shows its gauge; a
+        // paired-but-disconnected device shows its "Paired" badge (tap to
+        // connect) even if it reported a stale battery reading.
+        let showPct = Number.isFinite(d.pct) && !(clickable && !d.connected);
+        if (showPct) {
+            const TRACK_W = 44;
+            let track = new St.BoxLayout({ style_class: 'nook-batt-track', y_align: Clutter.ActorAlign.CENTER });
+            let low = d.pct <= 25;
+            let fill = new St.Widget({ style_class: low ? 'nook-batt-fill nook-batt-low' : 'nook-batt-fill' });
+            // Normal fill follows the accent; the low state keeps its amber
+            // warning colour, so only tint when not low.
+            if (!low) fill.set_style(`background-color: ${accentHex()};`);
+            fill.set_width(Math.max(3, Math.round((TRACK_W / 100) * d.pct)));
+            track.add_child(fill);
+            inner.add_child(track);
+            inner.add_child(new St.Label({ text: `${d.pct}%`, style_class: 'nook-device-pct', y_align: Clutter.ActorAlign.CENTER }));
+        } else if (d.status) {
+            // "Connected" / "Paired" badge. Paired-but-disconnected rows are
+            // tappable to connect; the hover highlight on the row signals that.
+            let badgeCls = 'nook-device-pct'
+                + (clickable && !d.connected ? ' nook-device-badge-paired'
+                    : d.connected ? ' nook-device-badge-connected' : '');
+            inner.add_child(new St.Label({ text: d.status,
+                style_class: badgeCls, y_align: Clutter.ActorAlign.CENTER }));
+        }
+        if (clickable) {
+            row.set_child(inner);
+            let want = !d.connected;
+            row.connect('clicked', () => {
+                row.reactive = false;
+                this._system.setBluetoothConnected(d.dbusPath, want, (ok) => {
+                    this._renderActiveTab();
+                });
+            });
+        }
+        return row;
+    }
+
+    // WiFi status + toggle card for the Tray tab, or null when there's no WiFi
+    // hardware (or NM isn't up yet). Clicking the row toggles the WiFi radio; the
+    // hotspot button starts/stops an AP-mode connection. Sits under the devices
+    // card; kept compact so it and the top-bar row share one strip.
+    _buildWifiCard() {
+        let info = this._system.getWifiInfo();
+        if (!info.available) return null;
+
+        let card = new St.BoxLayout({ style_class: 'nook-wifi-card', vertical: true, x_expand: true });
+
+        // Header: eyebrow + hotspot button + Wi-Fi radio toggle. The radio and
+        // hotspot are explicit controls now; the network list below handles
+        // connecting to individual networks.
+        let head = new St.BoxLayout({ style_class: 'nook-wifi-head', vertical: false, x_expand: true });
+        head.add_child(new St.Label({ text: 'WIFI', style_class: 'nook-card-eyebrow',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+
+        // Hotspot button — only meaningful while WiFi is on.
+        let hotBtn = new St.Button({
+            style_class: 'nook-wifi-hotspot' + (info.hotspot ? ' nook-wifi-hotspot-on' : ''),
+            reactive: info.enabled, can_focus: info.enabled, y_align: Clutter.ActorAlign.CENTER,
+        });
+        hotBtn.set_child(new St.Icon({ icon_name: 'network-wireless-hotspot-symbolic', icon_size: 15 }));
+        hotBtn.set_opacity(info.enabled ? 255 : 90);
+        hotBtn.connect('clicked', () => {
+            if (!info.enabled) return;
+            hotBtn.reactive = false;
+            this._system.setHotspotEnabled(!info.hotspot, (ok, detail) => {
+                if (ok && detail && detail.ssid)
+                    Main.notify('NotchNux Hotspot',
+                        `SSID: ${detail.ssid}\nPassword: ${detail.password}`);
+                // Warn when the client had to be dropped: this adapter can only
+                // share a channel for AP+client on 2.4 GHz, and we were on 5 GHz.
+                if (ok && detail && detail.concurrent === false)
+                    Main.notify('NotchNux Hotspot',
+                        'Wi-Fi was on a 5 GHz channel, which can\'t host a hotspot. ' +
+                        'The hotspot started on 2.4 GHz and the Wi-Fi connection was dropped ' +
+                        '(this adapter has a single radio).');
+                this._scheduleTrayReRender();
+            });
+        });
+        head.add_child(hotBtn);
+
+        // Wi-Fi radio toggle (mirrors the Bluetooth mini-toggle).
+        let wifiToggle = new St.Button({
+            style_class: 'nook-mini-toggle' + (info.enabled ? ' nook-mini-toggle-on' : ''),
+            reactive: true, can_focus: true, y_align: Clutter.ActorAlign.CENTER });
+        wifiToggle.set_child(new St.Icon({
+            icon_name: info.enabled ? 'network-wireless-signal-good-symbolic'
+                : 'network-wireless-offline-symbolic',
+            icon_size: 14 }));
+        wifiToggle.connect('clicked', () => {
+            wifiToggle.reactive = false;
+            this._system.setWifiEnabled(!info.enabled);
+            this._scheduleTrayReRender();
+        });
+        head.add_child(wifiToggle);
+        card.add_child(head);
+
+        // Off / hotspot / not-connected states have no network list, so they
+        // get a one-line status row. When actually connected we skip this and
+        // show the connected network as the first item of the list below
+        // (mirrors how DEVICES lists "This device" as a normal row).
+        if (!info.enabled || info.hotspot || !info.connected) {
+            let statusIcon = info.hotspot ? 'network-wireless-hotspot-symbolic'
+                : info.enabled ? 'network-wireless-signal-none-symbolic'
+                : 'network-wireless-offline-symbolic';
+            let primary = !info.enabled ? 'Wi-Fi Off'
+                : info.hotspot ? 'Hotspot'
+                : 'Not connected';
+            let secondary = !info.enabled ? 'Off'
+                : info.hotspot ? 'Sharing'
+                : 'On';
+            let statusRow = new St.BoxLayout({ style_class: 'nook-wifi-row', vertical: false, x_expand: true });
+            statusRow.add_child(new St.Icon({ icon_name: statusIcon, icon_size: 16, style_class: 'nook-wifi-icon', y_align: Clutter.ActorAlign.CENTER }));
+            statusRow.add_child(new St.Label({ text: primary, style_class: 'nook-wifi-name', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+            statusRow.add_child(new St.Label({ text: secondary, style_class: 'nook-wifi-sub', y_align: Clutter.ActorAlign.CENTER }));
+            card.add_child(statusRow);
+        }
+
+        // Saved/known networks — the connected one first (showing its signal %),
+        // then other saved profiles to click-to-connect. Added straight to the
+        // card (a ScrollView collapses to zero height here); capped at NET_CAP
+        // with a "+N more…" line into the scan overlay.
+        if (info.enabled && !info.hotspot) {
+            let saved = this._system.getSavedWifiConnections();
+            if (saved.length > 0) {
+                const NET_CAP = 3;
+                let list = new St.BoxLayout({ style_class: 'nook-wifi-list', vertical: true, x_expand: true });
+                for (let net of saved.slice(0, NET_CAP))
+                    list.add_child(this._buildSavedWifiRow(net));
+                let netExtra = saved.length - NET_CAP;
+                if (netExtra > 0)
+                    list.add_child(this._buildMoreRow(`+${netExtra} more…`, () => this._openWifiScanOverlay()));
+                card.add_child(list);
+            }
+
+            // Footer: scan for and join a new network via the overlay.
+            let addNet = new St.Button({ style_class: 'nook-add-row', reactive: true, x_expand: true, can_focus: true });
+            let addNetInner = new St.BoxLayout({ vertical: false, x_expand: true });
+            addNetInner.add_child(new St.Icon({ icon_name: 'list-add-symbolic', icon_size: 14,
+                style_class: 'nook-add-icon', y_align: Clutter.ActorAlign.CENTER }));
+            addNetInner.add_child(new St.Label({ text: 'Add network…', style_class: 'nook-add-label',
+                x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+            addNet.set_child(addNetInner);
+            addNet.connect('clicked', () => this._openWifiScanOverlay());
+            card.add_child(addNet);
+        }
+
+        return card;
+    }
+
+    // One saved-network row in the WiFi card. Clicking activates that saved
+    // profile; the currently-connected one is badged and non-actionable.
+    _buildSavedWifiRow(net) {
+        let row = new St.Button({ style_class: 'nook-wifi-net-row', reactive: !net.connected,
+            can_focus: !net.connected, x_expand: true });
+        let inner = new St.BoxLayout({ vertical: false, x_expand: true });
+        inner.add_child(new St.Icon({
+            icon_name: net.connected ? 'network-wireless-signal-excellent-symbolic'
+                : 'network-wireless-signal-good-symbolic',
+            icon_size: 14, style_class: 'nook-wifi-net-icon', y_align: Clutter.ActorAlign.CENTER }));
+        inner.add_child(new St.Label({ text: net.ssid, style_class: 'nook-wifi-net-name',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        // The connected network is just a normal row marked "Connected" (no
+        // percentage readout); other rows are clickable to switch to them.
+        if (net.connected)
+            inner.add_child(new St.Label({ text: 'Connected',
+                style_class: 'nook-wifi-net-sub', y_align: Clutter.ActorAlign.CENTER }));
+        row.set_child(inner);
+        if (!net.connected) {
+            row.connect('clicked', () => {
+                row.reactive = false;
+                this._system.activateSavedWifi(net.uuid, (ok, err) => {
+                    if (!ok) {
+                        row.reactive = true;
+                        Main.notify('NotchNux Wi-Fi',
+                            err === 'not in range'
+                                ? `${net.ssid} is not in range`
+                                : `Could not connect to ${net.ssid}` + (err ? `: ${err}` : ''));
+                    }
+                    this._scheduleTrayReRender();
+                });
+            });
+        }
+        return row;
+    }
+
+    // ============================================================
+    // Scan overlays (Bluetooth pair / WiFi connect)
+    // ============================================================
+
+    // Open a modal-style overlay over the dashboard: a dimming scrim plus a
+    // centered card with a title, close (X) button and a caller-populated body.
+    // Returns { overlay, body, setStatus } so the caller can fill/refresh the
+    // body and show a status line. Only one overlay exists at a time; opening a
+    // new one closes the previous. Escape or a scrim click closes it.
+    //
+    // `onClose` (optional) runs on teardown so callers can stop discovery/scans.
+    _openScanOverlay({ title, onClose }) {
+        this._closeScanOverlay();
+
+        let overlay = new St.Widget({
+            style_class: 'nook-scan-overlay',
+            reactive: true,
+            layout_manager: new Clutter.BinLayout(),
+        });
+        // Pin the overlay exactly over the dashboard (position + size), even as
+        // it resizes. It's parented to the top-level BinLayout actor — NOT to the
+        // vertical `_dashboard` BoxLayout, where it would be laid out *below* the
+        // content instead of floating on top of it.
+        overlay.add_constraint(new Clutter.BindConstraint({
+            source: this._dashboard, coordinate: Clutter.BindCoordinate.POSITION }));
+        overlay.add_constraint(new Clutter.BindConstraint({
+            source: this._dashboard, coordinate: Clutter.BindCoordinate.SIZE }));
+
+        // Card floats near the top of the dashboard (just under the header) so
+        // it reads as a sheet dropping from the notch, not a box centered in the
+        // tall dashboard allocation.
+        let card = new St.BoxLayout({ style_class: 'nook-scan-card', vertical: true,
+            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.START });
+
+        let header = new St.BoxLayout({ style_class: 'nook-scan-header', vertical: false, x_expand: true });
+        header.add_child(new St.Label({ text: title, style_class: 'nook-scan-title',
+            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+        let closeBtn = new St.Button({ style_class: 'nook-scan-close', reactive: true, can_focus: true });
+        closeBtn.set_child(new St.Icon({ icon_name: 'window-close-symbolic', icon_size: 14 }));
+        closeBtn.connect('clicked', () => this._closeScanOverlay());
+        header.add_child(closeBtn);
+        card.add_child(header);
+
+        let status = new St.Label({ text: '', style_class: 'nook-scan-status' });
+        status.visible = false;
+        card.add_child(status);
+
+        let scroll = new St.ScrollView({ style_class: 'nook-scan-scroll', x_expand: true });
+        scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
+        let body = new St.BoxLayout({ style_class: 'nook-scan-body', vertical: true, x_expand: true });
+        scroll.set_child(body);
+        card.add_child(scroll);
+
+        overlay.add_child(card);
+        // A click on the scrim (outside the card) closes; clicks on the card are
+        // swallowed so they don't bubble up to the scrim handler.
+        overlay.connect('button-press-event', () => { this._closeScanOverlay(); return Clutter.EVENT_STOP; });
+        card.reactive = true;
+        card.connect('button-press-event', () => Clutter.EVENT_STOP);
+        // Escape closes the overlay.
+        overlay.connect('key-press-event', (a, ev) => {
+            if (ev.get_key_symbol() === Clutter.KEY_Escape) { this._closeScanOverlay(); return Clutter.EVENT_STOP; }
+            return Clutter.EVENT_PROPAGATE;
+        });
+
+        // Parent to the top-level BinLayout actor so the overlay stacks *over*
+        // the dashboard (BinLayout overlays children) rather than being appended
+        // below it as another vertical box row.
+        this.add_child(overlay);
+        overlay.grab_key_focus();
+
+        this._scanOverlay = { overlay, body, onClose, timerId: 0,
+            setStatus: (text) => {
+                if (!text) { status.visible = false; return; }
+                status.text = text; status.visible = true;
+            } };
+        return this._scanOverlay;
+    }
+
+    // Tear down the current scan overlay, running its onClose (stop discovery /
+    // scan timers) and removing the actor. Safe to call when none is open.
+    _closeScanOverlay() {
+        let ov = this._scanOverlay;
+        if (!ov) return;
+        this._scanOverlay = null;
+        if (ov.timerId) { GLib.Source.remove(ov.timerId); ov.timerId = 0; }
+        try { if (ov.onClose) ov.onClose(); } catch (e) { /* ignore */ }
+        try { ov.overlay.destroy(); } catch (e) { /* ignore */ }
+        // If state changed while the overlay was up, a re-render was deferred;
+        // run it now so the Tray card reflects the new WiFi/BT state. Guard on
+        // still being on the Tray tab (a tab switch already re-rendered).
+        if (this._trayReRenderPending) {
+            this._trayReRenderPending = false;
+            if (this.isExpanded && this._activeTab === 'system')
+                this._scheduleTrayReRender();
+        }
+    }
+
+    // Bluetooth: power the radio on (if needed), start discovery, and list
+    // nearby devices, refreshing on a timer. Tapping a device pairs+connects it.
+    _openBluetoothScanOverlay() {
+        let ov = this._openScanOverlay({
+            title: 'Add Bluetooth Device',
+            onClose: () => this._system.stopBluetoothDiscovery(),
+        });
+        ov.setStatus('Scanning…');
+
+        // Ensure the adapter is on, then begin discovery.
+        this._system.setBluetoothRadio(true, () => {
+            this._system.startBluetoothDiscovery(() => {});
+        });
+
+        // Track in-flight pair attempts so their rows show a spinner label and
+        // don't get rebuilt out from under the user mid-pair.
+        let pairing = new Set();
+
+        let refresh = () => {
+            if (this._scanOverlay !== ov) return; // closed since scheduled
+            let devices = this._system.getDiscoveredBluetoothDevices();
+            ov.body.destroy_all_children();
+            if (devices.length === 0) {
+                ov.body.add_child(new St.Label({ text: 'Searching for nearby devices…',
+                    style_class: 'nook-scan-empty' }));
+                return;
+            }
+            for (let d of devices) {
+                let busy = pairing.has(d.dbusPath);
+                let row = new St.Button({ style_class: 'nook-scan-row', reactive: !busy,
+                    can_focus: !busy, x_expand: true });
+                let inner = new St.BoxLayout({ vertical: false, x_expand: true });
+                inner.add_child(new St.Icon({ icon_name: d.icon, icon_size: 16,
+                    style_class: 'nook-scan-row-icon', y_align: Clutter.ActorAlign.CENTER }));
+                inner.add_child(new St.Label({ text: d.name, style_class: 'nook-scan-row-name',
+                    x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+                let sub = busy ? 'Pairing…'
+                    : d.connected ? 'Connected'
+                    : d.paired ? 'Paired' : '';
+                inner.add_child(new St.Label({ text: sub, style_class: 'nook-scan-row-sub',
+                    y_align: Clutter.ActorAlign.CENTER }));
+                row.set_child(inner);
+                if (!busy && !d.connected) {
+                    row.connect('clicked', () => {
+                        pairing.add(d.dbusPath);
+                        refresh();
+                        this._system.pairBluetoothDevice(d.dbusPath, (ok, err) => {
+                            pairing.delete(d.dbusPath);
+                            if (!ok)
+                                Main.notify('NotchNux Bluetooth',
+                                    `Could not pair ${d.name}` + (err ? `: ${err}` : ''));
+                            if (this._scanOverlay === ov) refresh();
+                            // Reflect the new connection in the card behind.
+                            this._scheduleTrayReRender();
+                        });
+                    });
+                }
+                ov.body.add_child(row);
+            }
+        };
+
+        refresh();
+        ov.timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+            if (this._scanOverlay !== ov) return GLib.SOURCE_REMOVE;
+            refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    // WiFi: request a scan and list visible access points, refreshing on a
+    // timer. Secure APs reveal an inline password field; open APs connect on
+    // tap. A saved profile for the SSID is reused rather than duplicated.
+    _openWifiScanOverlay() {
+        let ov = this._openScanOverlay({ title: 'Add Wi-Fi Network' });
+        ov.setStatus('Scanning…');
+        this._system.requestWifiScan(() => {});
+
+        // Which SSID currently has its password field expanded (only one at a
+        // time), and any in-flight connect attempts.
+        let expanded = null;
+        let connecting = new Set();
+
+        let refresh = () => {
+            if (this._scanOverlay !== ov) return;
+            let aps = this._system.getWifiAccessPoints();
+            ov.body.destroy_all_children();
+            if (aps.length === 0) {
+                ov.body.add_child(new St.Label({ text: 'Looking for networks…',
+                    style_class: 'nook-scan-empty' }));
+                return;
+            }
+            for (let ap of aps) {
+                let busy = connecting.has(ap.ssid);
+                let sig = ap.signal;
+                let sigIcon = sig >= 75 ? 'network-wireless-signal-excellent-symbolic'
+                    : sig >= 50 ? 'network-wireless-signal-good-symbolic'
+                    : sig >= 25 ? 'network-wireless-signal-ok-symbolic'
+                    : 'network-wireless-signal-weak-symbolic';
+
+                let row = new St.Button({ style_class: 'nook-scan-row', reactive: !busy && !ap.active,
+                    can_focus: !busy && !ap.active, x_expand: true });
+                let inner = new St.BoxLayout({ vertical: false, x_expand: true });
+                inner.add_child(new St.Icon({ icon_name: sigIcon, icon_size: 16,
+                    style_class: 'nook-scan-row-icon', y_align: Clutter.ActorAlign.CENTER }));
+                inner.add_child(new St.Label({ text: ap.ssid, style_class: 'nook-scan-row-name',
+                    x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
+                if (ap.secure)
+                    inner.add_child(new St.Icon({ icon_name: 'channel-secure-symbolic', icon_size: 12,
+                        style_class: 'nook-scan-row-lock', y_align: Clutter.ActorAlign.CENTER }));
+                let sub = busy ? 'Connecting…' : ap.active ? 'Connected' : '';
+                if (sub)
+                    inner.add_child(new St.Label({ text: sub, style_class: 'nook-scan-row-sub',
+                        y_align: Clutter.ActorAlign.CENTER }));
+                row.set_child(inner);
+
+                let connect = (password) => {
+                    connecting.add(ap.ssid);
+                    expanded = null;
+                    refresh();
+                    this._system.connectWifi(ap.ssid, password, (ok, err) => {
+                        connecting.delete(ap.ssid);
+                        if (!ok)
+                            Main.notify('NotchNux Wi-Fi',
+                                err === 'not in range'
+                                    ? `${ap.ssid} is not in range`
+                                    : `Could not connect to ${ap.ssid}` + (err ? `: ${err}` : ''));
+                        if (ok) this._closeScanOverlay();
+                        else if (this._scanOverlay === ov) refresh();
+                        this._scheduleTrayReRender();
+                    });
+                };
+
+                if (!busy && !ap.active) {
+                    row.connect('clicked', () => {
+                        if (!ap.secure) { connect(''); return; }
+                        // Secure: toggle an inline password field for this SSID.
+                        expanded = (expanded === ap.ssid) ? null : ap.ssid;
+                        refresh();
+                    });
+                }
+                ov.body.add_child(row);
+
+                // Inline password entry for the expanded secure network.
+                if (ap.secure && expanded === ap.ssid && !busy) {
+                    let pwRow = new St.BoxLayout({ style_class: 'nook-scan-pw', vertical: false, x_expand: true });
+                    let entry = new St.Entry({ style_class: 'nook-scan-entry',
+                        hint_text: 'Password', can_focus: true, x_expand: true });
+                    entry.clutter_text.set_password_char('●');
+                    entry.clutter_text.connect('activate', () => connect(entry.get_text()));
+                    let go = new St.Button({ style_class: 'nook-scan-connect', reactive: true, can_focus: true });
+                    go.set_child(new St.Label({ text: 'Connect' }));
+                    go.connect('clicked', () => connect(entry.get_text()));
+                    pwRow.add_child(entry);
+                    pwRow.add_child(go);
+                    ov.body.add_child(pwRow);
+                    entry.grab_key_focus();
+                }
+            }
+        };
+
+        // Give NM a moment to populate scan results, then refresh periodically.
+        refresh();
+        ov.timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
+            if (this._scanOverlay !== ov) return GLib.SOURCE_REMOVE;
+            this._system.requestWifiScan(() => {});
+            refresh();
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    // Re-render the Tray tab after a short delay, so NetworkManager state
+    // (WiFi enable, hotspot activation) has time to settle before we read it
+    // back. Coalesces multiple calls into one pending timeout.
+    _scheduleTrayReRender() {
+        if (this._trayReRenderId)
+            GLib.Source.remove(this._trayReRenderId);
+        this._trayReRenderId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 700, () => {
+            this._trayReRenderId = 0;
+            // A full re-render destroys the tab content, which would close an
+            // open scan overlay. Defer it while one is up — _closeScanOverlay
+            // re-renders once the overlay is dismissed so the card catches up.
+            if (this._scanOverlay) { this._trayReRenderPending = true; return GLib.SOURCE_REMOVE; }
+            if (this.isExpanded && this._activeTab === 'system')
+                this._renderActiveTab();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     // Build the mirrored status-area row, or null if there's nothing to show.
@@ -2706,6 +3246,10 @@ export const NotchNux = GObject.registerClass({
             iconRow.add_child(new St.Label({ text: 'No indicators',
                 style_class: 'nook-tray-mirror-empty', y_align: Clutter.ActorAlign.CENTER }));
         }
+        // Let the icon row take the vertical space the card gains from
+        // y_expand, keeping the icons centered in a taller TOP BAR.
+        iconRow.y_expand = true;
+        iconRow.y_align = Clutter.ActorAlign.CENTER;
         card.add_child(iconRow);
         return card;
     }
@@ -5221,6 +5765,7 @@ export const NotchNux = GObject.registerClass({
     collapse() {
         if (!this.isExpanded) return;
         this.isExpanded = false;
+        this._closeScanOverlay();
         this._stopMediaAnimations();
         this._stopSystemRefresh();
         this._surface.remove_style_class_name('notchnux-island-expanded');
