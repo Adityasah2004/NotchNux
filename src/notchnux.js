@@ -2,12 +2,15 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import Soup from 'gi://Soup';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.js';
 
 import { SystemHelper } from './helpers/system.js';
@@ -17,7 +20,7 @@ import { MediaHelper } from './helpers/media.js';
 import { ShelfHelper } from './helpers/shelf.js';
 import { WallpaperHelper } from './helpers/wallpaper.js';
 import { Vinyl, AlbumArtDisc, Knob, RingMeter, AnalogClock, EqBars, CameraView, ACCENT, AMBER, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS } from './helpers/config.js';
+import { ConfigStore, TAB_DEFS, FEATURE_DEFS, blurPreset } from './helpers/config.js';
 
 // Configuration constants
 // Minimum idle width. _pillWidth() measures the actual content (clock + battery
@@ -152,6 +155,12 @@ export const NotchNux = GObject.registerClass({
         this._notifBanner.visible = false;
         // Recolour the active-state chrome to match the persisted accent.
         this._applyAccentStyles();
+        // Attach the backdrop-blur effect (created disabled) and apply the
+        // persisted glass preset + collapsed radius. Real gaussian blur of
+        // whatever is behind the surface; see _applyBlur for how the surface is
+        // made translucent so the blur is actually visible.
+        this._buildBlur();
+        this._applyBlur();
         this.set_size(PILL_WIDTH, PILL_HEIGHT);
 
         // Hover + click on the widget
@@ -185,6 +194,23 @@ export const NotchNux = GObject.registerClass({
 
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this.reposition());
         this.reposition();
+
+        // Keep the notch drawn above window content. addTopChrome with
+        // trackFullscreen:false stops GNOME from *hiding* the notch on the
+        // fullscreen signal, but it does NOT lift it above windows in the
+        // stacking order — so maximizing ANY app (Chrome, Files, …) composites
+        // that window over the top strip and the notch visually disappears.
+        // The shell restacks its actors on every window map/raise/focus change,
+        // so re-raise the notch to the top of its parent on each 'restacked'.
+        this._restackedId = global.display.connect('restacked', () => {
+            this._raiseToTop();
+            // A restack means a window was raised/mapped/minimized or the
+            // workspace switched — any of which can change whether a window now
+            // covers the top strip. Re-evaluate the unredirect inhibit (cheap
+            // no-op unless the reclaim watch is active).
+            this._queueUnredirectUpdate();
+        });
+        this._raiseToTop();
 
         // Watch the config file so edits made in the separate prefs.js process
         // apply to the live notch without a shell restart.
@@ -268,6 +294,8 @@ export const NotchNux = GObject.registerClass({
             tabsKey: JSON.stringify(this._config.visibleTabs),
             features,
             wallpaperKey: JSON.stringify(this._config.wallpaper),
+            blurKey: JSON.stringify(this._config.blur),
+            trayMirrorKey: this._config.trayMirrorKey,
         };
     }
 
@@ -313,6 +341,12 @@ export const NotchNux = GObject.registerClass({
             this._applyAccentStyles();
         }
 
+        // Blur/glass changed in prefs: re-apply the preset + current-state
+        // radius. _applyBlur reads the new config and enables/disables the
+        // effect as needed.
+        if (next.blurKey !== prev.blurKey)
+            this._applyBlur();
+
         // Feature toggles: run the same live-apply logic the in-notch panel used.
         for (let f of FEATURE_DEFS) {
             if (next.features[f.id] !== prev.features[f.id])
@@ -334,6 +368,15 @@ export const NotchNux = GObject.registerClass({
             this._tabOrder = this._config.visibleTabs;
             this._rebuildDashboard();
         }
+
+        // Which indicators the Tray tab mirrors changed in prefs: repaint the
+        // Tray tab so the row reflects the new selection. Only meaningful while
+        // it's the visible tab; otherwise the next render picks it up. Guarded on
+        // the user's enable map (trayMirrorKey), not the published catalog, so
+        // our own catalog writes don't re-enter here.
+        if (next.trayMirrorKey !== prev.trayMirrorKey &&
+            this._activeTab === 'system' && this.isExpanded)
+            this._renderActiveTab();
     }
 
     destroy() {
@@ -343,6 +386,13 @@ export const NotchNux = GObject.registerClass({
         this._stopMediaAnimations();
         this._stopPillMarquee();
         if (this._pillEq) this._pillEq.stop();
+        if (this._blurRadiusTimeline) {
+            this._blurRadiusTimeline.stop();
+            this._blurRadiusTimeline = null;
+        }
+        // Restore clipped redraws — this Clutter flag is compositor-global, so
+        // it must never outlive the extension.
+        this._setClippedRedrawsDisabled(false);
         this._destroyCalendarServer();
         this._teardownStudio();
         if (this._media) { this._media.destroy(); this._media = null; }
@@ -377,6 +427,10 @@ export const NotchNux = GObject.registerClass({
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
         }
+        if (this._restackedId) {
+            global.display.disconnect(this._restackedId);
+            this._restackedId = 0;
+        }
         super.destroy();
     }
 
@@ -409,6 +463,19 @@ export const NotchNux = GObject.registerClass({
             GLib.Source.remove(this._tabScrollFrameId);
             this._tabScrollFrameId = 0;
         }
+        if (this._trayToggleRefreshId) {
+            GLib.Source.remove(this._trayToggleRefreshId);
+            this._trayToggleRefreshId = 0;
+        }
+    }
+
+    // Lift the notch to the top of its parent so no window (maximized or
+    // fullscreen) is composited over it. Cheap: a single actor sibling move.
+    // Guarded so a mid-teardown call (parent gone) can't throw.
+    _raiseToTop() {
+        let parent = this.get_parent();
+        if (!parent) return;
+        try { parent.set_child_above_sibling(this, null); } catch (e) {}
     }
 
     reposition() {
@@ -416,6 +483,9 @@ export const NotchNux = GObject.registerClass({
         if (!monitor) return;
         let width = this.isExpanded ? DASHBOARD_WIDTH : this._pillWidth();
         this.set_position(monitor.x + Math.floor((monitor.width - width) / 2), monitor.y);
+        // Keep the top-edge scroll strip aligned to the (possibly new) primary
+        // monitor geometry.
+        this._positionTopScroll();
     }
 
     // Measure how tall the currently-rendered dashboard wants to be at the
@@ -979,6 +1049,25 @@ export const NotchNux = GObject.registerClass({
         // Visibility: hide/show the whole panel box.
         panelBox.visible = !hide;
 
+        // GNOME re-shows panelBox during its own region/visibility recomputes
+        // (opening or maximizing a window, workspace switches, leaving the
+        // overview). Our single assignment above would be undone, so while the
+        // panel is meant to be hidden we watch notify::visible and immediately
+        // re-hide it. The guard is torn down when hide turns off or on teardown.
+        if (hide) {
+            if (!this._panelVisibleWatchId) {
+                this._panelVisibleWatchId = panelBox.connect('notify::visible', () => {
+                    // Re-assert only while still configured to hide; setting
+                    // .visible here re-enters this handler, so bail if already false.
+                    if (this._config.isFeatureEnabled('hidePanel') && panelBox.visible)
+                        panelBox.visible = false;
+                });
+            }
+        } else if (this._panelVisibleWatchId) {
+            panelBox.disconnect(this._panelVisibleWatchId);
+            this._panelVisibleWatchId = 0;
+        }
+
         // Struts: flip the panelBox's affectsStruts flag in the layout manager's
         // tracked-actor list, then recompute regions so the work area updates.
         // We remember the original value the first time we touch it so we can
@@ -997,14 +1086,208 @@ export const NotchNux = GObject.registerClass({
         } catch (e) {
             console.error('NotchNux: Failed to adjust panel struts.', e);
         }
+
+        // Unredirection: with reclaimSpace on, the panel no longer reserves the
+        // top strip, so a *maximized* window (not just true fullscreen) grows to
+        // cover y=0 — the exact rows the notch occupies. When a window covers a
+        // whole monitor Mutter "unredirects" it (scans it out directly, bypassing
+        // the compositor), and nothing drawn above it in the scene graph — our
+        // top-chrome notch included — is composited. The notch then vanishes and
+        // only flickers back on repaints (scrolling, a screenshot forcing
+        // redirection). Inhibiting unredirection keeps every frame composited so
+        // the notch stays drawn over the covering window.
+        //
+        // We only inhibit when a window is *actually* covering the top strip
+        // (evaluated in _updateUnredirect), so direct scanout for fullscreen
+        // video keeps working the rest of the time. The watch is wired up only
+        // while reclaim is on — the only combo that lets a window reach y=0.
+        if (reclaim) {
+            this._startUnredirectWatch();
+            this._updateUnredirect();
+        } else {
+            this._stopUnredirectWatch();
+            this._uninhibitUnredirect();
+        }
+
+        // The top-edge scroll strip only exists while the panel is hidden, so
+        // its lifecycle is tied to this same recompute.
+        this._applyTopScroll();
+    }
+
+    // Start watching for window geometry/stacking changes so we can flip the
+    // unredirect inhibit on/off as a window covers or uncovers the top strip.
+    // Idempotent. `restacked` (already tracked in _init for the raise-to-top)
+    // covers maximize/minimize/raise/map/workspace-switch; window_manager's
+    // `size-change` covers maximize/unmaximize/tile/fullscreen transitions.
+    _startUnredirectWatch() {
+        if (this._unredirectWatchStarted)
+            return;
+        this._unredirectWatchStarted = true;
+        try {
+            let wm = global.window_manager;
+            if (wm)
+                this._wmSizeChangeId = wm.connect('size-change',
+                    () => this._queueUnredirectUpdate());
+        } catch (e) {
+            console.error('NotchNux: Failed to start unredirect watch.', e);
+        }
+    }
+
+    _stopUnredirectWatch() {
+        if (!this._unredirectWatchStarted)
+            return;
+        this._unredirectWatchStarted = false;
+        if (this._wmSizeChangeId) {
+            try { global.window_manager.disconnect(this._wmSizeChangeId); } catch (e) {}
+            this._wmSizeChangeId = 0;
+        }
+        if (this._unredirectUpdateId) {
+            GLib.Source.remove(this._unredirectUpdateId);
+            this._unredirectUpdateId = 0;
+        }
+    }
+
+    // Coalesce a burst of window signals into a single re-evaluation on the next
+    // idle, so a maximize (which fires several signals) checks the geometry once.
+    _queueUnredirectUpdate() {
+        if (!this._unredirectWatchStarted)
+            return;
+        if (this._unredirectUpdateId)
+            return;
+        this._unredirectUpdateId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._unredirectUpdateId = 0;
+            this._updateUnredirect();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Inhibit unredirection iff some ordinary window currently overlaps the
+    // notch's top strip on the primary monitor + active workspace. Cheap enough
+    // to run on every relevant window change.
+    _updateUnredirect() {
+        // Only meaningful while we're reclaiming the strip; a defensive re-check
+        // in case this is reached after the feature was toggled off.
+        let reclaim = this._config.isFeatureEnabled('hidePanel') &&
+                      this._config.isFeatureEnabled('reclaimSpace');
+        if (!reclaim) {
+            this._uninhibitUnredirect();
+            return;
+        }
+        if (this._windowCoversTopStrip())
+            this._inhibitUnredirect();
+        else
+            this._uninhibitUnredirect();
+    }
+
+    // True if any normal, shown window on the primary monitor's active workspace
+    // has a frame rect that reaches into the top strip the notch occupies. We
+    // test overlap against the collapsed pill's band at the top of the monitor
+    // (a window merely touching y=0 is enough to cover the notch), which is what
+    // triggers Mutter's unredirect in the first place.
+    _windowCoversTopStrip() {
+        let monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return false;
+        // The band the notch draws in: the top PILL_HEIGHT rows of the monitor.
+        let stripTop = monitor.y;
+        let stripBottom = monitor.y + PILL_HEIGHT;
+        let primaryIndex = Main.layoutManager.primaryIndex;
+
+        let wsm = global.workspace_manager;
+        let activeWs = wsm ? wsm.get_active_workspace() : null;
+
+        let actors = global.get_window_actors();
+        for (let actor of actors) {
+            let win = actor.meta_window ?? actor.get_meta_window?.();
+            if (!win)
+                continue;
+            // Skip anything that isn't a real, currently-visible top-level.
+            if (win.is_override_redirect && win.is_override_redirect())
+                continue;
+            if (win.minimized)
+                continue;
+            if (win.showing_on_its_workspace && !win.showing_on_its_workspace())
+                continue;
+            // Only windows on the primary monitor can cover the notch.
+            if (typeof win.get_monitor === 'function' && win.get_monitor() !== primaryIndex)
+                continue;
+            // Restrict to the active workspace (unless the window is on all).
+            if (activeWs && win.located_on_workspace &&
+                !win.located_on_workspace(activeWs) &&
+                !(win.is_on_all_workspaces && win.is_on_all_workspaces()))
+                continue;
+            // Ignore desktop/dock-type surfaces — they legitimately sit under us.
+            let t = win.get_window_type ? win.get_window_type() : null;
+            if (t === Meta.WindowType.DESKTOP || t === Meta.WindowType.DOCK)
+                continue;
+
+            let r = win.get_frame_rect ? win.get_frame_rect() : null;
+            if (!r)
+                continue;
+            // Vertical overlap with the notch band + horizontal overlap with the
+            // monitor is enough — the window is drawing where the notch is.
+            let rTop = r.y;
+            let rBottom = r.y + r.height;
+            if (rTop < stripBottom && rBottom > stripTop)
+                return true;
+        }
+        return false;
+    }
+
+    // Disable Mutter's direct-scanout optimization so top chrome stays composited
+    // over a monitor-covering window. disable/enable_unredirect are ref-counted,
+    // so a bool flag keeps this one-shot (never disable twice, never leave a
+    // dangling disable). No-op if already inhibited.
+    _inhibitUnredirect() {
+        if (this._unredirectInhibited)
+            return;
+        try {
+            let compositor = global.compositor ?? global.get_compositor?.();
+            if (compositor && typeof compositor.disable_unredirect === 'function') {
+                compositor.disable_unredirect();
+                this._unredirectInhibited = true;
+            }
+        } catch (e) {
+            console.error('NotchNux: Failed to inhibit unredirect.', e);
+        }
+    }
+
+    // Release the inhibition set by _inhibitUnredirect (restoring direct scanout
+    // for fullscreen video etc.). No-op if we weren't inhibiting.
+    _uninhibitUnredirect() {
+        if (!this._unredirectInhibited)
+            return;
+        try {
+            let compositor = global.compositor ?? global.get_compositor?.();
+            if (compositor && typeof compositor.enable_unredirect === 'function')
+                compositor.enable_unredirect();
+        } catch (e) {
+            console.error('NotchNux: Failed to release unredirect inhibit.', e);
+        } finally {
+            // Clear the flag even if the call threw, so we don't get wedged
+            // permanently inhibited.
+            this._unredirectInhibited = false;
+        }
     }
 
     // Undo everything _applyPanelVisibility changed: show the panel again and
     // restore its original strut behaviour. Safe to call when nothing was hidden.
     _restorePanel() {
+        // The scroll strip only makes sense with the panel hidden, so drop it
+        // whenever we restore the panel (also covers teardown).
+        this._destroyTopScroll();
+        // Stop watching windows and restore direct scanout — we're no longer
+        // reclaiming the top strip.
+        this._stopUnredirectWatch();
+        this._uninhibitUnredirect();
         let lm = Main.layoutManager;
         let panelBox = lm?.panelBox;
         if (!panelBox) return;
+        // Stop re-asserting hidden-ness before showing the panel again.
+        if (this._panelVisibleWatchId) {
+            panelBox.disconnect(this._panelVisibleWatchId);
+            this._panelVisibleWatchId = 0;
+        }
         panelBox.visible = true;
         try {
             if (this._panelStrutsOriginal !== undefined) {
@@ -1020,6 +1303,102 @@ export const NotchNux = GObject.registerClass({
         } catch (e) {
             console.error('NotchNux: Failed to restore panel struts.', e);
         }
+    }
+
+    // --- Top-edge workspace scroll ------------------------------------------
+    //
+    // Several third-party extensions let you scroll over the GNOME top bar to
+    // switch workspaces. Hiding the panel (hidePanel) removes the bar's actor,
+    // so that scroll region disappears with it. To keep the gesture working we
+    // mount a thin, transparent, full-width strip pinned to the very top edge of
+    // the primary monitor that captures scroll events and switches workspaces
+    // itself. It only reacts to scroll — clicks pass through — and never
+    // reserves work-area space, so it's invisible in every way except that
+    // scrolling along the top edge still moves between workspaces.
+    //
+    // Enabled only when BOTH hidePanel and topScroll are on: with the panel
+    // visible the real bar (or the user's extension) already owns that region.
+    _applyTopScroll() {
+        let want = this._config.isFeatureEnabled('hidePanel')
+                && this._config.isFeatureEnabled('topScroll');
+        if (want) this._ensureTopScroll();
+        else this._destroyTopScroll();
+    }
+
+    _ensureTopScroll() {
+        if (this._topScroll) {
+            this._positionTopScroll();
+            return;
+        }
+        // ~6px is enough to catch a scroll aimed at the screen's top edge while
+        // staying out of the way. Reactive for scroll only; clicks are let
+        // through so it doesn't swallow interaction with whatever is beneath.
+        let strip = new St.Widget({
+            reactive: true,
+            can_focus: false,
+            track_hover: false,
+            style_class: 'nook-topscroll',
+        });
+        strip.connect('scroll-event', (actor, event) =>
+            this._onTopScroll(event));
+        // addChrome (not addTopChrome) so it isn't hidden with fullscreen top
+        // chrome; affectsStruts/affectsInputRegion default such that it takes
+        // input but reserves no space.
+        Main.layoutManager.addChrome(strip, { affectsStruts: false });
+        this._topScroll = strip;
+        this._positionTopScroll();
+    }
+
+    _positionTopScroll() {
+        if (!this._topScroll) return;
+        let monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor) return;
+        const STRIP_H = 6;
+        this._topScroll.set_position(monitor.x, monitor.y);
+        this._topScroll.set_size(monitor.width, STRIP_H);
+    }
+
+    _destroyTopScroll() {
+        if (!this._topScroll) return;
+        try { Main.layoutManager.removeChrome(this._topScroll); } catch (e) {}
+        this._topScroll.destroy();
+        this._topScroll = null;
+    }
+
+    // Switch workspace in response to a scroll over the top-edge strip. Scroll
+    // up → previous workspace, down → next; horizontal/smooth deltas are mapped
+    // the same way. Debounced lightly so a single flick doesn't skip several.
+    _onTopScroll(event) {
+        let dir = event.get_scroll_direction();
+        let step = 0;
+        if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.LEFT)
+            step = -1;
+        else if (dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT)
+            step = 1;
+        else if (dir === Clutter.ScrollDirection.SMOOTH && event.get_scroll_delta) {
+            let [, dy] = event.get_scroll_delta();
+            if (dy > 0.01) step = 1;
+            else if (dy < -0.01) step = -1;
+        }
+        if (!step) return Clutter.EVENT_PROPAGATE;
+
+        // Coalesce a burst of smooth-scroll events so one physical flick moves a
+        // single workspace rather than racing through several.
+        let now = GLib.get_monotonic_time();
+        if (this._topScrollLast && now - this._topScrollLast < 180000)
+            return Clutter.EVENT_STOP;
+        this._topScrollLast = now;
+
+        let wm = global.workspace_manager;
+        let active = wm.get_active_workspace_index();
+        let target = active + step;
+        if (target < 0 || target >= wm.get_n_workspaces())
+            return Clutter.EVENT_STOP;
+        // Plain activate() switches the workspace without dragging the currently
+        // focused window along — the same call the overview and scroll-to-switch
+        // extensions use.
+        wm.get_workspace_by_index(target).activate(global.get_current_time());
+        return Clutter.EVENT_STOP;
     }
 
     // Tear down and rebuild the entire dashboard from current config. Called
@@ -1065,6 +1444,160 @@ export const NotchNux = GObject.registerClass({
             this._pillEq.setAccentColor();
         // Keep the Alerts tab count pill in sync with the new accent.
         this._updateTabCountBadge();
+    }
+
+    // ============================================================
+    // Backdrop blur / "glass" appearance
+    // ============================================================
+    //
+    // The blur is a single Shell.BlurEffect(mode = BACKGROUND) on the visible
+    // surface. Its `radius` is animated between the collapsed and expanded
+    // strengths during expand()/collapse(); the glass *look* (tint, rim,
+    // brightness) comes from the chosen preset and is applied as inline style
+    // over the .notchnux-island class.
+    _buildBlur() {
+        // Named so we can find/replace it; BACKGROUND samples what's drawn
+        // behind the actor. Start disabled — _applyBlur enables it if the user
+        // turned blur on.
+        this._blurEffect = new Shell.BlurEffect({
+            name: 'notchnux-blur',
+            mode: Shell.BlurMode.BACKGROUND,
+            radius: 0,
+            brightness: 1.0,
+        });
+        this._surface.add_effect(this._blurEffect);
+        // Base drop-shadow reused whenever we override the surface style for a
+        // glass preset (the stylesheet's is otherwise lost to set_style).
+        this._blurActive = false;
+        // Tracks whether we've currently suppressed Clutter clipped redraws for
+        // the blur (see _setClippedRedrawsDisabled). Global flag — keep it honest.
+        this._clippedRedrawsDisabled = false;
+    }
+
+    // Re-read the persisted blur config and apply it: enable/disable the effect,
+    // set the preset tint/rim/brightness, and set the radius for the *current*
+    // pill state (expand/collapse animate it from here). Safe to call any time.
+    _applyBlur() {
+        if (!this._blurEffect)
+            return;
+        let cfg = this._config.blur;
+        this._blurCfg = cfg;
+
+        if (!cfg.enabled) {
+            // Fully off: neutral effect + let the stylesheet's opaque surface
+            // and shadow take over again. Re-enable clipped redraws (the perf
+            // optimization we suppress only while blur is on).
+            this._blurActive = false;
+            this._blurEffect.set_enabled(false);
+            this._blurEffect.radius = 0;
+            this._surface.set_style(null);
+            this._setClippedRedrawsDisabled(false);
+            return;
+        }
+
+        let p = blurPreset(cfg.preset);
+        this._blurActive = true;
+        this._blurEffect.set_enabled(true);
+        this._blurEffect.brightness = p.brightness;
+        // Radius for whichever state we're in right now; the animations pick up
+        // from this value.
+        this._blurEffect.radius = this.isExpanded ? cfg.expandedRadius : cfg.collapsedRadius;
+
+        // Make the surface translucent so the blurred backdrop shows through,
+        // tinted per the preset. We override background/border/shadow inline
+        // (set_style replaces, not merges, so we must restate the shadow). The
+        // rounded corners + radius transitions still come from the CSS class.
+        this._surface.set_style(this._blurSurfaceStyle(p));
+
+        // Blur is live: suppress clipped redraws so re-rendering content (the
+        // spinning disc, EQ bars, clock) doesn't leave stale blur outlines.
+        this._setClippedRedrawsDisabled(true);
+    }
+
+    // Inline style implementing a glass preset over .notchnux-island. Kept as
+    // one string so _applyBlur / the expand-collapse paths can reuse it.
+    _blurSurfaceStyle(p) {
+        return (
+            `background-color: rgba(${p.tint}, ${p.alpha});` +
+            `border: 1px solid rgba(255, 255, 255, ${p.rim});` +
+            `border-top: 1px solid rgba(255, 255, 255, ${p.rimTop});` +
+            `box-shadow: 0px 8px 26px rgba(0, 0, 0, 0.30);`
+        );
+    }
+
+    // Trailing outlines / "breathing" artifacts on a BACKGROUND-blurred surface.
+    //
+    // Clutter optimizes painting with *clipped redraws*: when an actor changes it
+    // only repaints the small rectangle that actually changed. But a background
+    // blur samples a region *larger* than that clip, so whenever anything inside
+    // or near the notch redraws — the spinning vinyl disc, the EQ bars, the clock
+    // tick, a resize — Clutter repaints only the tiny clip and leaves the blur's
+    // sampled area partly stale. That stale edge is the outline that lingers, and
+    // the frame-to-frame staleness is the shimmer/"breathing" seen on exactly the
+    // components that re-render themselves. It's invisible to screenshots/recorders
+    // because it lives in the compositor's framebuffer, not the scene graph.
+    //
+    // This is a documented Clutter limitation, not a bug in our drawing. The fix,
+    // as used by blur-my-shell (which pioneered GNOME background blur), is to turn
+    // off clipped redraws globally via the Clutter debug flag so every frame does a
+    // full redraw and the blur is never left stale. It has a real compositor-wide
+    // cost, so we only set it while our blur is actually enabled and always clear
+    // it on teardown — never leave it on when blur is off or the extension unloads.
+    _setClippedRedrawsDisabled(disabled) {
+        // Idempotent: don't add/remove the flag twice.
+        if (disabled === this._clippedRedrawsDisabled)
+            return;
+        try {
+            let flag = Clutter.DrawDebugFlag.DISABLE_CLIPPED_REDRAWS;
+            // GNOME 48+ exposes the toggle on Clutter directly; older shells go
+            // through Meta.{add,remove}_clutter_debug_flags.
+            let hasClutterApi = typeof Clutter.add_debug_flags === 'function';
+            if (disabled) {
+                if (hasClutterApi)
+                    Clutter.add_debug_flags(null, flag, null);
+                else
+                    Meta.add_clutter_debug_flags(null, flag, null);
+            } else {
+                if (hasClutterApi)
+                    Clutter.remove_debug_flags(null, flag, null);
+                else
+                    Meta.remove_clutter_debug_flags(null, flag, null);
+            }
+            this._clippedRedrawsDisabled = disabled;
+        } catch (e) {
+            console.error('NotchNux: failed to toggle clipped redraws', e);
+        }
+    }
+
+    // Animate the blur radius toward the target for a state change. Clutter has
+    // no implicit-animation path for a plain GObject effect property, so we
+    // drive it with a short timeline. No-op (and instant) when blur is off.
+    _animateBlurRadius(target, duration) {
+        if (!this._blurEffect || !this._blurActive) {
+            if (this._blurEffect) this._blurEffect.radius = 0;
+            return;
+        }
+        if (this._blurRadiusTimeline) {
+            this._blurRadiusTimeline.stop();
+            this._blurRadiusTimeline = null;
+        }
+        let from = this._blurEffect.radius;
+        if (from === target || duration <= 0) {
+            this._blurEffect.radius = target;
+            return;
+        }
+        let tl = Clutter.Timeline.new_for_actor(this._surface, duration);
+        tl.set_progress_mode(Clutter.AnimationMode.EASE_OUT_QUINT);
+        tl.connect('new-frame', () => {
+            let t = tl.get_progress();
+            this._blurEffect.radius = Math.round(from + (target - from) * t);
+        });
+        tl.connect('stopped', () => {
+            this._blurEffect.radius = target;
+            this._blurRadiusTimeline = null;
+        });
+        this._blurRadiusTimeline = tl;
+        tl.start();
     }
 
     _switchTab(tabId) {
@@ -2095,7 +2628,407 @@ export const NotchNux = GObject.registerClass({
         lower.add_child(cluster);
 
         panel.add_child(lower);
+
+        // --- Mirrored top-bar indicators (extensions + system status area) ---
+        // Non-destructive: the real panel keeps its actors; we render a row of
+        // icons that mirror Main.panel.statusArea and open each indicator's own
+        // menu when clicked. Lets the notch stand in for the (often hidden) bar.
+        if (this._config.isFeatureEnabled('mirrorTray')) {
+            let tray = this._buildTrayMirror();
+            if (tray)
+                panel.add_child(tray);
+        }
+
         this._contentContainer.add_child(panel);
+    }
+
+    // Build the mirrored status-area row, or null if there's nothing to show.
+    // Reads Main.panel.statusArea, skips our own indicator and anything hidden
+    // or icon-less, and turns each remaining indicator into a button that opens
+    // that indicator's real PopupMenu anchored under the button.
+    _buildTrayMirror() {
+        let statusArea = Main.panel?.statusArea;
+        if (!statusArea) return null;
+
+        let card = new St.BoxLayout({ style_class: 'nook-tray-mirror', vertical: true, x_expand: true });
+        card.add_child(new St.Label({ text: 'TOP BAR', style_class: 'nook-card-eyebrow' }));
+        let iconRow = new St.BoxLayout({ style_class: 'nook-tray-mirror-row', vertical: false, x_expand: true });
+
+        // Every indicator we *can* mirror is collected here as { id, label }
+        // (whether or not the user has it enabled) so we can publish the catalog
+        // to the prefs picker afterwards. `shown` counts only the ones actually
+        // rendered into the row.
+        let catalog = [];
+        let shown = 0;
+        for (let name in statusArea) {
+            if (!Object.prototype.hasOwnProperty.call(statusArea, name)) continue;
+            let indicator = statusArea[name];
+            // Skip our own hidden date menu and anything not currently visible
+            // in the panel (extensions hide their indicator when they've nothing
+            // to show). `dateMenu` is force-hidden by us, so it'd never qualify.
+            if (!indicator || indicator === this) continue;
+            // The aggregate Quick Settings button is handled specially below: we
+            // mirror each of ITS toggles individually (Caffeine, GSConnect, …)
+            // rather than surfacing one button that pops the whole QS panel.
+            if (indicator === statusArea.quickSettings) continue;
+            let container = indicator.container ?? indicator;
+            // Respect the indicator's own visibility (its container is what the
+            // panel actually shows/hides).
+            if (container && container.visible === false) continue;
+
+            // This indicator is mirrorable — record it in the catalog, then skip
+            // rendering if the user has toggled it off in settings.
+            let id = this._trayMirrorId(indicator, name, false);
+            catalog.push({ id, label: this._trayDisplayName(indicator, name) });
+            if (!this._config.isTrayMirrorEnabled(id)) continue;
+
+            // Find a representative icon: most PanelMenu.Buttons hold an St.Icon
+            // (or a label) as their first child. We clone the gicon/icon-name so
+            // reparenting never steals the real one out of the panel.
+            let btn = this._mkTrayMirrorButton(indicator, name);
+            if (!btn) continue;
+            iconRow.add_child(btn);
+            shown++;
+        }
+
+        // Quick Settings extensions (Caffeine, GSConnect, …) don't register a
+        // top-level statusArea key — their SystemIndicators live inside the
+        // aggregate quickSettings menu's _indicators box, each exposing a
+        // QuickMenuToggle in `.quickSettingsItems`. Mirror those individually so
+        // the notch can toggle them directly instead of opening the whole panel.
+        shown += this._buildQuickSettingsMirror(statusArea.quickSettings, iconRow, catalog);
+
+        // Publish the discovered catalog so the prefs window can offer a picker
+        // for these (it runs in a separate process and can't read statusArea).
+        this._config.publishTrayMirrorItems(catalog);
+
+        if (!shown) {
+            iconRow.add_child(new St.Label({ text: 'No indicators',
+                style_class: 'nook-tray-mirror-empty', y_align: Clutter.ActorAlign.CENTER }));
+        }
+        card.add_child(iconRow);
+        return card;
+    }
+
+    // A stable id for a mirrorable indicator, used as the settings key + catalog
+    // id. Top-level status-area indicators are keyed by their statusArea name
+    // (stable across sessions). Quick Settings extension toggles have no
+    // statusArea key, so they're keyed by their toggle/indicator class name
+    // (e.g. 'CaffeineToggle', GSConnect's 'ServiceToggle') under a `qs:` prefix
+    // to avoid colliding with a same-named status-area key.
+    _trayMirrorId(indicator, name, isQuickSettings) {
+        if (isQuickSettings) {
+            let toggle = this._primaryQuickToggle(indicator);
+            let cls = toggle?.constructor?.name ?? indicator?.constructor?.name ?? name;
+            return 'qs:' + cls;
+        }
+        return 'sa:' + String(name);
+    }
+
+    // Mirror the Quick Settings *extension* toggles (Caffeine, GSConnect, …) as
+    // individual buttons in `iconRow`. Returns how many were added.
+    //
+    // These live in `quickSettings._indicators` as SystemIndicator actors, each
+    // with a `.quickSettingsItems` array of QuickMenuToggles and (usually) a
+    // panel icon added via `_addIndicator()`. The same box also holds all the
+    // built-in GNOME toggles (network, bluetooth, volume, night light, power
+    // mode, …) — those already have first-class treatment in the shell and would
+    // just clutter the row with duplicates, so we skip them by their well-known
+    // Shell toggle class names and only surface third-party extension toggles.
+    _buildQuickSettingsMirror(quickSettings, iconRow, catalog) {
+        let box = quickSettings?._indicators;
+        let children = box?.get_children?.() ?? [];
+        let added = 0;
+        for (let ind of children) {
+            if (!ind || ind === this) continue;
+            let items = ind.quickSettingsItems;
+            if (!items || !items.length) continue;
+            // Skip built-in GNOME QS indicators/toggles — keep only extensions.
+            if (this._isBuiltinQuickSettings(ind)) continue;
+            // Must expose a panel icon to be worth mirroring (that's how an
+            // extension signals it has a status to surface). We deliberately do
+            // NOT gate on `ind.visible`: an extension like Caffeine hides its
+            // panel icon while idle, but we still want to offer its toggle so the
+            // user can turn it ON from the notch.
+            if (!this._findFirstIcon(ind)) continue;
+            let clsName = ind.constructor?.name ?? 'qs';
+            // Record in the catalog, then honour the user's per-indicator toggle.
+            let id = this._trayMirrorId(ind, clsName, true);
+            if (catalog)
+                catalog.push({ id, label: this._trayDisplayName(ind, clsName) });
+            if (!this._config.isTrayMirrorEnabled(id)) continue;
+            let btn = this._mkTrayMirrorButton(ind, clsName);
+            if (!btn) continue;
+            iconRow.add_child(btn);
+            added++;
+        }
+        return added;
+    }
+
+    // True for GNOME's own Quick Settings indicators/toggles, which we don't
+    // mirror (they're duplicated shell chrome, not third-party extensions).
+    // Matched by the Shell-internal class names of the indicator and its first
+    // toggle — extension toggles use their own bespoke class names instead.
+    _isBuiltinQuickSettings(indicator) {
+        const BUILTIN = new Set([
+            // stream sliders + the system row (battery/settings/lock/power)
+            'OutputStreamSlider', 'InputStreamSlider', 'StreamSlider', 'SystemItem',
+            // network
+            'NMWiredToggle', 'NMWirelessToggle', 'NMModemToggle', 'NMVpnToggle',
+            'NMBluetoothToggle', 'NMWireguardToggle',
+            // radios / power / a11y / display
+            'BluetoothToggle', 'RfkillToggle', 'PowerProfilesToggle',
+            'NightLightToggle', 'DarkModeToggle', 'DoNotDisturbToggle',
+            'RotationToggle', 'KeyboardBrightnessToggle', 'BacklightToggle',
+            'A11yToggle', 'InputStreamSlider', 'AutoRotateToggle',
+            'RemoteAccessApplet', 'UnsafeModeIndicator', 'ScreenshotToggle',
+        ]);
+        // indicator class (some builtins are anonymous `Indicator`, so also
+        // check the first toggle's class, which is always the specific type).
+        let indName = indicator?.constructor?.name;
+        if (indName && BUILTIN.has(indName)) return true;
+        let t = this._primaryQuickToggle(indicator);
+        let tName = t?.constructor?.name;
+        if (tName && BUILTIN.has(tName)) return true;
+        return false;
+    }
+
+    // Build one mirror button for a status-area indicator. Returns null if we
+    // can't derive any visual for it. Clicking opens the indicator's own menu
+    // re-anchored under our button (falls back to a plain toggle if that fails).
+    _mkTrayMirrorButton(indicator, name) {
+        let btn = new St.Button({ style_class: 'nook-tray-mirror-btn', reactive: true, can_focus: true });
+
+        // Derive a symbolic icon from the indicator's first icon child, cloning
+        // by gicon/icon-name so we never remove the real actor from the panel.
+        let visual = null;
+        let firstIcon = this._findFirstIcon(indicator.container ?? indicator);
+        if (firstIcon) {
+            let clone = new St.Icon({ style_class: 'nook-tray-mirror-icon', icon_size: 16,
+                y_align: Clutter.ActorAlign.CENTER });
+            if (firstIcon.gicon) clone.gicon = firstIcon.gicon;
+            else if (firstIcon.icon_name) clone.icon_name = firstIcon.icon_name;
+            else clone.icon_name = 'application-x-executable-symbolic';
+            visual = clone;
+        } else {
+            // No icon (e.g. a text-only indicator) — fall back to a short label
+            // from the indicator's accessible/role name.
+            visual = new St.Label({ text: this._trayLabel(name),
+                style_class: 'nook-tray-mirror-text', y_align: Clutter.ActorAlign.CENTER });
+        }
+        btn.set_child(visual);
+
+        // The icons alone don't say which extension is which (Caffeine's cup,
+        // etc.), so attach a hover tooltip with a human-readable name.
+        this._attachTrayTooltip(btn, this._trayDisplayName(indicator, name));
+
+        // Clicking triggers the indicator's primary action. For old-style
+        // PanelMenu indicators that's opening their .menu under our button;
+        // for Quick Settings extensions (Caffeine, GSConnect) it's activating
+        // their toggle directly. _activateTrayItem picks the right path.
+        btn.connect('clicked', () => this._activateTrayItem(indicator, btn));
+        return btn;
+    }
+
+    // Route a mirror-button click to the indicator's primary action.
+    //
+    // Modern extensions (Caffeine, GSConnect on GNOME 43+) are Quick Settings
+    // SystemIndicators: they have NO `.menu` on the indicator itself. Their real
+    // control is a QuickMenuToggle in `indicator.quickSettingsItems`, and the
+    // extension wires that toggle's 'clicked' signal to its action (Caffeine's
+    // inhibitor toggle, GSConnect's service toggle). So the "open the menu"
+    // path can't reach them — clicking it used to fall through to toggling the
+    // whole aggregate Quick Settings panel. Instead, emit 'clicked' on the
+    // toggle, exactly as clicking the real Quick Settings tile would.
+    //
+    // Old-style PanelMenu.Button indicators (with a real `.menu`) keep the
+    // existing behaviour: open that menu re-anchored under the notch.
+    _activateTrayItem(indicator, sourceBtn) {
+        let toggle = this._primaryQuickToggle(indicator);
+        if (toggle) {
+            // A QuickMenuToggle's own submenu (GSConnect's device list, Caffeine's
+            // timer options) is a QuickToggleMenu — which, unlike an old-style
+            // PanelMenu.Button menu, has NO boxpointer and is designed to expand
+            // *inside* the Quick Settings panel grid. It can't be re-anchored to
+            // pop up under the notch. Emitting 'clicked' to open it (the previous
+            // behaviour) therefore popped GSConnect's menu open at the top-left,
+            // over the system-menu area — the reported bug.
+            //
+            // Since we can't relocate that submenu, a mirror-button click performs
+            // the toggle's PRIMARY on/off action instead. For `toggleMode` toggles
+            // (GSConnect's service, Caffeine's inhibitor) we flip `checked`
+            // directly — the same bound action a user click runs, but without the
+            // menu side effect. Non-toggleMode QuickToggles have no bound state to
+            // flip, so we emit 'clicked' for them as before.
+            try {
+                if (toggle.toggleMode === true && typeof toggle.checked === 'boolean')
+                    toggle.checked = !toggle.checked;
+                else
+                    toggle.emit('clicked', Clutter.BUTTON_PRIMARY);
+                // The mirrored icon is a static clone taken at render time, and
+                // the extension may swap its indicator gicon to reflect the new
+                // state (Caffeine's full/empty cup, GSConnect's on/off). Re-render
+                // the tab shortly after so the notch tile updates. The dashboard
+                // stays open so the user sees the toggle take effect. State flips
+                // can be async (D-Bus), so give it a beat before re-cloning.
+                if (this._trayToggleRefreshId)
+                    GLib.Source.remove(this._trayToggleRefreshId);
+                this._trayToggleRefreshId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                    this._trayToggleRefreshId = 0;
+                    if (this.isExpanded && this._activeTab === 'system')
+                        this._renderActiveTab();
+                    return GLib.SOURCE_REMOVE;
+                });
+                return;
+            } catch (e) {
+                console.error('NotchNux: failed to activate quick-settings toggle', e);
+                // fall through to the menu path below
+            }
+        }
+        this._openMirroredMenu(indicator, sourceBtn);
+    }
+
+    // Return the QuickMenuToggle that represents this indicator's primary
+    // action, or null if it's not a Quick Settings indicator. We take the first
+    // toggle that carries a 'clicked' handler (the primary tile); its .menu, if
+    // any, is the secondary submenu we deliberately don't open here.
+    _primaryQuickToggle(indicator) {
+        let items = indicator?.quickSettingsItems;
+        if (!items || !items.length) return null;
+        // Prefer a real QuickMenuToggle/QuickToggle (has an emittable 'clicked'
+        // signal). Guard everything: some items are plain menu sections.
+        for (let it of items) {
+            if (it && typeof it.emit === 'function' && typeof it.connect === 'function')
+                return it;
+        }
+        return null;
+    }
+
+    // Best human-readable name for an indicator, for its hover tooltip. Prefers
+    // the indicator's accessible name (extensions set this, e.g. "Caffeine"),
+    // then a title/accessible-name on its first icon, then a de-camel-cased
+    // version of the status-area key ("nightLight" -> "Night Light").
+    _trayDisplayName(indicator, name) {
+        let candidates = [];
+        try { candidates.push(indicator?.get_accessible?.()?.get_name?.()); } catch (e) {}
+        try { candidates.push((indicator.container ?? indicator)?.accessible_name); } catch (e) {}
+        // Quick Settings toggles carry their own display title (Caffeine's
+        // "Caffeine", GSConnect's "GSConnect") — a reliable name for QS mirrors.
+        try {
+            let t = this._primaryQuickToggle(indicator);
+            if (t?.title) candidates.push(t.title);
+        } catch (e) {}
+        for (let c of candidates) {
+            if (c && String(c).trim() && String(c).toLowerCase() !== 'panel')
+                return String(c).trim();
+        }
+        // Fall back to a prettified status-area key.
+        let s = String(name).replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ');
+        s = s.replace(/\bmenu\b/i, '').trim();
+        return s.charAt(0).toUpperCase() + s.slice(1);
+    }
+
+    // Attach a lightweight hover tooltip to a tray-mirror button. The tooltip is
+    // a floating label parented to the shell's uiGroup (so it draws above the
+    // dashboard), shown after a short hover delay and hidden on leave/destroy.
+    _attachTrayTooltip(btn, text) {
+        if (!text) return;
+        btn.track_hover = true;
+        let tip = null;
+        let showId = 0;
+
+        let hide = () => {
+            if (showId) { GLib.Source.remove(showId); showId = 0; }
+            if (tip) { tip.destroy(); tip = null; }
+        };
+        let show = () => {
+            if (tip) return;
+            tip = new St.Label({ text, style_class: 'nook-tray-tooltip' });
+            tip.opacity = 0;
+            Main.layoutManager.uiGroup.add_child(tip);
+            // Center the tooltip under the button.
+            let [bx, by] = btn.get_transformed_position();
+            let tw = tip.get_preferred_width(-1)[1];
+            tip.set_position(
+                Math.round(bx + (btn.width - tw) / 2),
+                Math.round(by + btn.height + 6));
+            tip.ease({ opacity: 255, duration: 120,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        };
+
+        btn.connect('notify::hover', () => {
+            if (btn.hover) {
+                if (!showId && !tip)
+                    showId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
+                        showId = 0; show(); return GLib.SOURCE_REMOVE;
+                    });
+            } else {
+                hide();
+            }
+        });
+        // Clean up if the button (i.e. the whole tray card) is torn down.
+        btn.connect('destroy', hide);
+    }
+
+    // Depth-first search for the first St.Icon under an actor (the panel button's
+    // representative icon). Returns null if none.
+    _findFirstIcon(actor) {
+        if (!actor) return null;
+        if (actor instanceof St.Icon) return actor;
+        let kids = actor.get_children ? actor.get_children() : [];
+        for (let k of kids) {
+            let found = this._findFirstIcon(k);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    // A short human label for an indicator that has no icon, from its status-area
+    // key ("aggregateMenu" -> "Menu", "keyboard" -> "Keyboard").
+    _trayLabel(name) {
+        let s = String(name).replace(/([a-z])([A-Z])/g, '$1 $2');
+        s = s.charAt(0).toUpperCase() + s.slice(1);
+        // Keep it short so the row stays tidy.
+        return s.length > 10 ? s.slice(0, 9) + '…' : s;
+    }
+
+    // Open a mirrored indicator's real PopupMenu anchored under `sourceBtn`.
+    // Retargets the menu's boxpointer to our button for the duration so it pops
+    // up by the notch instead of at the (often hidden) panel. Falls back to the
+    // indicator's default menu.toggle() if retargeting isn't possible.
+    _openMirroredMenu(indicator, sourceBtn) {
+        let menu = indicator?.menu;
+        if (!menu) return;
+        try {
+            // Retarget the boxpointer + sourceActor to our button so the menu
+            // appears under the notch. We restore them after the menu closes so
+            // the real panel indicator keeps working normally.
+            let bp = menu._boxPointer;
+            let prevSource = menu.sourceActor;
+            let prevBpSource = bp?._sourceActor;
+            if (bp && sourceBtn) {
+                menu.sourceActor = sourceBtn;
+                bp._sourceActor = sourceBtn;
+                // Point the arrow up toward the notch.
+                if (bp.setPosition) {
+                    try { bp.setPosition(sourceBtn, 0.5); } catch (e) {}
+                }
+            }
+            // Collapse the dashboard first so the menu isn't drawn behind it.
+            this._collapseImmediately();
+            menu.open(BoxPointer.PopupAnimation.FULL);
+            // Restore the original anchoring once the menu closes so we don't
+            // permanently hijack the panel indicator's own placement.
+            let closeId = menu.connect('open-state-changed', (m, isOpen) => {
+                if (isOpen) return;
+                menu.sourceActor = prevSource;
+                if (bp) bp._sourceActor = prevBpSource;
+                menu.disconnect(closeId);
+            });
+        } catch (e) {
+            console.error(`NotchNux: failed to open mirrored menu for tray item.`, e);
+            try { menu.toggle(); } catch (e2) {}
+        }
     }
 
     // ============================================================
@@ -2513,6 +3446,15 @@ export const NotchNux = GObject.registerClass({
                 break;
             case 'reclaimSpace':
                 this._applyPanelVisibility();
+                break;
+            case 'mirrorTray':
+                // The mirror lives in the Tray tab; re-render so it appears or
+                // disappears if that tab is currently on screen.
+                if (this.isExpanded)
+                    this._renderActiveTab();
+                break;
+            case 'topScroll':
+                this._applyTopScroll();
                 break;
         }
     }
@@ -4239,6 +5181,11 @@ export const NotchNux = GObject.registerClass({
         const DURATION = 340;
         const CURVE = Clutter.AnimationMode.EASE_OUT_QUINT;
 
+        // Deepen the backdrop blur toward the expanded strength alongside the
+        // unfold (no-op when blur is disabled).
+        if (this._blurActive)
+            this._animateBlurRadius(this._blurCfg.expandedRadius, DURATION);
+
         this._surface.set_pivot_point(0.5, 0.0);
         this._surface.scale_y = 0.9;
         this._surface.scale_x = 0.985;
@@ -4295,6 +5242,10 @@ export const NotchNux = GObject.registerClass({
         // top-center pivot while the box shrinks underneath it.
         const DURATION = 280;
         const CURVE = Clutter.AnimationMode.EASE_IN_OUT_QUINT;
+
+        // Ease the backdrop blur back down to the collapsed strength.
+        if (this._blurActive)
+            this._animateBlurRadius(this._blurCfg.collapsedRadius, DURATION);
 
         this._surface.set_pivot_point(0.5, 0.0);
         this._surface.ease({

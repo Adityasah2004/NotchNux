@@ -12,9 +12,13 @@ export default class NotchNuxExtension extends Extension {
             Main.panel.statusArea.dateMenu.hide();
         }
 
-        // 2. Create and mount NotchNux widget
+        // 2. Create and mount NotchNux widget.
+        // trackFullscreen:false keeps the notch on screen when a window is
+        // maximized/fullscreen over the top strip — otherwise the layout
+        // manager hides all fullscreen-tracked top chrome and the notch
+        // vanishes the moment you maximize an app.
         this._notch = new NotchNux(this);
-        Main.layoutManager.addTopChrome(this._notch);
+        Main.layoutManager.addTopChrome(this._notch, { trackFullscreen: false });
     }
 
     disable() {

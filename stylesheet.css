@@ -578,6 +578,58 @@
     background-color: rgba(255, 255, 255, 0.08);
 }
 
+/* Mirrored top-bar indicators: a card holding a wrap-free row of small icon
+ * buttons that stand in for the (often hidden) GNOME panel status area. */
+.nook-tray-mirror {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    padding: 10px 14px;
+    spacing: 8px;
+    margin-top: 12px;
+}
+.nook-tray-mirror-row {
+    spacing: 6px;
+}
+.nook-tray-mirror-btn {
+    padding: 6px;
+    border-radius: 9px;
+    transition: background-color 150ms ease-out;
+}
+.nook-tray-mirror-btn:hover {
+    background-color: rgba(255, 255, 255, 0.10);
+}
+.nook-tray-mirror-btn:active {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+.nook-tray-mirror-icon {
+    color: rgba(255, 255, 255, 0.85);
+}
+.nook-tray-mirror-text {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.75);
+    padding: 0 2px;
+}
+.nook-tray-mirror-empty {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+}
+.nook-tray-tooltip {
+    background-color: rgba(20, 20, 22, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 8px;
+    padding: 4px 9px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+/* Invisible top-edge strip that captures scroll to switch workspaces while the
+   panel is hidden. Fully transparent — its only job is to receive scroll. */
+.nook-topscroll {
+    background-color: transparent;
+}
+
 .nook-device-icon {
     color: rgba(255, 255, 255, 0.7);
 }

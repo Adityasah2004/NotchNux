@@ -5,6 +5,93 @@ All notable changes to NotchNux are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Backdrop blur / "glass" appearance**: a new **Glass & Blur** group in
+  preferences composites a real gaussian blur of the wallpaper and windows
+  behind the notch (via `Shell.BlurEffect` in `BACKGROUND` mode). Choose a glass
+  style preset — **Liquid Glass** (Apple-style vivid frost), **Frosted**
+  (Samsung-style neutral), **Clear** (barely-there), or **Acrylic**
+  (Windows-style) — each of which sets the surface tint, opacity, rim highlight
+  and blur brightness. Blur *strength* is controlled independently for the
+  collapsed pill and the open dashboard, and animates smoothly between the two
+  as the notch expands/collapses. Off by default; every control applies live.
+  Each glass style now also carries its own recommended blur strengths, so
+  picking a style applies a complete look (tint + rim + strength) and moves the
+  strength sliders to match — and a **Reset to defaults** button restores the
+  shipped style and strengths in one click.
+- **Pick which indicators the Tray tab mirrors**: a new **Mirrored indicators**
+  group in preferences lists every top-bar / Quick Settings indicator NotchNux can
+  mirror, each with its own switch, so you can hide the ones you don't want in the
+  Tray tab's row. The shell publishes the list of indicators it actually sees into
+  the config, so the picker reflects your real environment (open the Tray tab once
+  to populate it). Everything shows by default; changes apply to the notch live.
+
+### Fixed
+- **Trailing blur outline / "breathing" shimmer on the glass surface**
+  ([#1](https://github.com/Adityasah2004/NotchNux/issues/1)). With backdrop blur on,
+  an outline of the pill/dashboard lingered on screen (the reporter saw it stay
+  for ~5 seconds) and continuously re-rendered content — the spinning vinyl disc,
+  EQ bars, the clock tick — made the frosted surface flicker/"breathe". Neither
+  could be captured in a screenshot or screen recording. Root cause: Clutter's
+  *clipped redraws* optimization only repaints the small rectangle that changed,
+  but a `BACKGROUND` blur samples a larger region, so any partial repaint left the
+  blur's sampled area stale (the artifact lives in the compositor framebuffer, not
+  the scene graph — hence invisible to capture). NotchNux now disables clipped
+  redraws (via the Clutter `DISABLE_CLIPPED_REDRAWS` debug flag, as blur-my-shell
+  does) **only while blur is enabled**, and always restores them when blur is
+  turned off or the extension unloads — since the flag is compositor-global.
+- **Glass & Blur settings never returned to their defaults.** Switching the glass
+  style only changed the frost look and left the blur-strength sliders untouched,
+  and there was no way to restore the shipped values once they'd been moved. Glass
+  styles now carry and apply their own strengths, and a **Reset to defaults**
+  button restores the default style and blur strengths in one click.
+- **Notch vanished behind a maximized window with "Reclaim panel space" on** (even
+  without true fullscreen), flickering back only while scrolling or taking a
+  screenshot. With the panel strut reclaimed, a maximized window reaches the very
+  top of the monitor and Mutter unredirects it (direct scanout), so nothing drawn
+  above it — the top-chrome notch included — was composited. NotchNux now inhibits
+  unredirection **only while a window is actually covering the top strip** (tracked
+  via window restack/resize signals), keeping the notch drawn over the covering
+  window without disabling direct scanout the rest of the time — so fullscreen
+  video keeps its scanout path when nothing overlaps the notch. Released
+  automatically when the covering window moves away or the feature is turned off.
+- **Mirrored GSConnect tile opened the whole system menu.** GSConnect's Quick
+  Settings toggle keeps its device list in a QuickToggleMenu, which (unlike an
+  old-style panel menu) has no boxpointer and expands inside the Quick Settings
+  grid — so the previous "click = open the menu" path popped it up over the
+  system-menu area instead of under the notch. Clicking a mirrored Quick Settings
+  tile now performs the toggle's primary on/off action (flipping `checked` for
+  toggle-mode toggles like GSConnect's service and Caffeine's inhibitor) with no
+  stray menu.
+
+## [1.3.0] - 2026-07-30
+
+### Added
+- **Mirror top-bar indicators**: the Tray tab now shows a "TOP BAR" row that
+  mirrors the GNOME panel's status area (extension indicators + system icons).
+  Clicking one opens that indicator's own menu anchored under the notch, so you
+  can reach your extensions with the panel hidden. Non-destructive — the real
+  panel keeps its actors. Toggle it with the new **Mirror top-bar indicators**
+  feature switch (on by default). Hovering an icon now shows a tooltip with the
+  indicator's name, so unlabelled icons (Caffeine, etc.) are identifiable.
+- **Scroll the top edge to switch workspaces (with the panel hidden)**: some
+  extensions let you scroll over the GNOME top bar to change workspaces, but
+  hiding the panel removes that region. The new **Scroll top edge to switch
+  workspaces** feature mounts an invisible full-width strip along the very top
+  of the screen that captures scroll and switches workspaces itself — so the
+  gesture keeps working with the bar hidden. Only active while "Hide top panel"
+  is on; clicks pass through and it reserves no space. Off by default.
+
+### Fixed
+- **Notch vanished when maximizing a window with "Hide top panel" + "Reclaim
+  panel space" on.** The notch is now mounted with `trackFullscreen: false`, so
+  a maximized/fullscreen window no longer hides it. The panel is also kept
+  hidden reliably: GNOME re-shows `panelBox` during its own region recomputes
+  (opening/maximizing a window, workspace switches), so we watch its visibility
+  and re-hide it while "Hide top panel" is on instead of flickering back.
+
 ## [1.2.0] - 2026-07-30
 
 ### Added

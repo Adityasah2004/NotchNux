@@ -18,7 +18,7 @@ import GObject from 'gi://GObject';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex } from './src/helpers/config.js';
+import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -34,9 +34,11 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         window.add(page);
 
         this._addAppearanceGroup(page, config);
+        this._addBlurGroup(page, config);
         this._addWallpaperGroup(page, config, window);
         this._addTabsGroup(page, config);
         this._addFeaturesGroup(page, config);
+        this._addTrayMirrorGroup(page, config);
         this._addQuickShareGroup(page);
         this._addSystemGroup(page);
 
@@ -154,6 +156,144 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         hexEntry.add_controller(focusCtl);
         hexRow.add_suffix(hexEntry);
         group.add(hexRow);
+    }
+
+    // ---- Glass & Blur ----
+    // Real gaussian backdrop blur behind the notch (Shell.BlurEffect). A master
+    // switch, a glass-style preset, and independent blur strength for the
+    // collapsed pill vs the open dashboard. Every control persists through
+    // config.setBlur(); the shell watches the file and re-applies live.
+    _addBlurGroup(page, config) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Glass & Blur',
+            description: 'Frost the backdrop behind the notch. Apple/Samsung-style glass presets, with separate blur strength for the collapsed pill and the open dashboard.',
+        });
+        page.add(group);
+
+        // Master enable. When off, the rows below are dimmed but still visible so
+        // the user can see what they'll get.
+        const enableRow = new Adw.SwitchRow({
+            title: 'Enable blur',
+            subtitle: 'Composite a live gaussian blur of the wallpaper/windows behind the panel.',
+            active: config.blur.enabled,
+        });
+        group.add(enableRow);
+
+        // Glass preset. ComboRow over BLUR_PRESETS; the model index maps to the
+        // preset id.
+        const presetIds = BLUR_PRESETS.map(p => p.id);
+        const presetModel = new Gtk.StringList();
+        for (const p of BLUR_PRESETS)
+            presetModel.append(p.label);
+        const presetRow = new Adw.ComboRow({
+            title: 'Glass style',
+            subtitle: BLUR_PRESETS[Math.max(0, presetIds.indexOf(config.blur.preset))].description,
+            model: presetModel,
+            selected: Math.max(0, presetIds.indexOf(config.blur.preset)),
+        });
+        group.add(presetRow);
+        // Guard so programmatic slider moves (from applying a preset or a reset)
+        // don't each fire a separate config write on top of the batched one.
+        let syncing = false;
+        presetRow.connect('notify::selected', () => {
+            if (syncing) return;
+            const p = BLUR_PRESETS[presetRow.get_selected()];
+            if (!p) return;
+            presetRow.set_subtitle(p.description);
+            // A preset is a full look: commit its id *and* its recommended
+            // strengths in one write, then move the sliders to match.
+            config.setBlur({
+                preset: p.id,
+                collapsedRadius: p.collapsedRadius,
+                expandedRadius: p.expandedRadius,
+            });
+            syncing = true;
+            collapsedRow.set_value(p.collapsedRadius);
+            expandedRow.set_value(p.expandedRadius);
+            syncing = false;
+        });
+
+        // Per-state radius sliders. SpinRow over the shared range; step of 2 so
+        // the value moves in visible increments.
+        const collapsedRow = new Adw.SpinRow({
+            title: 'Collapsed blur',
+            subtitle: 'Blur strength while the notch is a pill.',
+            adjustment: new Gtk.Adjustment({
+                lower: BLUR_RADIUS_RANGE.min,
+                upper: BLUR_RADIUS_RANGE.max,
+                step_increment: 2,
+                page_increment: 8,
+                value: config.blur.collapsedRadius,
+            }),
+        });
+        group.add(collapsedRow);
+        collapsedRow.connect('notify::value', () => {
+            if (syncing) return;
+            config.setBlur({ collapsedRadius: collapsedRow.get_value() });
+        });
+
+        const expandedRow = new Adw.SpinRow({
+            title: 'Expanded blur',
+            subtitle: 'Blur strength while the dashboard is open.',
+            adjustment: new Gtk.Adjustment({
+                lower: BLUR_RADIUS_RANGE.min,
+                upper: BLUR_RADIUS_RANGE.max,
+                step_increment: 2,
+                page_increment: 8,
+                value: config.blur.expandedRadius,
+            }),
+        });
+        group.add(expandedRow);
+        expandedRow.connect('notify::value', () => {
+            if (syncing) return;
+            config.setBlur({ expandedRadius: expandedRow.get_value() });
+        });
+
+        // Reset the whole glass/blur group back to shipped defaults (Liquid
+        // Glass, 18/36) in one write, then re-sync every widget. Leaves the
+        // master enable switch untouched — resetting the *look*, not turning it
+        // off. Wrapped in the same guard so the slider/combo moves don't each
+        // re-write config on top of the batched reset.
+        const resetRow = new Adw.ActionRow({
+            title: 'Reset glass & blur',
+            subtitle: 'Restore the default style and blur strengths.',
+        });
+        const resetBtn = new Gtk.Button({
+            label: 'Reset to defaults',
+            valign: Gtk.Align.CENTER,
+        });
+        resetBtn.add_css_class('flat');
+        resetRow.add_suffix(resetBtn);
+        resetRow.set_activatable_widget(resetBtn);
+        group.add(resetRow);
+        resetBtn.connect('clicked', () => {
+            config.setBlur({
+                preset: BLUR_DEFAULTS.preset,
+                collapsedRadius: BLUR_DEFAULTS.collapsedRadius,
+                expandedRadius: BLUR_DEFAULTS.expandedRadius,
+            });
+            syncing = true;
+            const idx = Math.max(0, presetIds.indexOf(BLUR_DEFAULTS.preset));
+            presetRow.set_selected(idx);
+            presetRow.set_subtitle(BLUR_PRESETS[idx].description);
+            collapsedRow.set_value(BLUR_DEFAULTS.collapsedRadius);
+            expandedRow.set_value(BLUR_DEFAULTS.expandedRadius);
+            syncing = false;
+        });
+
+        // Commit the toggle and gate the dependent rows on it.
+        const syncSensitivity = () => {
+            const on = enableRow.get_active();
+            presetRow.set_sensitive(on);
+            collapsedRow.set_sensitive(on);
+            expandedRow.set_sensitive(on);
+            resetRow.set_sensitive(on);
+        };
+        enableRow.connect('notify::active', () => {
+            config.setBlur({ enabled: enableRow.get_active() });
+            syncSensitivity();
+        });
+        syncSensitivity();
     }
 
     // ---- Wallpaper: rotate through a folder of images ----
@@ -502,6 +642,50 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             });
             row.connect('notify::active', () => {
                 config.setFeatureEnabled(f.id, row.get_active());
+            });
+            group.add(row);
+        }
+    }
+
+    // ---- Mirrored indicators (Tray tab) ----
+    // Lets the user choose which top-bar / Quick Settings indicators the Tray
+    // tab's mirror row shows. This process can't read the live shell's status
+    // area, so the shell publishes the list of indicators it can mirror (as
+    // { id, label }) into the config; we render a switch per entry and write the
+    // per-id enable map straight back. The shell watches the file and re-renders.
+    _addTrayMirrorGroup(page, config) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Mirrored indicators',
+            description: 'Choose which top-bar and Quick Settings indicators appear in the Tray tab. Requires "Mirror top-bar indicators" to be on.',
+        });
+        page.add(group);
+
+        const items = config.trayMirrorItems;
+        if (!items.length) {
+            // The catalog is only populated once the shell has rendered the Tray
+            // tab at least once (it publishes what it saw). Tell the user how to
+            // populate it rather than showing an empty group.
+            const empty = new Adw.ActionRow({
+                title: 'No indicators discovered yet',
+                subtitle: 'Open the notch, switch to the Tray tab once, then reopen these settings. Indicators you have will be listed here.',
+            });
+            group.add(empty);
+            return;
+        }
+
+        // Stable, human-friendly order.
+        const sorted = [...items].sort((a, b) =>
+            String(a.label).localeCompare(String(b.label)));
+        for (const it of sorted) {
+            const row = new Adw.SwitchRow({
+                title: it.label || it.id,
+                // Show the raw id as a subtitle so ambiguous entries (two icons
+                // with the same name) are still distinguishable.
+                subtitle: it.id,
+                active: config.isTrayMirrorEnabled(it.id),
+            });
+            row.connect('notify::active', () => {
+                config.setTrayMirrorEnabled(it.id, row.get_active());
             });
             group.add(row);
         }

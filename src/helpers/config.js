@@ -74,6 +74,81 @@ export const WALLPAPER_DEFAULTS = {
     pauseOnFullscreen: true
 };
 
+// ---- Blur / "glass" appearance ----
+//
+// GNOME Shell can composite a real gaussian backdrop blur under an actor via
+// Shell.BlurEffect(mode = BACKGROUND): it samples whatever is drawn behind the
+// surface (wallpaper, windows) and blurs it live. For that to be visible the
+// surface's own background must be *semi-transparent* — an opaque fill would
+// just cover the blurred backdrop. So each "glass" preset is really a bundle of
+//   - tint      : the surface fill colour (its RGB), applied at `alpha`
+//   - alpha     : how opaque that fill is (lower = more of the blur shows)
+//   - rimTop    : the bright hairline along the top edge (the "light frame")
+//   - rim       : the surrounding hairline
+//   - brightness: BlurEffect brightness (1 = neutral; <1 darkens the blur)
+//   - saturate  : extra colour lift applied to the tint for the "liquid" look
+// The blur *radius* is not part of the preset — it's controlled per pill state
+// (collapsed vs expanded) by the user's own sliders, so the same glass style
+// can be subtle on the pill and deep on the open dashboard.
+// Each preset also carries its own recommended collapsed/expanded blur radius,
+// so picking a "Glass style" applies a complete look (tint + rim + strength)
+// rather than only the frost colour. The prefs UI moves the strength sliders to
+// these values on a preset switch; the user can still fine-tune afterwards.
+export const BLUR_PRESETS = [
+    {
+        id: 'liquid',
+        label: 'Liquid Glass',
+        description: 'Apple-style vivid frosted glass — light tint, bright rim, colour lift.',
+        tint: '250,250,252', alpha: 0.28, rimTop: 0.55, rim: 0.16,
+        brightness: 1.06,
+        collapsedRadius: 18, expandedRadius: 36,
+    },
+    {
+        id: 'frosted',
+        label: 'Frosted',
+        description: 'Neutral Samsung-style frosted panel — balanced tint and rim.',
+        tint: '18,18,22', alpha: 0.55, rimTop: 0.20, rim: 0.10,
+        brightness: 0.94,
+        collapsedRadius: 22, expandedRadius: 44,
+    },
+    {
+        id: 'clear',
+        label: 'Clear',
+        description: 'Barely-there glass — mostly the blurred backdrop, faint rim.',
+        tint: '13,13,16', alpha: 0.18, rimTop: 0.14, rim: 0.06,
+        brightness: 1.0,
+        collapsedRadius: 12, expandedRadius: 24,
+    },
+    {
+        id: 'acrylic',
+        label: 'Acrylic',
+        description: 'Windows-style acrylic — darker tint with a soft rim over the blur.',
+        tint: '10,10,14', alpha: 0.66, rimTop: 0.16, rim: 0.08,
+        brightness: 0.9,
+        collapsedRadius: 28, expandedRadius: 52,
+    },
+];
+
+// Range for the per-state blur radius sliders (in the same units Shell's
+// BlurEffect uses). 0 disables the blur for that state; the ceiling keeps the
+// compositor cost bounded on lower-end GPUs.
+export const BLUR_RADIUS_RANGE = { min: 0, max: 64 };
+
+// Blur defaults: off, so nothing changes until the user opts in. `preset` names
+// one of BLUR_PRESETS above; the two radii are the collapsed/expanded strengths.
+export const BLUR_DEFAULTS = {
+    enabled: false,
+    preset: 'liquid',
+    collapsedRadius: 18,
+    expandedRadius: 36,
+};
+
+// Look up a blur preset by id, falling back to the first (default) preset so a
+// stale/unknown id from an old or hand-edited config never breaks rendering.
+export function blurPreset(id) {
+    return BLUR_PRESETS.find(p => p.id === id) ?? BLUR_PRESETS[0];
+}
+
 // Feature toggles exposed in settings. `id` is the stored key; `default`
 // is used when the config file has no opinion yet.
 export const FEATURE_DEFS = [
@@ -85,7 +160,9 @@ export const FEATURE_DEFS = [
     { id: 'notifPeek',         label: 'Notification peek',    description: 'Expand the pill into a banner when a notification arrives.',   default: true },
     { id: 'showPowerButton',   label: 'Power button',         description: 'Show a power menu (suspend, log out, restart, power off) in the dashboard header.', default: true },
     { id: 'hidePanel',         label: 'Hide top panel',       description: 'Hide the GNOME top bar and rely on the notch instead.',        default: false },
-    { id: 'reclaimSpace',      label: 'Reclaim panel space',  description: 'Let maximized windows use the top strip the panel occupied (only applies when the panel is hidden).', default: false }
+    { id: 'reclaimSpace',      label: 'Reclaim panel space',  description: 'Let maximized windows use the top strip the panel occupied (only applies when the panel is hidden).', default: false },
+    { id: 'mirrorTray',        label: 'Mirror top-bar indicators', description: 'Show the top bar’s extension and status icons inside the Tray tab, so you can reach them with the panel hidden.', default: true },
+    { id: 'topScroll',         label: 'Scroll top edge to switch workspaces', description: 'Restore top-edge scroll-to-switch-workspace when the panel is hidden — scroll anywhere along the top of the screen to move between workspaces.', default: false }
 ];
 
 const DEFAULT_ACCENT = '#7aa2ff';
@@ -142,7 +219,18 @@ export class ConfigStore {
             tabOrder: TAB_DEFS.map(t => t.id),
             tabs,
             features,
-            wallpaper: { ...WALLPAPER_DEFAULTS }
+            wallpaper: { ...WALLPAPER_DEFAULTS },
+            blur: { ...BLUR_DEFAULTS },
+            // Per-indicator enable map for the Tray tab's mirror row, keyed by a
+            // stable indicator id. Empty by default: an id not present is treated
+            // as enabled (see isTrayMirrorEnabled), so every indicator shows
+            // until the user hides one.
+            trayMirror: {},
+            // Catalog of indicators the shell has actually seen it can mirror,
+            // as [{ id, label }]. The shell publishes this so the (separate)
+            // prefs process can render a picker for indicators it can't see
+            // directly. Not user-authored; overwritten by the shell.
+            trayMirrorItems: []
         };
     }
 
@@ -160,6 +248,12 @@ export class ConfigStore {
                 data.tabs = { ...this._defaults().tabs, ...(parsed.tabs ?? {}) };
                 data.features = { ...this._defaults().features, ...(parsed.features ?? {}) };
                 data.wallpaper = { ...WALLPAPER_DEFAULTS, ...(parsed.wallpaper ?? {}) };
+                data.blur = { ...BLUR_DEFAULTS, ...(parsed.blur ?? {}) };
+                data.trayMirror = (parsed.trayMirror && typeof parsed.trayMirror === 'object')
+                    ? { ...parsed.trayMirror } : {};
+                data.trayMirrorItems = Array.isArray(parsed.trayMirrorItems)
+                    ? parsed.trayMirrorItems.filter(it => it && typeof it.id === 'string')
+                    : [];
                 data.accent = normalizeHex(parsed.accent) ?? DEFAULT_ACCENT;
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
@@ -258,6 +352,52 @@ export class ConfigStore {
         this._save();
     }
 
+    // ---- Tray-mirror indicator picker ----
+    // Which top-bar/Quick-Settings indicators the Tray tab mirrors, keyed by a
+    // stable id the shell derives (see notchnux.js _trayMirrorId). Default-on:
+    // an id absent from the map shows, so a newly-installed extension appears
+    // automatically and the user only ever opts things *out*.
+    isTrayMirrorEnabled(id) {
+        let m = this._data.trayMirror ?? {};
+        return m[id] !== false;
+    }
+    setTrayMirrorEnabled(id, enabled) {
+        if (!this._data.trayMirror || typeof this._data.trayMirror !== 'object')
+            this._data.trayMirror = {};
+        this._data.trayMirror[id] = !!enabled;
+        this._save();
+    }
+    // A stable serialization of just the user's enable map (NOT the published
+    // catalog), for the shell's config-change diff. The shell writes the catalog
+    // itself, so keying the diff on the whole trayMirror blob would make it react
+    // to its own publish; this keys only on what the user can change in prefs.
+    get trayMirrorKey() {
+        let m = this._data.trayMirror ?? {};
+        return JSON.stringify(Object.keys(m).sort().map(k => [k, m[k] !== false]));
+    }
+
+    // The catalog of mirrorable indicators the shell last saw, [{ id, label }].
+    // Read by the prefs process to build the picker; written by the shell.
+    get trayMirrorItems() {
+        return Array.isArray(this._data.trayMirrorItems) ? this._data.trayMirrorItems : [];
+    }
+    // Publish the current set of mirrorable indicators. Only writes (and only
+    // triggers a save + file-change) when the catalog actually differs, so the
+    // shell re-rendering the tray doesn't churn the config file on every open.
+    publishTrayMirrorItems(items) {
+        let next = (Array.isArray(items) ? items : [])
+            .filter(it => it && typeof it.id === 'string')
+            .map(it => ({ id: it.id, label: String(it.label ?? it.id) }));
+        let prev = this.trayMirrorItems;
+        let same = prev.length === next.length &&
+            prev.every((p, i) => p.id === next[i].id && p.label === next[i].label);
+        if (same)
+            return false;
+        this._data.trayMirrorItems = next;
+        this._save();
+        return true;
+    }
+
     // ---- Wallpaper rotation ----
     // Returned as a fresh object over the defaults so callers always get every
     // key even if the stored blob is partial or missing.
@@ -288,6 +428,30 @@ export class ConfigStore {
         next.pauseOnBattery = !!next.pauseOnBattery;
         next.pauseOnFullscreen = !!next.pauseOnFullscreen;
         this._data.wallpaper = next;
+        this._save();
+    }
+
+    // ---- Blur / glass ----
+    // Always returned complete over the defaults, with the preset id and radii
+    // validated so the shell can consume them without re-checking.
+    get blur() {
+        let raw = { ...BLUR_DEFAULTS, ...(this._data.blur ?? {}) };
+        let clampR = (v, def) => {
+            let n = Math.round(Number(v));
+            if (!Number.isFinite(n)) n = def;
+            return Math.min(BLUR_RADIUS_RANGE.max, Math.max(BLUR_RADIUS_RANGE.min, n));
+        };
+        return {
+            enabled: !!raw.enabled,
+            preset: blurPreset(raw.preset).id,
+            collapsedRadius: clampR(raw.collapsedRadius, BLUR_DEFAULTS.collapsedRadius),
+            expandedRadius: clampR(raw.expandedRadius, BLUR_DEFAULTS.expandedRadius),
+        };
+    }
+    // Merge a partial update into the stored blur settings; `blur` getter does
+    // the validation, so this just persists the merged blob.
+    setBlur(patch) {
+        this._data.blur = { ...BLUR_DEFAULTS, ...(this._data.blur ?? {}), ...(patch ?? {}) };
         this._save();
     }
 }
