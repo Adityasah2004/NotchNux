@@ -21,6 +21,7 @@ import { MediaHelper } from './helpers/media.js';
 import { ShelfHelper } from './helpers/shelf.js';
 import { FileDropBridge } from './helpers/filedrop.js';
 import { WallpaperHelper } from './helpers/wallpaper.js';
+import { SlitDeck } from './helpers/slitdeck.js';
 import { Vinyl, AlbumArtDisc, Knob, AnalogClock, EqBars, CameraView, ACCENT, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, blurPreset } from './helpers/config.js';
 import { fmt } from './helpers/format.js';
@@ -598,9 +599,9 @@ export const NotchNux = GObject.registerClass({
             GLib.Source.remove(this._trayReRenderId);
             this._trayReRenderId = 0;
         }
-        if (this._wpScrollIdleId) {
-            GLib.Source.remove(this._wpScrollIdleId);
-            this._wpScrollIdleId = 0;
+        if (this._wpApplyId) {
+            GLib.Source.remove(this._wpApplyId);
+            this._wpApplyId = 0;
         }
         if (this._trayCardsId) {
             GLib.Source.remove(this._trayCardsId);
@@ -2145,7 +2146,7 @@ export const NotchNux = GObject.registerClass({
     _dropTabRefs(tab) {
         const REFS = {
             system: ['_trayMeters', '_trayUi'],
-            wallpaper: ['_wpScroll', '_wpThumbs', '_wpSubtitle'],
+            wallpaper: ['_wpDeck', '_wpItems', '_wpSubtitle', '_wpCounter'],
             calendar: ['_calPanel', '_calAgenda', '_calDateStrip', '_calDateStripRow',
                 '_calSummaryDay', '_calSummaryDate'],
             shelf: ['_shareStatus'],
@@ -5877,102 +5878,69 @@ export const NotchNux = GObject.registerClass({
             return;
         }
 
-        // Horizontal filmstrip of thumbnails. Clicking one applies it; wheeling
-        // over the strip steps the selection and live-applies (throttled).
-        let scroll = new St.ScrollView({ style_class: 'nook-wp-scroll', x_expand: true });
-        scroll.set_policy(St.PolicyType.AUTOMATIC, St.PolicyType.NEVER);
-        let strip = new St.BoxLayout({ style_class: 'nook-wp-strip', vertical: false });
-
-        this._wpThumbs = [];
+        // Slit deck: every image is a slanted slit, the current one opens out
+        // full width and the row slides to keep it centred (see slitdeck.js).
+        // Scrolling moves the selection right away; the wallpaper itself is
+        // applied once you stop, so the desktop reveal plays once per landing.
+        let activeIdx = Math.max(0, items.findIndex(w => w.current));
+        this._wpItems = items;
         this._wpActivePath = currentItem ? currentItem.path : null;
+        let deck = new SlitDeck({
+            items,
+            activeIndex: activeIdx,
+            thumbFor: it => this._wallpaper.thumbFor(it),
+            accent: accentHex(),
+            onPick: idx => this._selectWallpaper(idx, { applyNow: true }),
+        });
+        this._wpDeck = deck;
+        this._wpCounter = new St.Label({ style_class: 'nook-wp-counter', y_align: Clutter.ActorAlign.CENTER });
+        header.add_child(this._wpCounter);
+        this._updateWallpaperCounter(activeIdx);
+
         // Thumbnails come from an on-disk cache; missing ones are generated
         // by the out-of-process image worker and pop in as each batch lands.
-        let missing = [];
-        let thumbBySrc = new Map();
-        for (let it of items) {
-            let cell = this._buildWallpaperThumb(it);
-            this._wpThumbs.push(cell);
-            strip.add_child(cell);
-            if (!cell._wpHasThumb) {
-                missing.push(it);
-                thumbBySrc.set(it.path, cell._wpThumb);
-            }
-        }
+        let missing = items.filter(it => !this._wallpaper.thumbFor(it));
         if (missing.length) {
             let alive = true;
-            strip.connect('destroy', () => { alive = false; });
+            let indexOf = new Map(items.map((it, i) => [it.path, i]));
+            deck.actor.connect('destroy', () => { alive = false; });
             this._wallpaper.requestThumbs(missing, (src, thumbPath) => {
-                let thumb = thumbBySrc.get(src);
-                if (alive && thumb)
-                    this._setWallpaperThumbImage(thumb, thumbPath);
+                if (alive && indexOf.has(src))
+                    deck.setThumb(indexOf.get(src), thumbPath);
             });
         }
-        scroll.set_child(strip);
-        this._wpScroll = scroll;
 
-        // Wheel/trackpad over the strip = step selection and apply. Throttled so
-        // a fast flick doesn't fire a dozen gsettings writes.
-        scroll.connect('scroll-event', (actor, event) => {
+        // Wheel = one step per notch (lightly throttled so a flick still
+        // reads as discrete steps); trackpads accumulate smooth deltas.
+        deck.actor.connect('scroll-event', (actor, event) => {
             let dir = event.get_scroll_direction();
-            let now = GLib.get_monotonic_time();
-            if (now - (this._lastWpScrollAt || 0) < 220000)
-                return Clutter.EVENT_STOP;
-            if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.LEFT)
-                this._stepWallpaper(-1);
-            else if (dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT)
-                this._stepWallpaper(1);
-            else
+            let step = 0;
+            if (dir === Clutter.ScrollDirection.SMOOTH) {
+                let [dx, dy] = event.get_scroll_delta();
+                this._wpSmoothAcc = (this._wpSmoothAcc || 0) + (Math.abs(dx) > Math.abs(dy) ? dx : dy);
+                if (Math.abs(this._wpSmoothAcc) >= 1.2) {
+                    step = Math.sign(this._wpSmoothAcc);
+                    this._wpSmoothAcc = 0;
+                }
+            } else if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.LEFT) {
+                step = -1;
+            } else if (dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT) {
+                step = 1;
+            } else {
                 return Clutter.EVENT_PROPAGATE;
+            }
+            if (step === 0)
+                return Clutter.EVENT_STOP;
+            let now = GLib.get_monotonic_time();
+            if (dir !== Clutter.ScrollDirection.SMOOTH && now - (this._lastWpScrollAt || 0) < 70000)
+                return Clutter.EVENT_STOP;
             this._lastWpScrollAt = now;
+            this._stepWallpaper(step);
             return Clutter.EVENT_STOP;
         });
 
-        panel.add_child(scroll);
-
-        // Bring the current thumbnail into view after layout settles.
-        this._scrollWallpaperIntoView();
-
+        panel.add_child(deck.actor);
         this._mount(panel);
-    }
-
-    // One thumbnail cell: a preview of the image with its name under it. The
-    // current wallpaper is marked with a highlight class. Clicking applies it.
-    _buildWallpaperThumb(item) {
-        let cell = new St.Button({
-            style_class: item.current ? 'nook-wp-cell nook-wp-cell-active' : 'nook-wp-cell',
-            reactive: true, can_focus: true,
-        });
-        cell._wpPath = item.path;
-        let box = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER });
-
-        // Fill a landscape frame with the cached thumbnail (already cropped to
-        // the cell's aspect, and landscape-rotated when auto-landscape is on,
-        // so portrait images show turned exactly as they'll be applied).
-        let thumb = new St.Widget({ style_class: 'nook-wp-thumb nook-wp-thumb-loading' });
-        let thumbPath = this._wallpaper.thumbFor(item);
-        if (thumbPath)
-            this._setWallpaperThumbImage(thumb, thumbPath);
-        cell._wpThumb = thumb;
-        cell._wpHasThumb = !!thumbPath;
-        box.add_child(thumb);
-
-        let name = new St.Label({ text: item.name, style_class: 'nook-wp-name' });
-        box.add_child(name);
-        cell.set_child(box);
-
-        if (item.current)
-            cell.set_style(`border-color: ${accentHex()};`);
-
-        cell.connect('clicked', () => this._applyWallpaper(item.path));
-        return cell;
-    }
-
-    // Thumbnail paths are sha256-named files in our own cache dir, so they're
-    // safe to place inside a CSS url("…") (no quotes or parens to escape).
-    _setWallpaperThumbImage(thumb, path) {
-        let uri = Gio.File.new_for_path(path).get_uri();
-        thumb.remove_style_class_name('nook-wp-thumb-loading');
-        thumb.set_style(`background-image: url("${uri}"); background-size: cover;`);
     }
 
     _buildWallpaperEmpty(icon, title, sub) {
@@ -5984,78 +5952,47 @@ export const NotchNux = GObject.registerClass({
         return box;
     }
 
-    // Step the selection by dir (±1) through the on-screen thumbnails and apply
-    // the newly-selected one. Wraps around at the ends.
+    // Move the selection by dir (±1), wrapping at the ends. The deck slides
+    // at once; the desktop follows after a short pause (see below).
     _stepWallpaper(dir) {
-        if (!this._wpThumbs || this._wpThumbs.length === 0)
+        if (!this._wpDeck || !this._wpItems?.length)
             return;
-        let curIdx = this._wpThumbs.findIndex(c => c._wpPath === this._wpActivePath);
-        if (curIdx < 0)
-            curIdx = 0;
-        let n = this._wpThumbs.length;
-        let nextIdx = (curIdx + dir + n) % n;
-        this._applyWallpaper(this._wpThumbs[nextIdx]._wpPath);
+        let n = this._wpItems.length;
+        this._selectWallpaper((this._wpDeck.index + dir + n) % n);
     }
 
-    // Apply `path`, then update the thumbnail highlight in place (no full tab
-    // re-render, so scrolling stays smooth) and scroll it into view.
-    _applyWallpaper(path) {
-        if (!this._wallpaper.setWallpaper(path))
+    // Select item `idx` in the deck. Wheel steps wait for 380 ms of quiet
+    // before writing the wallpaper, so a fast scroll through ten images plays
+    // one desktop reveal (and one gsettings write) instead of ten.
+    _selectWallpaper(idx, { applyNow = false } = {}) {
+        let item = this._wpItems?.[idx];
+        if (!item || !this._wpDeck)
             return;
-        this._wpActivePath = path;
-        if (this._wpThumbs) {
-            for (let c of this._wpThumbs) {
-                let active = c._wpPath === path;
-                if (active) {
-                    c.add_style_class_name('nook-wp-cell-active');
-                    c.set_style(`border-color: ${accentHex()};`);
-                } else {
-                    c.remove_style_class_name('nook-wp-cell-active');
-                    c.set_style('');
-                }
-            }
+        this._wpDeck.slideTo(idx);
+        this._wpSubtitle?.set_text(item.name);
+        this._updateWallpaperCounter(idx);
+        if (this._wpApplyId) {
+            GLib.Source.remove(this._wpApplyId);
+            this._wpApplyId = 0;
         }
-        // Refresh the header subtitle to the new filename.
-        if (this._wpSubtitle) {
-            let base = GLib.path_get_basename(path);
-            this._wpSubtitle.set_text(base);
+        if (applyNow) {
+            this._applyWallpaper(item.path);
+            return;
         }
-        this._scrollWallpaperIntoView();
-    }
-
-    // Ensure the active thumbnail is visible in the horizontal strip, matching
-    // the tab-strip auto-scroll behaviour used elsewhere.
-    _scrollWallpaperIntoView() {
-        if (!this._wpScroll || !this._wpThumbs)
-            return;
-        let active = this._wpThumbs.find(c => c._wpPath === this._wpActivePath);
-        if (!active)
-            return;
-        let scroll = this._wpScroll;
-        let adj = scroll.get_hadjustment();
-        if (!adj)
-            return;
-        if (this._wpScrollIdleId)
-            GLib.Source.remove(this._wpScrollIdleId);
-        this._wpScrollIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this._wpScrollIdleId = 0;
-            // The tab may have been switched (and these actors freed) while
-            // this idle waited behind the expand animation.
-            if (this._wpScroll !== scroll || !this._wpThumbs?.includes(active))
-                return GLib.SOURCE_REMOVE;
-            try {
-                let [x, ] = active.get_transformed_position();
-                let [px, ] = scroll.get_transformed_position();
-                let rel = x - px + adj.value;
-                let w = active.width;
-                let maxScroll = Math.max(0, adj.upper - adj.page_size);
-                if (rel < adj.value)
-                    adj.value = Math.max(0, rel - 8);
-                else if (rel + w > adj.value + adj.page_size)
-                    adj.value = Math.min(maxScroll, rel + w - adj.page_size + 8);
-            } catch (e) {}
+        this._wpApplyId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 380, () => {
+            this._wpApplyId = 0;
+            this._applyWallpaper(item.path);
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _updateWallpaperCounter(idx) {
+        this._wpCounter?.set_text(`${idx + 1} / ${this._wpItems?.length ?? 0}`);
+    }
+
+    _applyWallpaper(path) {
+        if (this._wallpaper.setWallpaper(path))
+            this._wpActivePath = path;
     }
 
     // ============================================================

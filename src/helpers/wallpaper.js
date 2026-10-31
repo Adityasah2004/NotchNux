@@ -23,6 +23,8 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
+import { WallpaperTransition } from './wptransition.js';
+
 const BG_SCHEMA = 'org.gnome.desktop.background';
 
 const CACHE_ROOT = GLib.build_filenamev([GLib.get_user_cache_dir(), 'notchnux']);
@@ -81,6 +83,7 @@ function pruneDir(dir, keep) {
 export class WallpaperHelper {
     constructor() {
         this._bg = new Gio.Settings({ schema_id: BG_SCHEMA });
+        this._transition = new WallpaperTransition();
         this._cancellable = new Gio.Cancellable();
 
         // Rotation state.
@@ -154,6 +157,8 @@ export class WallpaperHelper {
         this._thumbQueue = [];
         this._thumbWaiters.clear();
         this._unwatchFolder();
+        this._transition?.destroy();
+        this._transition = null;
         this._bg = null;
     }
 
@@ -162,7 +167,8 @@ export class WallpaperHelper {
     // takes effect immediately.
     configure({ folder, intervalSec, order, rotationEnabled, autoLandscape, enhance,
                 enhanceMode, enhanceSharpen, enhanceContrast, enhanceSaturation,
-                pauseOnBattery, pauseOnFullscreen }) {
+                pauseOnBattery, pauseOnFullscreen, transition }) {
+        this._transition?.setStyle(transition);
         let newFolder = folder || null;
         if (newFolder !== this._folder) {
             this._folder = newFolder;
@@ -414,6 +420,17 @@ export class WallpaperHelper {
     // --- Applying ---
 
     _applyUri(path) {
+        if (!this._bg)
+            return;
+        // Reveal it on the desktop first; picture-uri is written at the end.
+        if (this._transition) {
+            this._transition.play(path, () => this._writeUri(path));
+            return;
+        }
+        this._writeUri(path);
+    }
+
+    _writeUri(path) {
         if (!this._bg)
             return;
         let uri = Gio.File.new_for_path(path).get_uri();

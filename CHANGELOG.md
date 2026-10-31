@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Wallpaper tab is a slit deck
+- Images are now slanted slits; the current one opens to full width and the
+  row slides (spring, velocity-preserving) to keep it centred, with a little
+  parallax and dimming on the neighbours. Wheel or trackpad steps move the
+  selection instantly and the wallpaper is applied once you stop scrolling.
+
+### Added — animated wallpaper changes on the desktop
+- A new wallpaper is revealed on the desktop (above the background, under
+  windows) before GNOME takes over: grow from the notch, slanted wipe, fade or
+  none — *Settings → Wallpaper → Change animation*. Applies to timed rotation
+  too.
+
 ### Added — drag & drop onto the Shelf
 - Drag a file from Files, the desktop or any app toward the notch: it opens on
   the Shelf, the drop zone lights up ("Release to add") and dropping copies the

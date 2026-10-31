@@ -1451,8 +1451,8 @@
 }
 
 /* ------------------------------------------------------------------ *
- * Wallpaper tab — horizontal filmstrip of thumbnails. Scroll or click *
- * to switch; the active image gets an accent-coloured border.         *
+ * Wallpaper tab — a deck of slanted slits; the active image opens to *
+ * full width. Scroll or click to switch.                             *
  * ------------------------------------------------------------------ */
 .nook-wp-panel {
     spacing: 12px;
@@ -1487,53 +1487,31 @@
     color: #f4f4f6;
 }
 
-.nook-wp-scroll {
-    max-height: 168px;
+.nook-wp-counter {
+    font-size: 11px;
+    font-weight: bold;
+    font-feature-settings: "tnum";
+    color: rgba(255, 255, 255, 0.4);
 }
 
-/* Show a slim horizontal scrollbar so the strip reads as scrollable. */
-.nook-wp-scroll StScrollBar {
-    min-height: 0px;
-    height: 4px;
-    opacity: 0.5;
+/* Slit deck: geometry, slant and motion live in src/helpers/slitdeck.js;
+ * the parallelogram is cut by a shader, so no border-radius here. */
+.nook-wp-deck {
+    margin: 0 -4px;
 }
 
-.nook-wp-strip {
-    spacing: 10px;
-    padding: 4px 2px 8px 2px;
+/* Before its thumbnail lands a slit shows as a dim bar. */
+.nook-wp-slit {
+    background-color: rgba(255, 255, 255, 0.08);
 }
 
-.nook-wp-cell {
-    padding: 4px;
-    border-radius: 12px;
-    border: 2px solid transparent;
-    background-color: rgba(255, 255, 255, 0.04);
-    transition: background-color 150ms ease-out, border-color 150ms ease-out;
+.nook-wp-slit-ready {
+    background-color: transparent;
 }
 
-.nook-wp-cell:hover {
-    background-color: rgba(255, 255, 255, 0.09);
-}
-
-/* Active border colour is set inline from the accent; this just keeps the
- * baseline appearance when no inline style has been applied yet. */
-.nook-wp-cell-active {
-    background-color: rgba(255, 255, 255, 0.09);
-    border: 2px solid #7aa2ff;
-}
-
-.nook-wp-thumb {
-    border-radius: 8px;
-    width: 132px;
-    height: 82px;
-}
-
-.nook-wp-name {
-    font-size: 10px;
-    color: rgba(255, 255, 255, 0.55);
-    max-width: 132px;
-    margin-top: 5px;
-    text-align: center;
+.nook-wp-tick {
+    border-radius: 2px;
+    background-color: #7aa2ff;
 }
 
 .nook-wp-empty {
@@ -1556,10 +1534,6 @@
     font-size: 11px;
     color: rgba(255, 255, 255, 0.42);
     margin-top: 2px;
-}
-
-.nook-wp-thumb-loading {
-    background-color: rgba(255, 255, 255, 0.06);
 }
 
 /* ============================================================

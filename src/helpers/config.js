@@ -76,7 +76,9 @@ export const WALLPAPER_DEFAULTS = {
     enhanceContrast: ENHANCE_AUTO.contrast,
     enhanceSaturation: ENHANCE_AUTO.saturation,
     pauseOnBattery: true,
-    pauseOnFullscreen: true
+    pauseOnFullscreen: true,
+    // Desktop reveal when the wallpaper changes: 'grow' | 'wipe' | 'fade' | 'none'
+    transition: 'grow'
 };
 
 // ---- Blur / "glass" appearance ----
@@ -504,6 +506,8 @@ export class ConfigStore {
         next.autoLandscape = !!next.autoLandscape;
         next.enhance = !!next.enhance;
         next.enhanceMode = next.enhanceMode === 'manual' ? 'manual' : 'auto';
+        next.transition = ['grow', 'wipe', 'fade', 'none'].includes(next.transition)
+            ? next.transition : 'grow';
         // Clamp the manual strengths into their allowed ranges, falling back to
         // the auto defaults for anything non-numeric.
         let clampEnh = (v, def, range) => {

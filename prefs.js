@@ -413,6 +413,20 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         });
         group.add(orderRow);
 
+        // How the desktop reveals a new wallpaper (drawn by the shell over the
+        // background, under windows — see src/helpers/wptransition.js).
+        const TRANSITION_IDS = ['grow', 'wipe', 'fade', 'none'];
+        const transitionRow = new Adw.ComboRow({
+            title: 'Change animation',
+            subtitle: 'How a new wallpaper appears on the desktop',
+            model: Gtk.StringList.new(['Grow from notch', 'Slanted wipe', 'Fade', 'None']),
+            selected: Math.max(0, TRANSITION_IDS.indexOf(wp.transition ?? 'grow')),
+        });
+        transitionRow.connect('notify::selected', () => {
+            patch({ transition: TRANSITION_IDS[transitionRow.get_selected()] ?? 'grow' });
+        });
+        group.add(transitionRow);
+
         // Rotate portrait images so they fill a landscape screen. EXIF
         // orientation is honoured, and only portrait images are turned; the
         // originals are never modified (a rotated copy is cached and used).
