@@ -2,8 +2,8 @@
   "uuid": "notchnux@adityasah.programs",
   "name": "NotchNux",
   "description": "A dynamic pill-shaped Notch and dashboard for GNOME: tasks, a focus timer, notes, music, calendar, weather, notifications, system controls, a file shelf and wallpaper rotation.",
-  "version": 6,
-  "version-name": "1.5.0",
+  "version": 7,
+  "version-name": "1.6.0",
   "url": "https://github.com/Adityasah2004/NotchNux",
   "shell-version": [
     "45",
