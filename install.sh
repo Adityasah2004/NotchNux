@@ -53,7 +53,9 @@ check_env() {
     # Optional runtime deps — warn, don't block.
     local missing=()
     command -v gnome-extensions >/dev/null 2>&1 || missing+=("gnome-extensions (gnome-shell-extensions)")
-    pkg-config --exists gstreamer-1.0 2>/dev/null || missing+=("GStreamer 1.0 (Studio webcam/recording tab)")
+    # The runtime (gst-inspect-1.0) is what the Studio tab needs; pkg-config
+    # only finds the -devel package.
+    command -v gst-inspect-1.0 >/dev/null 2>&1 || missing+=("GStreamer 1.0 (Studio webcam/recording tab)")
     if ((${#missing[@]})); then
         for m in "${missing[@]}"; do warn "optional: $m not found"; done
     fi
@@ -101,8 +103,8 @@ cat <<EOF
     ${DIM}• Wayland:${RESET} log out and back in
     ${DIM}• X11:${RESET}     press ${BOLD}Alt+F2${RESET}, type ${BOLD}r${RESET}, press Enter
 
-  ${BOLD}Test safely in a nested session (no logout needed):${RESET}
-    ${DIM}dbus-run-session -- gnome-shell --nested --wayland${RESET}
+  ${BOLD}Test safely in a separate shell window (no logout needed):${RESET}
+    ${DIM}dbus-run-session -- gnome-shell --devkit --wayland${RESET}   ${DIM}(GNOME 49+; use --nested on older)${RESET}
 
   Click the pill to open the dashboard. Enjoy! ${CYAN}▪▪▪▪${RESET}
 EOF

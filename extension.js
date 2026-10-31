@@ -26,6 +26,7 @@ export default class NotchNuxExtension extends Extension {
         
         // 1. Remove and destroy widget
         if (this._notch) {
+            this._notch._disabling = true;
             Main.layoutManager.removeChrome(this._notch);
             this._notch.destroy();
             this._notch = null;

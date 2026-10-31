@@ -18,22 +18,29 @@ export class MprisHelper {
         this.onPlaybackChanged = null;
         this.onPlayersListChanged = null;
 
-        this._dbusProxy = null;
         this._nameOwnerChangedId = 0;
         this._pollId = 0;
         this._lastSnapshot = '';
+        this._cancellable = new Gio.Cancellable();
+        this._destroyed = false;
 
         this._initDBus();
         this._startPolling();
     }
 
     destroy() {
+        this._destroyed = true;
+        this.onMetadataChanged = null;
+        this.onPlaybackChanged = null;
+        this.onPlayersListChanged = null;
+        this._cancellable.cancel();
         if (this._pollId) {
             GLib.Source.remove(this._pollId);
             this._pollId = 0;
         }
-        if (this._dbusProxy && this._nameOwnerChangedId) {
-            this._dbusProxy.disconnectSignal(this._nameOwnerChangedId);
+        if (this._nameOwnerChangedId) {
+            Gio.DBus.session.signal_unsubscribe(this._nameOwnerChangedId);
+            this._nameOwnerChangedId = 0;
         }
         for (let proxy of this.players.values()) {
             // These are GObject signal handlers (proxy.connect), so they must
@@ -53,8 +60,14 @@ export class MprisHelper {
     // Poll on a low-frequency timer, re-select the active player, and only
     // fire callbacks when something actually changed to avoid needless redraws.
     _startPolling() {
-        this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 2, () => {
-            this._syncPlayers();
+        this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 3, () => {
+            if (this._destroyed)
+                return GLib.SOURCE_REMOVE;
+            // NameOwnerChanged already tracks players coming and going; the
+            // full ListNames resync is only a safety net, so run it every 30 s.
+            this._pollTicks = (this._pollTicks ?? 0) + 1;
+            if (this._pollTicks % 10 === 0)
+                this._syncPlayers();
             if (this.players.size > 0) {
                 this._refreshAllLiveProps(() => {
                     // Re-select after the async D-Bus reads complete. Reading
@@ -76,79 +89,55 @@ export class MprisHelper {
     }
 
     _syncPlayers() {
-        if (!this._dbusProxy)
-            return;
+        Gio.DBus.session.call(
+            DBUS_SERVICE, DBUS_PATH, DBUS_INTERFACE,
+            'ListNames',
+            null,
+            null,
+            Gio.DBusCallFlags.NONE,
+            2000,
+            this._cancellable,
+            (conn, res) => {
+                try {
+                    let result = conn.call_finish(res);
+                    if (this._destroyed) return;
+                    let [names] = result.deep_unpack();
+                    let livePlayers = new Set(names.filter(name => name.startsWith(MPRIS_PREFIX)));
 
-        try {
-            let result = this._dbusProxy.call_sync(
-                'ListNames',
-                null,
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
-            let [names] = result.deep_unpack();
-            let livePlayers = new Set(names.filter(name => name.startsWith(MPRIS_PREFIX)));
+                    for (let name of livePlayers) {
+                        if (!this.players.has(name))
+                            this._addPlayer(name);
+                    }
 
-            for (let name of livePlayers) {
-                if (!this.players.has(name))
-                    this._addPlayer(name);
+                    for (let name of [...this.players.keys()]) {
+                        if (!livePlayers.has(name))
+                            this._removePlayer(name);
+                    }
+                } catch (e) {
+                    // Ignore transient errors on bus shutdown or timeout
+                }
             }
-
-            for (let name of [...this.players.keys()]) {
-                if (!livePlayers.has(name))
-                    this._removePlayer(name);
-            }
-        } catch (e) {
-            console.error('NotchNux: Failed to resync MPRIS players', e);
-        }
+        );
     }
 
+    // Watch players come and go. A connection-level subscription with an arg0
+    // namespace match means the bus only delivers MPRIS name changes. (The old
+    // proxy.connectSignal() on an interface-less DBusProxy never fired at all,
+    // so players were only ever noticed by the poll.)
     _initDBus() {
-        try {
-            this._dbusProxy = Gio.DBusProxy.new_for_bus_sync(
-                Gio.BusType.SESSION,
-                Gio.DBusProxyFlags.NONE,
-                null,
-                DBUS_SERVICE,
-                DBUS_PATH,
-                DBUS_INTERFACE,
-                null
-            );
-
-            // 1. Monitor new/removed players via NameOwnerChanged
-            this._nameOwnerChangedId = this._dbusProxy.connectSignal(
-                'NameOwnerChanged',
-                (proxy, sender, [name, oldOwner, newOwner]) => {
-                    if (name.startsWith(MPRIS_PREFIX)) {
-                        if (newOwner === '') {
-                            // Player closed
-                            this._removePlayer(name);
-                        } else {
-                            // Player opened
-                            this._addPlayer(name);
-                        }
-                    }
-                }
-            );
-
-            // 2. Load existing players
-            let result = this._dbusProxy.call_sync(
-                'ListNames',
-                null,
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
-            let [names] = result.deep_unpack();
-            for (let name of names) {
-                if (name.startsWith(MPRIS_PREFIX)) {
+        this._nameOwnerChangedId = Gio.DBus.session.signal_subscribe(
+            DBUS_SERVICE, DBUS_INTERFACE, 'NameOwnerChanged', DBUS_PATH,
+            'org.mpris.MediaPlayer2', Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE,
+            (conn, sender, path, iface, signal, params) => {
+                let [name, , newOwner] = params.deepUnpack();
+                if (!name.startsWith(MPRIS_PREFIX)) return;
+                if (newOwner === '')
+                    this._removePlayer(name);
+                else
                     this._addPlayer(name);
-                }
-            }
-        } catch (e) {
-            console.error('NotchNux: Failed to initialize D-Bus tracking for MPRIS', e);
-        }
+            });
+        // Load players that already exist (async).
+        this._syncPlayers();
     }
 
     _addPlayer(busName) {
@@ -168,15 +157,17 @@ export class MprisHelper {
             busName,
             MPRIS_PATH,
             MPRIS_PLAYER_INTERFACE,
-            null,
+            this._cancellable,
             (obj, res) => {
+                if (this._destroyed) return;
                 // Removed (player vanished) while the proxy was in flight.
                 if (!this._pendingPlayers.delete(busName)) return;
                 let proxy;
                 try {
                     proxy = Gio.DBusProxy.new_for_bus_finish(res);
                 } catch (e) {
-                    console.error(`NotchNux: Error setting up MPRIS proxy for ${busName}`, e);
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.error(`NotchNux: Error setting up MPRIS proxy for ${busName}`, e);
                     return;
                 }
                 this._finishAddPlayer(busName, proxy);
@@ -201,7 +192,7 @@ export class MprisHelper {
             // the next idle tick once the cache has settled, and re-evaluate
             // which player should be active with real metadata in hand.
             GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-                if (this.players.has(busName)) {
+                if (!this._destroyed && this.players.has(busName)) {
                     this._refreshLiveProps(busName, proxy, () => {
                         this._revaluateActivePlayer();
                         this._triggerCallbacks();
@@ -323,17 +314,16 @@ export class MprisHelper {
             Gio.DBus.session.call(
                 busName, MPRIS_PATH, 'org.freedesktop.DBus.Properties', 'GetAll',
                 new GLib.Variant('(s)', [MPRIS_PLAYER_INTERFACE]),
-                null, Gio.DBusCallFlags.NONE, 2000, null,
+                null, Gio.DBusCallFlags.NONE, 2000, this._cancellable,
                 (conn, res) => {
                     try {
                         let reply = conn.call_finish(res);
                         let [props] = reply.deep_unpack();
                         proxy._liveProps = props; // { name -> GLib.Variant }
                     } catch (e) {
-                        // Player may have vanished mid-call; ignore.
-                    } finally {
-                        if (done) done();
+                        // Player may have vanished mid-call (or we were destroyed).
                     }
+                    if (done && !this._destroyed) done();
                 }
             );
         } catch (e) {
@@ -448,6 +438,7 @@ export class MprisHelper {
         }
 
         let artUrl = metadata['mpris:artUrl'] || '';
+        let album = typeof metadata['xesam:album'] === 'string' ? metadata['xesam:album'] : '';
         
         // Shorten only at the helper boundary enough to prevent pathological
         // labels; the media tab applies its own layout-sized cap.
@@ -458,6 +449,7 @@ export class MprisHelper {
             title: title,
             artist: artist,
             albumArt: artUrl,
+            album: album,
             status: status,
             hasMedia: true,
             canPlay: canPlay,
@@ -487,8 +479,9 @@ export class MprisHelper {
                 this.activePlayerBus, MPRIS_PATH, 'org.freedesktop.DBus.Properties',
                 'Get',
                 new GLib.Variant('(ss)', [MPRIS_PLAYER_INTERFACE, 'Position']),
-                null, Gio.DBusCallFlags.NONE, 800, null,
+                null, Gio.DBusCallFlags.NONE, 800, this._cancellable,
                 (conn, res) => {
+                    if (this._destroyed) return;
                     try {
                         let [variant] = conn.call_finish(res).deep_unpack();
                         let pos = variant instanceof GLib.Variant ? variant.deep_unpack() : variant;

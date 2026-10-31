@@ -43,17 +43,47 @@ class MediaDevice {
         this.id = this.nodeName || this.v4l2Path || this.name;
     }
 
-    // Build the source-element launch fragment for this device. Prefer
-    // pipewiresrc by node (works for both cameras and mics under PipeWire);
-    // fall back to the raw v4l2 device path for cameras.
-    sourceFragment() {
-        if (this.nodeName)
-            return `pipewiresrc target-object="${this.nodeName}"`;
-        if (this.kind === 'video' && this.v4l2Path)
-            return `v4l2src device=${this.v4l2Path}`;
-        return this.kind === 'video' ? 'v4l2src' : 'pulsesrc';
+    // A source element already configured for this device. Gst.Device knows
+    // how to open itself (pipewiresrc target, v4l2src device, …), so nothing
+    // device-supplied is ever spliced into a pipeline description string —
+    // the old `target-object="${nodeName}"` launch text could be hijacked by
+    // a crafted device name.
+    createSource() {
+        try {
+            let el = this._dev.create_element(null);
+            if (el) return el;
+        } catch (e) {
+            console.warn(`NotchNux: ${this.name} cannot create its own source`, e.message);
+        }
+        if (this.kind === 'video' && this.v4l2Path) {
+            let el = Gst.ElementFactory.make('v4l2src', null);
+            el?.set_property('device', this.v4l2Path);
+            return el;
+        }
+        return Gst.ElementFactory.make(this.kind === 'video' ? 'v4l2src' : 'pulsesrc', null);
     }
 }
+
+// Build a pipeline from [factoryName | element, props?] steps, linking them in
+// order. Returns { pipeline, elements } or throws with the missing plugin name.
+function chain(pipeline, steps) {
+    let els = [];
+    for (let step of steps) {
+        let [what, props] = Array.isArray(step) ? step : [step, null];
+        let el = typeof what === 'string' ? Gst.ElementFactory.make(what, null) : what;
+        if (!el)
+            throw new Error(`GStreamer element "${what}" is not installed`);
+        for (let [k, v] of Object.entries(props ?? {}))
+            el.set_property(k, v);
+        pipeline.add(el);
+        if (els.length && !els[els.length - 1].link(el))
+            throw new Error(`cannot link ${els[els.length - 1].get_name()} → ${el.get_name()}`);
+        els.push(el);
+    }
+    return els;
+}
+
+const caps = s => ['capsfilter', { caps: Gst.Caps.from_string(s) }];
 
 export class MediaHelper {
     constructor() {
@@ -111,19 +141,20 @@ export class MediaHelper {
     startPreview(camera) {
         this.stopPreview();
         if (!this._ok || !camera) return;
-        const W = 320, H = 240;
-        let desc =
-            `${camera.sourceFragment()} ! videoconvert ! videoscale ! ` +
-            `video/x-raw,format=RGB,width=${W},height=${H} ! ` +
-            `appsink name=sink max-buffers=1 drop=true sync=false`;
         try {
-            this._preview = Gst.parse_launch(desc);
+            let pipeline = new Gst.Pipeline();
+            let els = chain(pipeline, [
+                camera.createSource(), 'videoconvert', 'videoscale',
+                caps('video/x-raw,format=RGB,width=320,height=240'),
+                ['appsink', { 'max-buffers': 1, drop: true, sync: false }],
+            ]);
+            this._preview = pipeline;
+            this._previewSink = els[els.length - 1];
         } catch (e) {
             console.error('NotchNux: preview pipeline failed', e);
             this._preview = null;
             return;
         }
-        this._previewSink = this._preview.get_by_name('sink');
         this._preview.set_state(Gst.State.PLAYING);
 
         // ~20fps poll. try_pull_sample(0) returns null when no frame is ready,
@@ -179,31 +210,40 @@ export class MediaHelper {
     startVideoRecording(camera, mic) {
         if (!this._ok || this.isRecording || !camera) return null;
         let path = this._outPath('video');
-        let audioBranch = mic
-            ? `${mic.sourceFragment()} ! queue ! audioconvert ! audioresample ! ` +
-              `opusenc ! queue ! mux. `
-            : '';
-        let desc =
-            `webmmux name=mux ! filesink location="${path}" ` +
-            `${camera.sourceFragment()} ! queue ! videoconvert ! videoscale ! ` +
-            `video/x-raw,width=640,height=480 ! vp8enc deadline=1 cpu-used=5 ! queue ! mux. ` +
-            audioBranch;
-        return this._launchRecorder(desc, 'video', path);
+        return this._launchRecorder(pipeline => {
+            let [mux] = chain(pipeline, ['webmmux', ['filesink', { location: path }]]);
+            let video = chain(pipeline, [
+                camera.createSource(), 'queue', 'videoconvert', 'videoscale',
+                caps('video/x-raw,width=640,height=480'),
+                ['vp8enc', { deadline: 1, 'cpu-used': 5 }], 'queue',
+            ]);
+            if (!video[video.length - 1].link(mux))
+                throw new Error('cannot link video into webmmux');
+            if (mic) {
+                let audio = chain(pipeline, [
+                    mic.createSource(), 'queue', 'audioconvert', 'audioresample', 'opusenc', 'queue',
+                ]);
+                if (!audio[audio.length - 1].link(mux))
+                    throw new Error('cannot link audio into webmmux');
+            }
+        }, 'video', path);
     }
 
     // Record the selected mic to an Ogg/Opus file.
     startAudioRecording(mic) {
         if (!this._ok || this.isRecording || !mic) return null;
         let path = this._outPath('audio');
-        let desc =
-            `${mic.sourceFragment()} ! queue ! audioconvert ! audioresample ! ` +
-            `opusenc ! oggmux ! filesink location="${path}"`;
-        return this._launchRecorder(desc, 'audio', path);
+        return this._launchRecorder(pipeline => chain(pipeline, [
+            mic.createSource(), 'queue', 'audioconvert', 'audioresample', 'opusenc', 'oggmux',
+            ['filesink', { location: path }],
+        ]), 'audio', path);
     }
 
-    _launchRecorder(desc, kind, path) {
+    _launchRecorder(build, kind, path) {
         try {
-            this._recorder = Gst.parse_launch(desc);
+            let pipeline = new Gst.Pipeline();
+            build(pipeline);
+            this._recorder = pipeline;
         } catch (e) {
             console.error('NotchNux: recorder pipeline failed', e);
             this._recorder = null;
@@ -233,6 +273,8 @@ export class MediaHelper {
     stopRecording() {
         if (!this._recorder) return null;
         let path = this._recordPath;
+        // Already stopping: don't stack a second EOS + fallback timer.
+        if (this._stopFallbackId) return path;
         // send_event returns quickly; finalize happens on the EOS bus message.
         try {
             this._recorder.send_event(Gst.Event.new_eos());

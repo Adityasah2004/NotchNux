@@ -25,13 +25,18 @@ import GLib from 'gi://GLib';
 // in a future version appear (enabled, at the end) without a migration step,
 // and stale ids in an old config file are ignored.
 export const TAB_DEFS = [
+    { id: 'home',          label: 'Home',     icon: 'go-home-symbolic' },
+    { id: 'tasks',         label: 'Tasks',    icon: 'checkbox-checked-symbolic' },
+    { id: 'focus',         label: 'Focus',    icon: 'alarm-symbolic' },
     { id: 'media',         label: 'Music',    icon: 'audio-x-generic-symbolic' },
-    { id: 'system',        label: 'Tray',     icon: 'emblem-system-symbolic' },
-    { id: 'weather',       label: 'Weather',  icon: 'weather-few-clouds-symbolic' },
-    { id: 'studio',        label: 'Studio',   icon: 'camera-web-symbolic' },
     { id: 'calendar',      label: 'Calendar', icon: 'x-office-calendar-symbolic' },
+    { id: 'weather',       label: 'Weather',  icon: 'weather-few-clouds-symbolic' },
     { id: 'notifications', label: 'Alerts',   icon: 'preferences-system-notifications-symbolic' },
+    { id: 'system',        label: 'Tray',     icon: 'emblem-system-symbolic' },
     { id: 'shelf',         label: 'Shelf',    icon: 'view-list-symbolic' },
+    { id: 'notes',         label: 'Notes',    icon: 'document-edit-symbolic' },
+    { id: 'clipboard',     label: 'Clipboard', icon: 'edit-paste-symbolic' },
+    { id: 'studio',        label: 'Studio',   icon: 'camera-web-symbolic' },
     { id: 'wallpaper',     label: 'Wallpaper', icon: 'preferences-desktop-wallpaper-symbolic' }
 ];
 
@@ -158,14 +163,27 @@ export const FEATURE_DEFS = [
     { id: 'weatherAutoRefresh', label: 'Auto-refresh weather', description: 'Periodically refresh weather in the background.',           default: true },
     { id: 'calendarSync',      label: 'Calendar sync',        description: 'Pull events from GNOME Online Accounts into the Calendar tab.', default: true },
     { id: 'notifPeek',         label: 'Notification peek',    description: 'Expand the pill into a banner when a notification arrives.',   default: true },
-    { id: 'showPowerButton',   label: 'Power button',         description: 'Show a power menu (suspend, log out, restart, power off) in the dashboard header.', default: true },
+    { id: 'showPowerButton',   label: 'Session actions',      description: 'List Lock, Suspend, Log Out, Restart and Power Off in the dashboard’s ⋯ menu.', default: true },
     { id: 'hidePanel',         label: 'Hide top panel',       description: 'Hide the GNOME top bar and rely on the notch instead.',        default: false },
     { id: 'reclaimSpace',      label: 'Reclaim panel space',  description: 'Let maximized windows use the top strip the panel occupied (only applies when the panel is hidden).', default: false },
     { id: 'mirrorTray',        label: 'Mirror top-bar indicators', description: 'Show the top bar’s extension and status icons inside the Tray tab, so you can reach them with the panel hidden.', default: true },
+    { id: 'notchHud',          label: 'Volume & brightness in the notch', description: 'Show volume, brightness and other on-screen levels as a short alert in the notch instead of GNOME’s centre pop-up.', default: true },
+    { id: 'powerAlerts',       label: 'Charging & low battery alerts', description: 'A short alert when you plug in the charger or the battery drops to 20 % and 10 %.', default: true },
+    { id: 'headphoneAlerts',   label: 'Headphone alerts',     description: 'A short alert when headphones or a Bluetooth headset become the audio output.', default: true },
+    { id: 'eventHeadsUp',      label: 'Event heads-up',       description: 'A heads-up in the notch 5 minutes before a calendar event starts.', default: true },
+    { id: 'autoHide',          label: 'Hide when idle',       description: 'Tuck the notch into the top edge while nothing is happening. It comes back for music, timers and alerts, or when you rest the pointer at the top centre.', default: false },
+    { id: 'pillStats',         label: 'Stats in the pill',    description: 'Show memory and CPU in the pill when nothing else is live. Read every 2 seconds, only while on.', default: false },
+    { id: 'swipeGestures',     label: 'Swipe gestures',       description: 'Two-finger swipe sideways on the pill to skip tracks; swipe down to open, up to close.', default: true },
+    { id: 'lyricsOnline',      label: 'Look up lyrics online', description: 'Fetch timed lyrics for the playing song from lrclib.net (sends the song’s title, artist, album and length).', default: true },
     { id: 'topScroll',         label: 'Scroll top edge to switch workspaces', description: 'Restore top-edge scroll-to-switch-workspace when the panel is hidden — scroll anywhere along the top of the screen to move between workspaces.', default: false }
 ];
 
 const DEFAULT_ACCENT = '#7aa2ff';
+
+// Up to this many tabs sit beside Home in the dashboard header; everything
+// else is one click away in the grid.
+export const MAX_PINNED = 5;
+export const DEFAULT_PINNED = ['media', 'tasks', 'calendar', 'weather', 'system'];
 
 // Accept #rgb / #rrggbb (with or without leading #), returns a normalized
 // lowercase "#rrggbb" string, or null if the input isn't a valid hex colour.
@@ -230,7 +248,13 @@ export class ConfigStore {
             // as [{ id, label }]. The shell publishes this so the (separate)
             // prefs process can render a picker for indicators it can't see
             // directly. Not user-authored; overwritten by the shell.
-            trayMirrorItems: []
+            trayMirrorItems: [],
+            // Shortcuts beside Home in the header (see MAX_PINNED).
+            pinnedTabs: [...DEFAULT_PINNED],
+            // Keep Awake survives a lock/unlock (the extension is re-enabled).
+            keepAwake: false,
+            // Music tab shows synced lyrics in place of the vinyl + knob.
+            musicLyrics: false
         };
     }
 
@@ -255,6 +279,9 @@ export class ConfigStore {
                     ? parsed.trayMirrorItems.filter(it => it && typeof it.id === 'string')
                     : [];
                 data.accent = normalizeHex(parsed.accent) ?? DEFAULT_ACCENT;
+                data.pinnedTabs = this._cleanPinned(parsed.pinnedTabs ?? DEFAULT_PINNED);
+                data.keepAwake = !!parsed.keepAwake;
+                data.musicLyrics = !!parsed.musicLyrics;
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
@@ -268,8 +295,11 @@ export class ConfigStore {
     }
 
     // Produce a valid, complete tab order from a possibly stale/partial stored
-    // list: keep known ids in their stored order, drop unknown ids, and append
-    // any known tab the stored list forgot (e.g. added in a newer version).
+    // list: keep known ids in their stored order, drop unknown ids, and slot in
+    // any known tab the stored list forgot (e.g. added in a newer version) at
+    // its default position — right after the nearest preceding default-order
+    // tab the user has (or before the next one) — so new tabs like Home land
+    // up front and Notes beside Shelf, not all at the end.
     _reconcileOrder(stored) {
         let known = new Set(TAB_DEFS.map(t => t.id));
         let seen = new Set();
@@ -280,25 +310,39 @@ export class ConfigStore {
                 seen.add(id);
             }
         }
-        for (let t of TAB_DEFS) {
-            if (!seen.has(t.id))
-                order.push(t.id);
-        }
+        let defaults = TAB_DEFS.map(t => t.id);
+        defaults.forEach((id, i) => {
+            if (seen.has(id))
+                return;
+            let prev = defaults.slice(0, i).reverse().find(n => order.includes(n));
+            let next = defaults.slice(i + 1).find(n => order.includes(n));
+            let at = prev ? order.indexOf(prev) + 1
+                : next ? order.indexOf(next) : order.length;
+            order.splice(at, 0, id);
+            seen.add(id);
+        });
         return order;
+    }
+
+    // The shell and the prefs window each hold a ConfigStore over the same
+    // file. Every setter first re-reads the file (_refresh) and then changes
+    // only its own key, so one process never writes back a stale copy that
+    // silently undoes the other's edit.
+    _refresh() {
+        this._data = this._load();
     }
 
     _save() {
         try {
-            GLib.mkdir_with_parents(this._dir, 0o755);
-            let text = JSON.stringify(this._data, null, 2);
-            let file = Gio.File.new_for_path(this._path);
-            // replace_contents is atomic (writes to a temp then renames), so a
-            // crash mid-write can't leave a truncated config behind.
-            file.replace_contents(
-                new TextEncoder().encode(text),
-                null, false,
-                Gio.FileCreateFlags.REPLACE_DESTINATION,
-                null);
+            GLib.mkdir_with_parents(this._dir, 0o700);
+            // Atomic (temp file + rename) and private to the user. The mode
+            // argument only applies to new files, so also tighten a config
+            // (and dir) created 0644/0755 by older versions.
+            GLib.file_set_contents_full(this._path,
+                new TextEncoder().encode(JSON.stringify(this._data, null, 2)),
+                GLib.FileSetContentsFlags.CONSISTENT, 0o600);
+            GLib.chmod(this._path, 0o600);
+            GLib.chmod(this._dir, 0o700);
         } catch (e) {
             console.error('NotchNux: Failed to save config.', e);
         }
@@ -312,6 +356,7 @@ export class ConfigStore {
         let norm = normalizeHex(hex);
         if (!norm)
             return false;
+        this._refresh();
         this._data.accent = norm;
         this._save();
         return true;
@@ -325,6 +370,7 @@ export class ConfigStore {
         return this._reconcileOrder(this._data.tabOrder);
     }
     setTabOrder(order) {
+        this._refresh();
         this._data.tabOrder = this._reconcileOrder(order);
         this._save();
     }
@@ -332,12 +378,51 @@ export class ConfigStore {
         return this._data.tabs[id] !== false;
     }
     setTabEnabled(id, enabled) {
+        this._refresh();
         this._data.tabs[id] = !!enabled;
         this._save();
     }
     // The ordered list of tab ids that should actually be shown.
     get visibleTabs() {
         return this.tabOrder.filter(id => this.isTabEnabled(id));
+    }
+
+    // ---- Header shortcuts (pinned tabs) ----
+    _cleanPinned(list) {
+        let known = new Set(TAB_DEFS.map(t => t.id));
+        known.delete('home');
+        let out = [];
+        for (let id of Array.isArray(list) ? list : []) {
+            if (known.has(id) && !out.includes(id))
+                out.push(id);
+        }
+        return out.slice(0, MAX_PINNED);
+    }
+    get pinnedTabs() {
+        return this._cleanPinned(this._data.pinnedTabs);
+    }
+    setPinnedTabs(list) {
+        this._refresh();
+        this._data.pinnedTabs = this._cleanPinned(list);
+        this._save();
+    }
+
+    get keepAwake() {
+        return !!this._data.keepAwake;
+    }
+    setKeepAwake(on) {
+        this._refresh();
+        this._data.keepAwake = !!on;
+        this._save();
+    }
+
+    get musicLyrics() {
+        return !!this._data.musicLyrics;
+    }
+    setMusicLyrics(on) {
+        this._refresh();
+        this._data.musicLyrics = !!on;
+        this._save();
     }
 
     // ---- Features ----
@@ -348,6 +433,7 @@ export class ConfigStore {
         return def ? def.default : true;
     }
     setFeatureEnabled(id, enabled) {
+        this._refresh();
         this._data.features[id] = !!enabled;
         this._save();
     }
@@ -362,6 +448,7 @@ export class ConfigStore {
         return m[id] !== false;
     }
     setTrayMirrorEnabled(id, enabled) {
+        this._refresh();
         if (!this._data.trayMirror || typeof this._data.trayMirror !== 'object')
             this._data.trayMirror = {};
         this._data.trayMirror[id] = !!enabled;
@@ -388,6 +475,7 @@ export class ConfigStore {
         let next = (Array.isArray(items) ? items : [])
             .filter(it => it && typeof it.id === 'string')
             .map(it => ({ id: it.id, label: String(it.label ?? it.id) }));
+        this._refresh();
         let prev = this.trayMirrorItems;
         let same = prev.length === next.length &&
             prev.every((p, i) => p.id === next[i].id && p.label === next[i].label);
@@ -407,6 +495,7 @@ export class ConfigStore {
     // Merge a partial update into the stored wallpaper settings. Validates the
     // couple of fields that have a constrained shape; unknown keys pass through.
     setWallpaper(patch) {
+        this._refresh();
         let next = { ...WALLPAPER_DEFAULTS, ...(this._data.wallpaper ?? {}), ...(patch ?? {}) };
         next.folder = typeof next.folder === 'string' ? next.folder : '';
         next.intervalSec = Math.max(5, parseInt(next.intervalSec, 10) || WALLPAPER_DEFAULTS.intervalSec);
@@ -451,6 +540,7 @@ export class ConfigStore {
     // Merge a partial update into the stored blur settings; `blur` getter does
     // the validation, so this just persists the merged blob.
     setBlur(patch) {
+        this._refresh();
         this._data.blur = { ...BLUR_DEFAULTS, ...(this._data.blur ?? {}), ...(patch ?? {}) };
         this._save();
     }

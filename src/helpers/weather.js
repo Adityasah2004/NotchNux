@@ -2,12 +2,26 @@ import Soup from 'gi://Soup';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
+const GEOCLUE = 'org.freedesktop.GeoClue2';
+// GClueAccuracyLevel.CITY — plenty for weather, and it doesn't ask GeoClue for
+// a street-level fix the extension has no use for.
+const ACCURACY_CITY = 4;
+const GEOCLUE_TIMEOUT_S = 8;
+// A cached forecast younger than this is shown as-is on startup (GNOME
+// re-enables the extension on every unlock; refetching each time was waste).
+const FRESH_SECONDS = 15 * 60;
+
 export class WeatherHelper {
     constructor() {
-        this._session = new Soup.Session({ timeout: 15 });
+        this._session = new Soup.Session({
+            timeout: 15,
+            user_agent: 'NotchNux GNOME Shell extension (+https://github.com/Adityasah2004/NotchNux)',
+        });
+        this._cancellable = new Gio.Cancellable();
         this._configDir = GLib.build_filenamev([GLib.get_user_config_dir(), 'notchnux']);
         this._configPath = GLib.build_filenamev([this._configDir, 'settings.json']);
         this._settings = this._loadSettings();
+        this._geo = null;   // in-flight GeoClue session, see _fetchGeoClueLocation
         this.weatherData = {
             temp: '--',
             tempValue: null,
@@ -22,10 +36,32 @@ export class WeatherHelper {
             sunset: '--:--',
             hourly: [],   // [{ label, icon, temp }]
             manualLocation: this._settings.locationQuery || '',
-            loaded: false
+            loaded: false,
         };
+        // Restore the last good forecast so the UI has real numbers right away.
+        let cached = this._settings.lastWeather;
+        if (cached?.data?.loaded && typeof cached.at === 'number')
+            this.weatherData = { ...this.weatherData, ...cached.data, hourly: cached.data.hourly ?? [] };
 
         this.onWeatherUpdated = null;
+        this._timeFmt = new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit' });
+    }
+
+    destroy() {
+        this.onWeatherUpdated = null;
+        this._cancellable.cancel();
+        this._session.abort();
+        this._endGeoClue();
+    }
+
+    // Seconds since the cached forecast was fetched (Infinity if none).
+    get ageSeconds() {
+        let at = this._settings.lastWeather?.at;
+        return typeof at === 'number' ? Math.max(0, Date.now() / 1000 - at) : Infinity;
+    }
+
+    get isFresh() {
+        return this.weatherData.loaded && this.ageSeconds < FRESH_SECONDS;
     }
 
     _notify() {
@@ -43,10 +79,14 @@ export class WeatherHelper {
     }
 
     requestDeviceLocation() {
-        this._settings.locationQuery = '';
-        this._saveSettings();
-        this.weatherData.condition = 'Locating weather...';
-        this.weatherData.city = 'Locating...';
+        if (this._settings.locationQuery) {
+            this._settings.locationQuery = '';
+            this._saveSettings();
+        }
+        if (!this.weatherData.loaded) {
+            this.weatherData.condition = 'Locating weather...';
+            this.weatherData.city = 'Locating...';
+        }
         this.weatherData.manualLocation = '';
         this._notify();
 
@@ -68,10 +108,14 @@ export class WeatherHelper {
             return;
         }
 
-        this._settings.locationQuery = query;
-        this._saveSettings();
-        this.weatherData.condition = 'Finding location...';
-        this.weatherData.city = query;
+        if (this._settings.locationQuery !== query) {
+            this._settings.locationQuery = query;
+            this._saveSettings();
+        }
+        if (!this.weatherData.loaded) {
+            this.weatherData.condition = 'Finding location...';
+            this.weatherData.city = query;
+        }
         this.weatherData.manualLocation = query;
         this._notify();
 
@@ -81,7 +125,7 @@ export class WeatherHelper {
                     ...this.weatherData,
                     condition: 'Location not found',
                     city: query,
-                    loaded: false
+                    loaded: false,
                 };
                 this._notify();
                 return;
@@ -95,8 +139,8 @@ export class WeatherHelper {
             let [ok, bytes] = GLib.file_get_contents(this._configPath);
             if (!ok || !bytes)
                 return {};
-            let text = new TextDecoder('utf-8').decode(bytes);
-            return JSON.parse(text);
+            let parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+            return parsed && typeof parsed === 'object' ? parsed : {};
         } catch (e) {
             return {};
         }
@@ -105,10 +149,34 @@ export class WeatherHelper {
     _saveSettings() {
         try {
             GLib.mkdir_with_parents(this._configDir, 0o700);
-            GLib.file_set_contents(this._configPath, JSON.stringify(this._settings, null, 2));
+            GLib.file_set_contents_full(this._configPath,
+                new TextEncoder().encode(JSON.stringify(this._settings, null, 2)),
+                GLib.FileSetContentsFlags.CONSISTENT, 0o600);
+            GLib.chmod(this._configPath, 0o600);
         } catch (e) {
-            console.error('NotchNux: Failed to save settings.', e);
+            console.error('NotchNux: Failed to save weather settings.', e);
         }
+    }
+
+    // GET `url` and parse JSON. `done(json | null)`; null on any failure or
+    // after destroy(). Responses are small, so buffering them is fine.
+    _getJson(url, done) {
+        let msg = Soup.Message.new('GET', url);
+        this._session.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, this._cancellable,
+            (session, res) => {
+                let json = null;
+                try {
+                    let bytes = session.send_and_read_finish(res);
+                    if (msg.get_status() !== Soup.Status.OK)
+                        throw new Error(`HTTP ${msg.get_status()}`);
+                    json = JSON.parse(new TextDecoder('utf-8').decode(bytes.get_data()));
+                } catch (e) {
+                    if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        return;
+                    console.warn(`NotchNux: weather request failed: ${e.message}`);
+                }
+                done(json);
+            });
     }
 
     _geocodeLocation(query, done) {
@@ -122,145 +190,101 @@ export class WeatherHelper {
             }
         }
 
-        let url = 'https://nominatim.openstreetmap.org/search' +
-            `?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`;
-        let msg = Soup.Message.new('GET', url);
-        msg.request_headers.append('User-Agent', 'NotchNux GNOME Shell Extension');
-
-        this._session.send_and_read_async(
-            msg,
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (session, res) => {
-                try {
-                    let bytes = session.send_and_read_finish(res);
-                    let status = msg.get_status();
-                    if (status !== Soup.Status.OK)
-                        throw new Error(`HTTP ${status}`);
-
-                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
-                    let json = JSON.parse(text);
-                    let first = Array.isArray(json) ? json[0] : null;
-                    if (!first)
-                        throw new Error(`missing geocode result: ${text.slice(0, 160)}`);
-
-                    done({
-                        lat: Number(first.lat),
-                        lon: Number(first.lon),
-                        city: first.display_name || query
-                    });
-                } catch (e) {
-                    console.error('NotchNux: Manual geocoding failed.', e);
-                    done(null);
-                }
+        this._getJson('https://nominatim.openstreetmap.org/search' +
+            `?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`, json => {
+            let first = Array.isArray(json) ? json[0] : null;
+            let lat = Number(first?.lat), lon = Number(first?.lon);
+            if (!first || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+                done(null);
+                return;
             }
-        );
+            done({ lat, lon, city: first.name || first.display_name || query });
+        });
     }
 
+    // Ask GeoClue for a city-level fix, fully asynchronously. The old code
+    // used GetClientSync + synchronous proxies on the system bus; GeoClue is
+    // D-Bus activated, so that blocked the compositor until it started.
     _fetchGeoClueLocation(done) {
-        try {
-            const ManagerIface =
-                '<node><interface name="org.freedesktop.GeoClue2.Manager">' +
-                '<method name="GetClient"><arg name="client" type="o" direction="out"/></method>' +
-                '</interface></node>';
-            const ClientIface =
-                '<node><interface name="org.freedesktop.GeoClue2.Client">' +
-                '<property name="DesktopId" type="s" access="readwrite"/>' +
-                '<property name="RequestedAccuracyLevel" type="u" access="readwrite"/>' +
-                '<method name="Start"/>' +
-                '<method name="Stop"/>' +
-                '<signal name="LocationUpdated">' +
-                '<arg name="old" type="o"/><arg name="new" type="o"/>' +
-                '</signal></interface></node>';
-            const LocationIface =
-                '<node><interface name="org.freedesktop.GeoClue2.Location">' +
-                '<property name="Latitude" type="d" access="read"/>' +
-                '<property name="Longitude" type="d" access="read"/>' +
-                '<property name="Description" type="s" access="read"/>' +
-                '</interface></node>';
+        this._endGeoClue();
+        let bus = Gio.DBus.system;
+        let geo = { done, clientPath: null, signalId: 0, timeoutId: 0, settled: false };
+        this._geo = geo;
 
-            const ManagerProxy = Gio.DBusProxy.makeProxyWrapper(ManagerIface);
-            const ClientProxy = Gio.DBusProxy.makeProxyWrapper(ClientIface);
-            const LocationProxy = Gio.DBusProxy.makeProxyWrapper(LocationIface);
-
-            let manager = ManagerProxy(
-                Gio.DBus.system,
-                'org.freedesktop.GeoClue2',
-                '/org/freedesktop/GeoClue2/Manager');
-            let [clientPath] = manager.GetClientSync();
-            let client = ClientProxy(
-                Gio.DBus.system,
-                'org.freedesktop.GeoClue2',
-                clientPath);
-
-            client.DesktopId = 'notchnux';
-            client.RequestedAccuracyLevel = 4; // Exact, if permission allows it.
-
-            let timeoutId = 0;
-            let signalId = 0;
-            let settled = false;
-            let finish = (loc) => {
-                if (settled) return;
-                settled = true;
-                if (timeoutId) {
-                    GLib.Source.remove(timeoutId);
-                    timeoutId = 0;
-                }
+        let call = (path, iface, method, params, cb) => bus.call(GEOCLUE, path, iface, method,
+            params, null, Gio.DBusCallFlags.NONE, 5000, this._cancellable, (c, res) => {
                 try {
-                    if (signalId) client.disconnectSignal(signalId);
-                    client.StopRemote(() => {});
+                    cb(c.call_finish(res));
                 } catch (e) {
-                    // Ignore cleanup failures.
-                }
-                done(loc);
-            };
-
-            signalId = client.connectSignal('LocationUpdated', (proxy, sender, [oldPath, newPath]) => {
-                try {
-                    let location = LocationProxy(
-                        Gio.DBus.system,
-                        'org.freedesktop.GeoClue2',
-                        newPath);
-                    let lat = Number(location.Latitude);
-                    let lon = Number(location.Longitude);
-                    if (!Number.isFinite(lat) || !Number.isFinite(lon))
-                        throw new Error('GeoClue returned invalid coordinates');
-
-                    finish({
-                        lat,
-                        lon,
-                        city: location.Description || null
-                    });
-                } catch (e) {
-                    console.error('NotchNux: GeoClue location update failed.', e);
-                    finish(null);
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.warn(`NotchNux: GeoClue ${method} failed: ${e.message}`);
+                    this._finishGeoClue(geo, null);
                 }
             });
+        let setProp = (name, value, cb) => call(geo.clientPath, 'org.freedesktop.DBus.Properties',
+            'Set', new GLib.Variant('(ssv)', [`${GEOCLUE}.Client`, name, value]), cb);
 
-            timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
-                console.log('NotchNux: GeoClue location timed out.');
-                timeoutId = 0;
-                finish(null);
-                return GLib.SOURCE_REMOVE;
-            });
-            client.StartRemote((result, error) => {
-                if (error) {
-                    console.error('NotchNux: GeoClue start failed.', error);
-                    finish(null);
-                }
-            });
-        } catch (e) {
-            console.error('NotchNux: GeoClue location failed.', e);
-            done(null);
+        geo.timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, GEOCLUE_TIMEOUT_S, () => {
+            geo.timeoutId = 0;
+            this._finishGeoClue(geo, null);
+            return GLib.SOURCE_REMOVE;
+        });
+
+        call('/org/freedesktop/GeoClue2/Manager', `${GEOCLUE}.Manager`, 'GetClient', null, reply => {
+            if (geo.settled) return;
+            [geo.clientPath] = reply.deepUnpack();
+            geo.signalId = bus.signal_subscribe(GEOCLUE, `${GEOCLUE}.Client`, 'LocationUpdated',
+                geo.clientPath, null, Gio.DBusSignalFlags.NONE,
+                (c, sender, path, iface, signal, params) => {
+                    let [, newPath] = params.deepUnpack();
+                    call(newPath, 'org.freedesktop.DBus.Properties', 'GetAll',
+                        new GLib.Variant('(s)', [`${GEOCLUE}.Location`]), r => {
+                            let [props] = r.recursiveUnpack();
+                            let lat = Number(props.Latitude), lon = Number(props.Longitude);
+                            this._finishGeoClue(geo, Number.isFinite(lat) && Number.isFinite(lon)
+                                ? { lat, lon, city: props.Description || null } : null);
+                        });
+                });
+            setProp('DesktopId', new GLib.Variant('s', 'notchnux'), () =>
+                setProp('RequestedAccuracyLevel', new GLib.Variant('u', ACCURACY_CITY), () =>
+                    call(geo.clientPath, `${GEOCLUE}.Client`, 'Start', null, () => {})));
+        });
+    }
+
+    _finishGeoClue(geo, loc) {
+        if (geo.settled) return;
+        geo.settled = true;
+        if (this._geo === geo)
+            this._endGeoClue();
+        geo.done(loc);
+    }
+
+    // Release the GeoClue client: stop it, drop the signal and the timeout.
+    _endGeoClue() {
+        let geo = this._geo;
+        this._geo = null;
+        if (!geo) return;
+        geo.settled = true;
+        if (geo.timeoutId) GLib.Source.remove(geo.timeoutId);
+        if (geo.signalId) Gio.DBus.system.signal_unsubscribe(geo.signalId);
+        if (geo.clientPath) {
+            Gio.DBus.system.call(GEOCLUE, geo.clientPath, `${GEOCLUE}.Client`, 'Stop',
+                null, null, Gio.DBusCallFlags.NONE, 2000, null, (c, res) => {
+                    try { c.call_finish(res); } catch (e) {}
+                });
         }
     }
 
     _setLocationUnavailable() {
+        // Keep showing a cached forecast if we have one; only blank the card
+        // when there's genuinely nothing to show.
+        if (this.weatherData.loaded)
+            return;
         this.weatherData = {
             ...this.weatherData,
             condition: 'Location unavailable',
             city: 'Enable location',
-            loaded: false
+            loaded: false,
         };
         this._notify();
     }
@@ -270,118 +294,82 @@ export class WeatherHelper {
             done(loc.city);
             return;
         }
-
-        let url = 'https://nominatim.openstreetmap.org/reverse' +
-            `?format=jsonv2&lat=${loc.lat}&lon=${loc.lon}&zoom=12&addressdetails=1`;
-        let msg = Soup.Message.new('GET', url);
-        msg.request_headers.append('User-Agent', 'NotchNux GNOME Shell Extension');
-
-        this._session.send_and_read_async(
-            msg,
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (session, res) => {
-                try {
-                    let bytes = session.send_and_read_finish(res);
-                    let status = msg.get_status();
-                    if (status !== Soup.Status.OK)
-                        throw new Error(`HTTP ${status}`);
-
-                    let text = new TextDecoder('utf-8').decode(bytes.get_data());
-                    let json = JSON.parse(text);
-                    let address = json.address || {};
-                    let primary = address.city || address.town || address.village ||
-                        address.municipality || address.suburb || address.county ||
-                        json.name || json.display_name;
-                    let region = address.state || address.country;
-                    if (!primary)
-                        throw new Error(`missing place name: ${text.slice(0, 160)}`);
-
-                    let city = primary;
-                    if (region && region !== primary)
-                        city = `${primary}, ${region}`;
-                    console.log(`NotchNux: Location resolved ${city} (${loc.lat}, ${loc.lon}).`);
-                    done(city);
-                    return;
-                } catch (e) {
-                    console.error('NotchNux: Reverse geocoding failed.', e);
-                    done(`${loc.lat.toFixed(2)}, ${loc.lon.toFixed(2)}`);
-                }
+        // Reverse-geocode once per ~1 km cell; the answer is cached in settings
+        // so routine refreshes don't hit Nominatim at all.
+        let cell = `${loc.lat.toFixed(2)},${loc.lon.toFixed(2)}`;
+        if (this._settings.placeCache?.cell === cell) {
+            done(this._settings.placeCache.name);
+            return;
+        }
+        this._getJson('https://nominatim.openstreetmap.org/reverse' +
+            `?format=jsonv2&lat=${loc.lat}&lon=${loc.lon}&zoom=10&addressdetails=1`, json => {
+            let address = json?.address || {};
+            let primary = address.city || address.town || address.village ||
+                address.municipality || address.suburb || address.county || json?.name;
+            if (!primary) {
+                done(`${loc.lat.toFixed(2)}, ${loc.lon.toFixed(2)}`);
+                return;
             }
-        );
+            let region = address.state || address.country;
+            let name = region && region !== primary ? `${primary}, ${region}` : primary;
+            this._settings.placeCache = { cell, name };
+            this._saveSettings();
+            done(name);
+        });
     }
 
     _fetchWeather(lat, lon, city) {
-        // Pull current conditions, hourly temp/weathercode for the forecast
-        // strip, and today's high/low + sunrise/sunset. `timezone=auto` makes
-        // the hourly timestamps line up with the user's local clock.
-        let weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-            `&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m` +
-            `&hourly=temperature_2m,weather_code` +
-            `&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset` +
-            `&forecast_days=1&timezone=auto`;
-        let weatherMsg = Soup.Message.new('GET', weatherUrl);
-
-        this._session.send_and_read_async(
-            weatherMsg,
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (session, weatherRes) => {
-                try {
-                    let weatherBytes = session.send_and_read_finish(weatherRes);
-                    let status = weatherMsg.get_status();
-                    if (status !== Soup.Status.OK)
-                        throw new Error(`HTTP ${status}`);
-
-                    let weatherText = new TextDecoder('utf-8').decode(weatherBytes.get_data());
-                    let weatherJson = JSON.parse(weatherText);
-
-                    let current = weatherJson.current;
-                    if (!current)
-                        throw new Error(`missing current weather: ${weatherText.slice(0, 160)}`);
-
-                    let cond = this._getWeatherCondition(current.weather_code);
-                    let daily = weatherJson.daily || {};
-                    this.weatherData = {
-                        temp: `${Math.round(current.temperature_2m)}°`,
-                        tempValue: Math.round(current.temperature_2m),
-                        condition: cond.text,
-                        icon: cond.icon,
-                        city: city,
-                        wind: `${Math.round(current.wind_speed_10m)} km/h`,
-                        humidity: `${Math.round(current.relative_humidity_2m)}%`,
-                        high: daily.temperature_2m_max ? `${Math.round(daily.temperature_2m_max[0])}°` : '--°',
-                        low: daily.temperature_2m_min ? `${Math.round(daily.temperature_2m_min[0])}°` : '--°',
-                        sunrise: this._fmtTime(daily.sunrise && daily.sunrise[0]),
-                        sunset: this._fmtTime(daily.sunset && daily.sunset[0]),
-                        hourly: this._buildHourly(weatherJson.hourly),
-                        manualLocation: this._settings.locationQuery || '',
-                        loaded: true
-                    };
-                    console.log(`NotchNux: Weather updated for ${city}: ${this.weatherData.temp}, ${this.weatherData.condition}.`);
-                } catch (e) {
-                    console.error('NotchNux: Weather forecast request failed.', e);
-                    this.weatherData = {
-                        ...this.weatherData,
-                        condition: 'Weather offline',
-                        loaded: false
-                    };
-                }
-
+        // Current conditions, hourly temp/weathercode for the forecast strip, and
+        // today's high/low + sunrise/sunset. Two days so the 6-hour strip is
+        // full in the evening; `timezone=auto` lines hourly up with local time.
+        let url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+            '&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m' +
+            '&hourly=temperature_2m,weather_code' +
+            '&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset' +
+            '&forecast_days=2&timezone=auto';
+        this._getJson(url, json => {
+            let current = json?.current;
+            if (!current) {
+                // Offline: keep the last forecast visible but mark it stale.
+                this.weatherData = { ...this.weatherData, stale: true };
+                if (!this.weatherData.loaded)
+                    this.weatherData.condition = 'Weather offline';
                 this._notify();
+                return;
             }
-        );
+            let cond = this._getWeatherCondition(current.weather_code);
+            let daily = json.daily || {};
+            this.weatherData = {
+                temp: `${Math.round(current.temperature_2m)}°`,
+                tempValue: Math.round(current.temperature_2m),
+                condition: cond.text,
+                icon: cond.icon,
+                city,
+                wind: `${Math.round(current.wind_speed_10m)} km/h`,
+                humidity: `${Math.round(current.relative_humidity_2m)}%`,
+                high: daily.temperature_2m_max ? `${Math.round(daily.temperature_2m_max[0])}°` : '--°',
+                low: daily.temperature_2m_min ? `${Math.round(daily.temperature_2m_min[0])}°` : '--°',
+                sunrise: this._fmtTime(daily.sunrise && daily.sunrise[0]),
+                sunset: this._fmtTime(daily.sunset && daily.sunset[0]),
+                hourly: this._buildHourly(json.hourly),
+                manualLocation: this._settings.locationQuery || '',
+                loaded: true,
+                stale: false,
+            };
+            this._settings.lastWeather = { at: Math.floor(Date.now() / 1000), data: this.weatherData };
+            this._saveSettings();
+            this._notify();
+        });
     }
 
-    // "2026-07-15T05:42" -> "5:42". open-meteo returns local ISO strings when
-    // timezone=auto, so slice the clock portion rather than constructing a Date
-    // (which would re-apply the runner's timezone).
+    // "2026-07-15T18:10" -> "6:10 PM" (or "18:10", per locale). open-meteo
+    // returns the location's local wall-clock time with timezone=auto, so build
+    // the Date from those fields as-is rather than re-applying a zone.
     _fmtTime(iso) {
-        if (!iso || typeof iso !== 'string') return '--:--';
-        let t = iso.split('T')[1];
-        if (!t) return '--:--';
-        let [h, m] = t.split(':');
-        return `${parseInt(h, 10)}:${m}`;
+        let m = typeof iso === 'string' && iso.match(/^(\d+)-(\d+)-(\d+)T(\d+):(\d+)/);
+        if (!m) return '--:--';
+        let d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+        return this._timeFmt.format(d);
     }
 
     // Build the 6-slot forecast strip starting at the current hour. The hourly
@@ -389,8 +377,8 @@ export class WeatherHelper {
     _buildHourly(hourly) {
         if (!hourly || !hourly.time) return [];
         let now = new Date();
-        // Find the first hourly slot at or after the current hour.
-        let startIdx = hourly.time.findIndex(t => new Date(t) >= new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours()));
+        let hourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+        let startIdx = hourly.time.findIndex(t => new Date(t) >= hourStart);
         if (startIdx < 0) startIdx = 0;
         let out = [];
         for (let i = startIdx; i < hourly.time.length && out.length < 6; i++) {
@@ -406,27 +394,26 @@ export class WeatherHelper {
 
     _getWeatherCondition(code) {
         // WMO Weather interpretation codes (https://open-meteo.com/en/docs)
-        if (code === 0) {
+        if (code === 0)
             return { text: 'Clear Sky', icon: 'weather-clear-symbolic' };
-        } else if (code >= 1 && code <= 3) {
+        if (code >= 1 && code <= 3)
             return { text: 'Partly Cloudy', icon: 'weather-few-clouds-symbolic' };
-        } else if (code === 45 || code === 48) {
+        if (code === 45 || code === 48)
             return { text: 'Foggy', icon: 'weather-fog-symbolic' };
-        } else if (code >= 51 && code <= 55) {
+        if (code >= 51 && code <= 57)
             return { text: 'Light Drizzle', icon: 'weather-showers-scattered-symbolic' };
-        } else if (code >= 61 && code <= 65) {
+        if (code >= 61 && code <= 67)
             return { text: 'Rainy', icon: 'weather-showers-symbolic' };
-        } else if (code >= 71 && code <= 75) {
+        if (code >= 71 && code <= 75)
             return { text: 'Snowy', icon: 'weather-snow-symbolic' };
-        } else if (code === 77) {
+        if (code === 77)
             return { text: 'Snow Grains', icon: 'weather-snow-symbolic' };
-        } else if (code >= 80 && code <= 82) {
+        if (code >= 80 && code <= 82)
             return { text: 'Rain Showers', icon: 'weather-showers-symbolic' };
-        } else if (code === 85 || code === 86) {
+        if (code === 85 || code === 86)
             return { text: 'Snow Showers', icon: 'weather-snow-symbolic' };
-        } else if (code >= 95 && code <= 99) {
+        if (code >= 95 && code <= 99)
             return { text: 'Thunderstorm', icon: 'weather-storm-symbolic' };
-        }
         return { text: 'Cloudy', icon: 'weather-overcast-symbolic' };
     }
 }

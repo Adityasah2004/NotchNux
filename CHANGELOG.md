@@ -7,6 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — drag & drop onto the Shelf
+- Drag a file from Files, the desktop or any app toward the notch: it opens on
+  the Shelf, the drop zone lights up ("Release to add") and dropping copies the
+  file in. Wayland only hands drag data to app windows, so a tiny invisible
+  helper window (`src/tools/drop-catcher.js`) sits under the open dashboard for
+  the length of the drag; it is hidden from the window list and exits after a
+  few idle minutes.
+
+### Fixed — GNOME 50 input
+- The Wi-Fi / Bluetooth sheets' close (X) button and rows did nothing: a
+  press handler returning `EVENT_STOP` cancelled St.Button's click gesture.
+- `ClutterEvent.get_source()` returns null on GNOME 50, so every "was this
+  click inside…" check failed silently (tapping a Wi-Fi row closed the sheet;
+  the pill's right-click and swipe area tests). Now uses
+  `global.stage.get_event_actor()`.
+
+### Added — island behaviour (inspired by Dynamic Ledge)
+- **Alerts in the notch.** Volume, brightness and other GNOME level pop-ups,
+  charging, low battery (20 % / 10 %), headphones connecting and a heads-up
+  5 minutes before a calendar event grow out of the pill for a moment, one at a
+  time (same-kind alerts update in place; key-press feedback is never queued).
+- **Hide when idle** (off by default). The island tucks into the top edge while
+  nothing is live and comes back for music, timers, the mic/camera and alerts,
+  or when you rest the pointer at the top centre. Once revealed (or after the
+  dashboard closes) the pill stays up for 4 s of real idleness before tucking,
+  instead of vanishing the moment the pointer moves off it.
+- **Grid launcher.** The header now holds Home plus up to five shortcuts; every
+  tab and toggle lives behind the new grid button. Hold a tile (or press Edit)
+  to choose the shortcuts.
+- **Clipboard** tab: the last 20 text clips, with search and pinning. Passwords
+  are skipped, and only pinned clips are saved to disk.
+- **Lyrics in the Music tab.** The new lyrics button in the transport swaps the
+  vinyl and volume dial for a cover tile and timed lyrics from lrclib.net that
+  scroll with the song (Apple Music's layout). The button only appears for
+  songs that have lyrics; a song without them falls back to the player and the
+  next one with lyrics opens straight into them. Lookups happen while the Music
+  tab is open, can be turned off, and are cached (one request per song).
+- **Stopwatch** in the Focus tab, with laps, shown live in the pill.
+- **Keep Awake** (blocks idle and suspend), **Stats in the pill** (memory and
+  CPU), two-finger **swipe** to skip tracks or pull the notch open, and a
+  **right-click** quick menu on the pill.
+
+### Changed
+- **Tray rebuilt as a Control Center.** A Connectivity card (Wi-Fi, Bluetooth,
+  Hotspot, Airplane Mode as round toggles; Wi-Fi and Bluetooth open their
+  network/device sheets), Silence / Night Light / Screenshot / Lock tiles, thick
+  drag-and-scroll Volume and Brightness sliders (click the speaker to mute), a
+  Devices card and a compact System card (CPU, memory, disk, network) instead of
+  seven ring gauges. Everything updates in place; meters move by transform.
+- **Springs keep their momentum.** Interrupting the open/close (hovering out
+  mid-open) now turns around smoothly instead of stopping dead, and a slow
+  first frame no longer makes the notch jump a quarter of the way open.
+- Wi-Fi and Bluetooth sheets now drop out of the header and fade away when
+  dismissed, and only rebuild their rows when the list actually changes.
+- Pitch-black island, system colours for status, and an island-style content
+  swap (fade + slight scale from the top edge) between tabs and alerts.
+- **New island look** (inspired by Hitodama's island): solid near-black,
+  flush with the top edge and flared into it by concave shoulders, with no rim
+  and no drop shadow. The tab rail loses its track, the active tab is an
+  accent-tinted pill in the accent colour, and cards are flat, borderless tiles.
+- **Glass rebuilt.** The blur now runs over a clone of the wallpaper + windows
+  and is masked to the island's rounded shape by a small shader.
+
+### Fixed
+- Typing a Wi-Fi password was wiped every 3 seconds by the network list refresh.
+- Logging out spammed "already disposed" errors: the shell had already torn
+  down the message tray, panel and menus the notch tried to disconnect from.
+- Glass blur bled past the rounded bottom corners (a background blur always
+  paints a square).
+- Dark smears around the notch with glass on, which never showed up in
+  screenshots: a partial repaint made the blur sample the notch's own last
+  frame. Fixed at the source, so the *Artifact-free blur* option (a full-screen
+  redraw every frame) is gone.
+- Dashboard content hung below the box for a few frames while it opened or
+  closed; the island now clips to its own bounds.
+
+## [1.4.0] - 2026-10-23
+
+A redesign around your day, plus a full performance, stability and security
+pass. The audit behind it — every finding, with how it was verified — is in
+[AUDIT.md](AUDIT.md).
+
+### Added
+- **Home tab** (new default): greeting + weather, your next calendar event, top
+  tasks with quick-add, the focus timer and now-playing controls.
+- **Tasks tab**: add with Enter (`!` prefix stars a task), click to edit in
+  place, star, delete, tick off with an animated check; **Open / Done** views and
+  "Clear done". Stored in `~/.local/share/notchnux/tasks.json`.
+- **Focus tab**: 15 / 25 / 50-minute sessions with automatic 5 / 15-minute
+  breaks, optional **Do Not Disturb while focusing** (only ever undoes its own
+  change), today's sessions and minutes, and a completion banner with
+  *Start break*. Keeps running across screen locks.
+- **Notes tab**: an autosaving scratchpad.
+- **Live activity in the pill**: a running focus session shows its ring and
+  countdown in the pill (click to open Focus); music yields to it.
+- **Weather**: the 6-hour forecast strip (it was always fetched, never shown);
+  the last forecast is kept and shown instantly after unlock/offline.
+- **Artifact-free blur** switch for the glass styles (opt-in; see Fixed).
+
+### Changed
+- **Tab rail**: icon tabs over one travelling accent indicator; the active tab's
+  label slides open. All twelve tabs fit — the old carousel hid half of them.
+  Settings and the session actions moved into one **⋯** menu.
+- **Motion**: the notch now blooms open on a spring with a hint of overshoot,
+  folds back without bounce, swells slightly on hover, and tabs cross-slide in
+  the direction you're moving. Buttons dip when pressed. All motion respects
+  GNOME's *reduce animations* setting.
+- Tabs are kept alive between visits and refreshed in place: switching back to a
+  tab or re-opening the notch no longer rebuilds it.
+- The quick-toggle formerly called *Focus* (do not disturb) is now *Silence*,
+  to avoid clashing with the focus timer.
+
+### Performance
+- Wallpaper rotate/enhance and thumbnails run in a separate worker process
+  instead of a per-pixel JS loop on the compositor thread (multi-second freezes).
+- Adding a file to the Shelf copies asynchronously (a large file used to freeze
+  the desktop for the whole copy).
+- Mic/camera detection streams from `pw-dump --monitor` and a V4L2 watcher
+  process instead of spawning and parsing ~230 KB of JSON in the shell every 6 s
+  (~100 ms of jank per poll); the indicator now reacts in ~0.2 s.
+- GeoClue, UPower, BlueZ, rfkill, logind and MPRIS start-up are fully async; the
+  Music tab updates in place (volume scrolling no longer rebuilds it); the Tray
+  rebuilds only the card that changed; the clock wakes once a minute; date
+  formatting uses cached formatters; the dashboard is pre-warmed after login.
+
+### Fixed
+- The Shelf was wiped on **every screen lock**, not once per login.
+- The notification peek **wedged GNOME's notification queue** after the first
+  suppressed banner — later banners (including critical ones) never showed.
+- The Studio **camera kept streaming after the notch collapsed**.
+- Text fields (Wi-Fi password) never received the keyboard.
+- MPRIS players were only detected by polling (`NameOwnerChanged` never fired).
+- Errors after unlock / shell shutdown from callbacks outliving the notch.
+- `needs an allocation` / `not in the stage` warnings on every open.
+- Accessory battery types were mis-labelled; Tray's top-bar row could overflow
+  the dashboard; blank preference group titles caused by unescaped `&`.
+
+### Security
+- No command lines are built from file or device names any more (Shelf
+  *Reveal* uses the FileManager1 D-Bus API; Studio pipelines are built from
+  GStreamer elements).
+- Album art from MPRIS players is size- and type-checked and streamed with a
+  hard cap; caches are pruned.
+- Config, tasks, notes and caches are private (`0600` files, `0700` folders);
+  the precise address is no longer written to the system journal.
+- Hotspot passwords come from the kernel CSPRNG (60 bits) and are shown in a
+  transient notification; critical notifications are never swallowed; the
+  shell and preferences no longer overwrite each other's settings.
+
+
 ### Added
 - **Tray tab networking overhaul — device/network lists, radio toggles, and
   in-notch scanning**:

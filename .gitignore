@@ -9,3 +9,6 @@
 # Build / packaging output
 *.zip
 dist/
+
+# MCP browser tool logs
+.playwright-mcp/

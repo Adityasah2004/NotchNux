@@ -4,7 +4,7 @@
 
 ### A dynamic, macOS-style **Notch** and dashboard for GNOME Shell
 
-A pill that lives at the top of your screen, morphs to show what you're doing, and expands into a full glassy dashboard for music, weather, your webcam, calendar, notifications and a file shelf.
+A pill that lives at the top of your screen, morphs to show what you're doing, and springs open into a dashboard for your day: tasks, a focus timer, notes, music, calendar, weather, notifications, system controls and a file shelf.
 
 ![NotchNux collapsed pill](assets/pill-collapsed.png)
 
@@ -18,7 +18,7 @@ A pill that lives at the top of your screen, morphs to show what you're doing, a
 
 ## ✨ What is it?
 
-NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a glance it shows the date, time, battery and privacy (mic/camera) indicators. While music plays, the track title scrolls across it. When a notification arrives, the pill **morphs into a banner** with action buttons. Click it and it opens into a **tabbed dashboard** — a little control center that follows your accent color.
+NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a glance it shows the date, time, battery and privacy (mic/camera) indicators. It hosts one **live activity** at a time — a running focus timer, or the track that's playing. When a notification arrives, the pill **morphs into a banner** with action buttons. Hover or click and it **springs open** into a dashboard that starts on **Home**: what's next today, your tasks, the focus timer and now-playing, all in one glance.
 
 
 
@@ -26,24 +26,48 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 
 | | Feature | What it does |
 |---|---|---|
-| 🎵 | **Music / MPRIS** | Full player with album art, a spinning vinyl, scrubber, shuffle/repeat, and a volume dial — works with any MPRIS player (Spotify, browsers, etc.). |
+| 🏠 | **Home** | A glanceable start page: greeting and weather, your next calendar event, your top tasks with a quick-add field, the focus timer and now-playing controls. |
+| ✅ | **Tasks** | A fast to-do list right under the notch. Type and press Enter to add (start with `!` to star it), click to edit, check off with a satisfying tick, review what you finished in **Done**. |
+| ⏱️ | **Focus** | A Pomodoro-style timer (15 / 25 / 50 min) with automatic short and long breaks. While it runs, the countdown lives in the pill, **Do Not Disturb** turns on (optional), and you get a banner with *Start break* when time's up. Survives screen locks. |
+| 📝 | **Notes** | A scratchpad that autosaves as you type. |
+| 🎵 | **Music / MPRIS** | Full player with album art, a spinning vinyl, scrubber, shuffle/repeat, and a volume dial — plus a lyrics view with timed lyrics from lrclib.net that follow the song. Works with any MPRIS player (Spotify, browsers, etc.). |
 | 🌤️ | **Weather** | Current conditions, an analog clock, humidity, wind, sunrise/sunset and hourly forecast. Auto-locates or set a manual location. |
 | 📷 | **Studio** | Live webcam preview (GStreamer) plus video and audio-only recording, with camera/mic device selection. |
 | 📅 | **Calendar** | A scrollable day strip with your events pulled from GNOME Online Accounts — scroll the dates to jump between days. |
 | 🔔 | **Alerts** | Notification history, and a **peek** mode where the pill expands into a banner with action buttons the moment a notification arrives. |
 | 🗂️ | **Shelf** | A click-to-browse / paste-a-file scratch space, plus **Quick Share** to send files to your phone and other paired [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) devices. |
-| 🖥️ | **Tray / System** | Live CPU, memory, swap, disk and network throughput; connected-device battery levels; and quick toggles for sound, screenshot, airplane mode, focus and screen lock. |
+| 🖥️ | **Tray / System** | A Control Center: Wi-Fi, Bluetooth, hotspot and airplane toggles with in-notch network and device pickers; Silence, Night Light, screenshot and lock tiles; volume and brightness sliders; device batteries; and live CPU, memory, disk and network. |
+| 🏝️ | **Island alerts** | Volume, brightness, charging, low battery, headphones and a 5-minute event heads-up grow out of the pill for a moment, one at a time. |
+| 🫥 | **Hide when idle** | Optional: the notch tucks into the top edge until something is live, or you rest the pointer at the top centre. |
+| 🔲 | **Grid launcher** | Home plus up to five shortcuts in the header; everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
+| 📋 | **Clipboard** | The last 20 text clips with search and pins. Passwords are skipped; only pinned clips are saved. |
+| ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
 | 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |
 
 ### Collapsed pill indicators
 - 📆 Date & time (pill sizes to its content so the clock never truncates)
 - 🔋 Battery percentage & charging state
-- 🎤/📷 Privacy dots when the mic or camera is in use
+- 🎤/📷 Privacy dots the moment the mic or camera is in use
+- ⏱️ Focus countdown while a session runs — click it to jump to the Focus tab
 - 🎶 Scrolling now-playing title while media is active
+
+![Focus timer live in the pill](assets/pill-focus.png)
 
 ## 🖼️ Screenshots
 
 <div align="center">
+
+**Home** — your day at a glance
+![Home](assets/home.png)
+
+**Tasks** — quick add, star, edit in place, tick off
+![Tasks](assets/tasks.png)
+
+**Focus** — Pomodoro timer with breaks, do-not-disturb and today's stats
+![Focus](assets/focus.png)
+
+**Notes** — an autosaving scratchpad
+![Notes](assets/notes.png)
 
 **Music** — vinyl art, scrubber, shuffle/repeat and a volume dial
 ![Music dashboard](assets/music.png)
@@ -51,7 +75,7 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 **Weather** — analog clock, current conditions and details
 ![Weather dashboard](assets/weather.png)
 
-**Tray / System** — live CPU · RAM · swap · disk · network meters, device battery levels, and quick toggles
+**Tray / System** — connectivity, quick tiles, volume and brightness sliders, device batteries and live system meters
 ![Tray dashboard](assets/tray.png)
 
 **Calendar** — a scrollable day strip with your GNOME Online Accounts events
@@ -108,16 +132,20 @@ gnome-extensions enable notchnux@adityasah.programs
 ```
 
 ### Try it without reloading your session
-Run it in a nested GNOME session so nothing touches your real desktop:
+Run it in a separate GNOME Shell window so nothing touches your real desktop:
 ```bash
+# GNOME 49 and newer
+dbus-run-session -- gnome-shell --devkit --wayland
+# GNOME 48 and older
 dbus-run-session -- gnome-shell --nested --wayland
 ```
 
 ## 🕹️ Usage
 
-- **Click the pill** to open the dashboard; click outside (or the pill) to collapse it.
-- **Switch tabs** with the carousel at the top of the dashboard.
-- **Open preferences** (⚙️ in the dashboard, or `gnome-extensions prefs notchnux@adityasah.programs`) to change the accent color, reorder or hide tabs, and toggle features. Changes apply to the live notch instantly — no shell reload needed.
+- **Hover or click the pill** to open the dashboard; click outside to collapse it.
+- **Switch tabs** with the icon rail at the top (or scroll over it). Each tab keeps its place, so switching back is instant.
+- **Type right in the notch** — the Tasks and Notes fields take the keyboard while focused; `Esc` hands it back.
+- **Open preferences** (⋯ → *NotchNux Settings…* in the dashboard, or `gnome-extensions prefs notchnux@adityasah.programs`) to change the accent color, reorder or hide tabs, and toggle features. Changes apply to the live notch instantly — no shell reload needed.
 
 Configuration is stored as plain JSON under `~/.config/notchnux/config.json` — no GSettings schema required. The preferences window and the running notch share this file, so edits made in either place take effect immediately.
 
@@ -126,8 +154,14 @@ Configuration is stored as plain JSON under `~/.config/notchnux/config.json` —
 | Path | Contents |
 |---|---|
 | `~/.config/notchnux/config.json` | Accent color, tab order & visibility, feature toggles |
-| `~/.config/notchnux/settings.json` | Manual weather location |
-| `~/.local/share/notchnux/shelf/` | Files added to the Shelf |
+| `~/.config/notchnux/settings.json` | Weather location and the last forecast |
+| `~/.local/share/notchnux/tasks.json` | Your tasks |
+| `~/.local/share/notchnux/notes.md` | Your notes |
+| `~/.local/share/notchnux/focus.json` | Focus timer state and today's stats |
+| `~/.local/share/notchnux/shelf/` | Files added to the Shelf (cleared once per login) |
+| `~/.cache/notchnux/` | Album art, wallpaper thumbnails and processed wallpapers (pruned automatically) |
+
+Everything is stored locally, readable only by you (`0600` files in `0700` folders). Nothing is uploaded; the only network requests are the weather forecast (Open-Meteo), place-name lookups (OpenStreetMap Nominatim) and album art from your music player.
 
 > **Quick Share** sends files through the [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) extension. Install and pair a device in GSConnect to send files to your phone from the Shelf. Pasting a copied file into the Shelf uses `wl-clipboard` (`wl-paste`) on Wayland.
 

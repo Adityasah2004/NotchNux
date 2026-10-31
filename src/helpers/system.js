@@ -24,9 +24,33 @@ export class SystemHelper {
         this._netRxRate = 0; // bytes/sec down
         this._netTxRate = 0; // bytes/sec up
 
-        // Initialize UPower Client
+        // One cancellable for every async call/subprocess we start, so
+        // destroy() can stop all of them at once.
+        this._cancellable = new Gio.Cancellable();
+        this._timeouts = new Set();
+
+        // UPower client, created asynchronously (the sync constructor blocks on
+        // the system bus on every enable, i.e. every unlock). `onPowerReady`
+        // fires once it's up. The display device and accessory list are cached:
+        // libupower's getters make synchronous D-Bus calls of their own.
+        this._upowerClient = null;
+        this._displayDevice = null;
+        this._upowerAccessories = [];
+        this.onPowerReady = null;
         try {
-            this._upowerClient = UPower.Client.new_full(null);
+            UPower.Client.new_async(this._cancellable, (o, res) => {
+                try {
+                    this._upowerClient = UPower.Client.new_finish(res);
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        console.error('NotchNux: Failed to initialize UPower Client', e);
+                    return;
+                }
+                // One-time lookup, cached: the display device's properties
+                // update live, so the clock tick never re-queries it.
+                this._displayDevice = this._upowerClient.get_display_device();
+                this.onPowerReady?.();
+            });
         } catch (e) {
             console.error('NotchNux: Failed to initialize UPower Client', e);
         }
@@ -37,18 +61,20 @@ export class SystemHelper {
         // whenever WiFi state changes, so a Tray tab open before NM was up still
         // gets a populated WiFi row as soon as it becomes available.
         this._nmClient = null;
+        this._nmSignalIds = [];
         this.onWifiChanged = null;
         try {
-            NM.Client.new_async(null, (obj, res) => {
+            NM.Client.new_async(this._cancellable, (obj, res) => {
                 try {
                     this._nmClient = NM.Client.new_finish(res);
                     // NM.Client has no custom signals in this version — watch the
                     // relevant properties instead. wireless-enabled covers the
                     // radio toggle; active-connections covers connect/disconnect
                     // and hotspot activation; state is a catch-all.
-                    this._nmClient.connect('notify::wireless-enabled', () => this._emitWifiChanged());
-                    this._nmClient.connect('notify::active-connections', () => this._emitWifiChanged());
-                    this._nmClient.connect('notify::state', () => this._emitWifiChanged());
+                    for (let prop of ['wireless-enabled', 'active-connections', 'state']) {
+                        this._nmSignalIds.push(this._nmClient.connect(`notify::${prop}`,
+                            () => this._emitWifiChanged()));
+                    }
                     this._emitWifiChanged();
                 } catch (e) {
                     console.warn('NotchNux: NetworkManager unavailable', e.message);
@@ -73,12 +99,15 @@ export class SystemHelper {
         this.isMuted = false;
         this.onVolumeChanged = null;
         this.onMicChanged = null;
+        // Fires when the audio output switches to another device or port
+        // (not for the first one found at start-up).
+        this.onOutputChanged = null;
+        this._outputKey = null;
 
         // Mic/camera "in use" state, refreshed from PipeWire on the poll below.
         this._micInUse = false;
         this._camInUse = false;
         this.onPrivacyChanged = null;
-        this._pwCancellable = null;
 
         try {
             this._initVolumeControl();
@@ -86,30 +115,187 @@ export class SystemHelper {
             console.error('NotchNux: Failed to initialize Gvc volume control', e);
         }
 
-        // Start background CPU + network + privacy polling (every 2.5 seconds)
+        // System throughput/CPU polling is started on demand when the System tab is open
+        this._sysPollingTimeout = null;
+
+        // Privacy monitors start via setPrivacyPolling() — only while the
+        // pill's mic/camera dots are enabled.
+        this._privacyOn = false;
+        this._pwNodes = new Map();      // PipeWire node id -> { mediaClass, state }
+        this._camV4l2 = false;
+        this._privacyProcs = {};        // name -> { proc, cancellable, restartId, restarts }
+    }
+
+    // Watch for mic/camera use while the privacy indicators are on. Both
+    // sources are long-lived processes that *push* changes: polling spawned
+    // pw-dump + fuser from the compositor every 6 s and parsed ~230 KB of JSON
+    // each time (~100 ms of main-thread work per poll).
+    setPrivacyPolling(enabled) {
+        if (enabled === this._privacyOn)
+            return;
+        this._privacyOn = enabled;
+        if (enabled) {
+            this._startPrivacyProc('pw', ['pw-dump', '--monitor', '--no-colors'],
+                chunk => this._applyPipewireChunk(chunk), '\n]\n');
+            let script = Gio.File.new_for_uri(import.meta.url).get_parent().get_parent()
+                .get_child('tools').get_child('v4l2-watch.sh').get_path();
+            this._startPrivacyProc('v4l2', ['sh', script], line => {
+                this._camV4l2 = line.trim() === '1';
+                this._recomputePrivacy();
+            }, '\n');
+        } else {
+            for (let name of Object.keys(this._privacyProcs))
+                this._stopPrivacyProc(name);
+            this._pwNodes.clear();
+            this._camV4l2 = false;
+            this._commitPrivacyState(false, false);
+        }
+    }
+
+    // Spawn `argv`, read its stdout asynchronously and hand every complete
+    // record (text up to `sep`) to `onRecord`. Restarts with backoff if the
+    // process dies (e.g. PipeWire restarted), a few times at most.
+    _startPrivacyProc(name, argv, onRecord, sep) {
+        this._stopPrivacyProc(name);
+        let entry = { proc: null, cancellable: new Gio.Cancellable(), restartId: 0,
+            restarts: this._privacyProcs[name]?.restarts ?? 0 };
+        this._privacyProcs[name] = entry;
+        try {
+            entry.proc = Gio.Subprocess.new(argv,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+        } catch (e) {
+            // Tool not installed: that source simply never reports "in use".
+            return;
+        }
+        let stream = entry.proc.get_stdout_pipe();
+        let decoder = new TextDecoder();
+        let sepBytes = new TextEncoder().encode(sep);
+        // Raw bytes until a full record arrives: GJS's TextDecoder has no
+        // streaming mode, and the separators are ASCII, so decoding whole
+        // records never splits a multi-byte character.
+        let buf = new Uint8Array(0);
+        let read = () => stream.read_bytes_async(65536, GLib.PRIORITY_LOW, entry.cancellable, (s, res) => {
+            let bytes;
+            try {
+                bytes = s.read_bytes_finish(res);
+            } catch (e) {
+                return; // cancelled
+            }
+            if (bytes.get_size() === 0) {
+                // EOF: the monitor died. Retry a few times, then give up.
+                if (this._privacyOn && entry.restarts < 5 && this._privacyProcs[name] === entry) {
+                    entry.restarts++;
+                    entry.restartId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 5 * entry.restarts, () => {
+                        entry.restartId = 0;
+                        if (this._privacyOn && this._privacyProcs[name] === entry)
+                            this._startPrivacyProc(name, argv, onRecord, sep);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+                return;
+            }
+            let chunk = bytes.toArray();
+            let merged = new Uint8Array(buf.length + chunk.length);
+            merged.set(buf);
+            merged.set(chunk, buf.length);
+            buf = merged;
+            let idx;
+            while ((idx = indexOfBytes(buf, sepBytes)) >= 0) {
+                let record = decoder.decode(buf.subarray(0, idx + sepBytes.length - 1));
+                buf = buf.slice(idx + sepBytes.length);
+                try {
+                    onRecord(record);
+                } catch (e) {
+                    console.warn(`NotchNux: privacy monitor ${name}: ${e.message}`);
+                }
+            }
+            read();
+        });
+        read();
+    }
+
+    _stopPrivacyProc(name) {
+        let entry = this._privacyProcs[name];
+        if (!entry) return;
+        delete this._privacyProcs[name];
+        entry.cancellable.cancel();
+        if (entry.restartId) GLib.Source.remove(entry.restartId);
+        entry.proc?.force_exit();
+    }
+
+    startSysPolling() {
+        if (this._sysPollingTimeout) return;
         this._updateCpuUsage();
         this._updateNetUsage();
-        this._updatePrivacyState();
-        this._cpuTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2500, () => {
+        this._sysPollingTimeout = GLib.timeout_add(GLib.PRIORITY_LOW, 2500, () => {
             this._updateCpuUsage();
             this._updateNetUsage();
-            this._updatePrivacyState();
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    destroy() {
-        if (this._cpuTimeout) {
-            GLib.Source.remove(this._cpuTimeout);
-            this._cpuTimeout = null;
+    stopSysPolling() {
+        if (this._sysPollingTimeout) {
+            GLib.Source.remove(this._sysPollingTimeout);
+            this._sysPollingTimeout = null;
         }
-        if (this._pwCancellable) {
-            this._pwCancellable.cancel();
-            this._pwCancellable = null;
+    }
+
+    // One-shot timer that destroy() can cancel.
+    _later(ms, fn) {
+        let id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            this._timeouts.delete(id);
+            fn();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._timeouts.add(id);
+    }
+
+    // The cached UPower display device (laptop battery aggregate), or null
+    // until the client is up.
+    get displayDevice() {
+        return this._displayDevice;
+    }
+
+    destroy() {
+        this.onWifiChanged = null;
+        this.onPowerReady = null;
+        this._displayDevice = null;
+        this.onVolumeChanged = null;
+        this.onMicChanged = null;
+        this.onPrivacyChanged = null;
+        this.onOutputChanged = null;
+        if (this._audioStream && this._portNotifyId) {
+            this._audioStream.disconnect(this._portNotifyId);
+            this._portNotifyId = 0;
+        }
+        this._cancellable.cancel();
+        for (let id of this._timeouts)
+            GLib.Source.remove(id);
+        this._timeouts.clear();
+        this.stopSysPolling();
+        this._privacyOn = false;
+        for (let name of Object.keys(this._privacyProcs))
+            this._stopPrivacyProc(name);
+        if (this._audioStream) {
+            if (this._volNotifyId) this._audioStream.disconnect(this._volNotifyId);
+            if (this._muteNotifyId) this._audioStream.disconnect(this._muteNotifyId);
+            this._audioStream = null;
+        }
+        if (this._micStream && this._micMuteNotifyId) {
+            this._micStream.disconnect(this._micMuteNotifyId);
+            this._micStream = null;
         }
         if (this._mixerControl) {
+            for (let id of this._mixerSignalIds ?? [])
+                this._mixerControl.disconnect(id);
             this._mixerControl.close();
             this._mixerControl = null;
+        }
+        if (this._nmClient) {
+            for (let id of this._nmSignalIds)
+                this._nmClient.disconnect(id);
+            this._nmSignalIds = [];
         }
         this._nmClient = null;
     }
@@ -220,53 +406,43 @@ export class SystemHelper {
         return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB/s`;
     }
 
-    // --- RAM Usage ---
-    getRamUsage() {
+    // --- RAM and Swap Usage ---
+    _readMeminfo() {
+        let now = GLib.get_monotonic_time();
+        if (this._meminfoCache && (now - (this._meminfoStamp || 0)) < 1500000) {
+            return this._meminfoCache;
+        }
+        let cache = { ram: 0, swap: 0 };
         try {
             let file = Gio.File.new_for_path('/proc/meminfo');
             let [success, contents] = file.load_contents(null);
-            if (!success) return 0;
+            if (!success) return cache;
 
             let lines = ByteArrayToString(contents).split('\n');
-            let memTotal = 0;
-            let memAvailable = 0;
-
+            let memTotal = 0, memAvailable = 0, swapTotal = 0, swapFree = 0;
             for (let line of lines) {
-                if (line.startsWith('MemTotal:')) {
-                    memTotal = Number(line.replace(/\D/g, ''));
-                } else if (line.startsWith('MemAvailable:')) {
-                    memAvailable = Number(line.replace(/\D/g, ''));
-                }
+                if (line.startsWith('MemTotal:')) memTotal = Number(line.replace(/\D/g, ''));
+                else if (line.startsWith('MemAvailable:')) memAvailable = Number(line.replace(/\D/g, ''));
+                else if (line.startsWith('SwapTotal:')) swapTotal = Number(line.replace(/\D/g, ''));
+                else if (line.startsWith('SwapFree:')) swapFree = Number(line.replace(/\D/g, ''));
             }
-
-            if (memTotal > 0) {
-                let used = memTotal - memAvailable;
-                return Math.round((used / memTotal) * 100);
-            }
+            if (memTotal > 0) cache.ram = Math.round(((memTotal - memAvailable) / memTotal) * 100);
+            if (swapTotal > 0) cache.swap = Math.round(((swapTotal - swapFree) / swapTotal) * 100);
+            this._meminfoCache = cache;
+            this._meminfoStamp = now;
         } catch (e) {
-            console.error('NotchNux: Error updating RAM usage', e);
+            console.error('NotchNux: Error reading meminfo', e);
         }
-        return 0;
+        return cache;
+    }
+
+    getRamUsage() {
+        return this._readMeminfo().ram;
     }
 
     // --- Swap Usage --- (percentage of swap in use; 0 when no swap configured)
     getSwapUsage() {
-        try {
-            let file = Gio.File.new_for_path('/proc/meminfo');
-            let [success, contents] = file.load_contents(null);
-            if (!success) return 0;
-            let lines = ByteArrayToString(contents).split('\n');
-            let swapTotal = 0, swapFree = 0;
-            for (let line of lines) {
-                if (line.startsWith('SwapTotal:')) swapTotal = Number(line.replace(/\D/g, ''));
-                else if (line.startsWith('SwapFree:')) swapFree = Number(line.replace(/\D/g, ''));
-            }
-            if (swapTotal > 0)
-                return Math.round(((swapTotal - swapFree) / swapTotal) * 100);
-        } catch (e) {
-            console.error('NotchNux: Error reading swap usage', e);
-        }
-        return 0;
+        return this._readMeminfo().swap;
     }
 
     // --- Disk Usage --- (percentage used on the root filesystem)
@@ -286,8 +462,7 @@ export class SystemHelper {
     // --- Battery Level ---
     getBatteryInfo() {
         try {
-            if (!this._upowerClient) return { percentage: 100, isCharging: false };
-            let displayDevice = this._upowerClient.get_display_device();
+            let displayDevice = this._displayDevice;
             if (displayDevice) {
                 // state values: 1 = charging, 2 = discharging, 3 = empty, 4 = fully charged, 5 = pending charge
                 let state = displayDevice.state;
@@ -305,21 +480,16 @@ export class SystemHelper {
     // --- Volume Control (Gvc) ---
     _initVolumeControl() {
         this._mixerControl = new Gvc.MixerControl({ name: 'NotchNux Volume Control' });
-        
-        this._mixerControl.connect('state-changed', (control, state) => {
-            if (state === Gvc.MixerControlState.READY) {
-                this._updateAudioStream();
-                this._updateSourceStream();
-            }
-        });
-
-        this._mixerControl.connect('default-sink-changed', () => {
-            this._updateAudioStream();
-        });
-
-        this._mixerControl.connect('default-source-changed', () => {
-            this._updateSourceStream();
-        });
+        this._mixerSignalIds = [
+            this._mixerControl.connect('state-changed', (control, state) => {
+                if (state === Gvc.MixerControlState.READY) {
+                    this._updateAudioStream();
+                    this._updateSourceStream();
+                }
+            }),
+            this._mixerControl.connect('default-sink-changed', () => this._updateAudioStream()),
+            this._mixerControl.connect('default-source-changed', () => this._updateSourceStream()),
+        ];
 
         this._mixerControl.open();
     }
@@ -354,65 +524,40 @@ export class SystemHelper {
     isMicInUse() { return this._micInUse; }
     isCameraInUse() { return this._camInUse; }
 
-    _updatePrivacyState() {
-        // Cancel any in-flight dump so slow calls can't stack up on the poll.
-        if (this._pwCancellable) this._pwCancellable.cancel();
-        this._pwCancellable = new Gio.Cancellable();
-        let cancellable = this._pwCancellable;
-
-        let proc;
-        try {
-            proc = Gio.Subprocess.new(
-                ['pw-dump', '--no-colors'],
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
-        } catch (e) {
-            // pw-dump unavailable (no PipeWire): treat as never-in-use.
-            return;
-        }
-
-        proc.communicate_utf8_async(null, cancellable, (p, res) => {
-            let out;
-            try {
-                [, out] = p.communicate_utf8_finish(res);
-            } catch (e) {
-                return; // cancelled or failed; keep last known state
+    // One `pw-dump --monitor` record: a JSON array of added/changed objects
+    // (removed ones arrive as { id, info: null }). Track just the nodes'
+    // media class + state; the very first record is the full graph.
+    _applyPipewireChunk(text) {
+        let objects = JSON.parse(text);
+        for (let o of objects) {
+            if (o.info === null) {
+                this._pwNodes.delete(o.id);
+                continue;
             }
-            this._parsePrivacyDump(out);
-        });
+            if (o.type !== 'PipeWire:Interface:Node' || !o.info)
+                continue;
+            let node = this._pwNodes.get(o.id) ?? { mediaClass: '', state: '' };
+            if (o.info.props?.['media.class'] !== undefined)
+                node.mediaClass = o.info.props['media.class'];
+            if (o.info.state !== undefined)
+                node.state = o.info.state;
+            this._pwNodes.set(o.id, node);
+        }
+        this._recomputePrivacy();
     }
 
-    _parsePrivacyDump(jsonText) {
-        let micInUse = false, camInUse = false;
-        try {
-            let nodes = JSON.parse(jsonText);
-            for (let o of nodes) {
-                if (o.type !== 'PipeWire:Interface:Node') continue;
-                let info = o.info;
-                if (!info) continue;
-                let props = info.props || {};
-                let mediaClass = props['media.class'] || '';
-                let running = info.state === 'running';
-                if (!running) continue;
-
-                // A running audio/video capture stream, or a running source that
-                // isn't our own monitoring, means the device is live.
-                if (mediaClass.includes('Stream/Input/Audio') ||
-                    mediaClass === 'Audio/Source')
-                    micInUse = true;
-                if (mediaClass.includes('Stream/Input/Video') ||
-                    mediaClass === 'Video/Source')
-                    camInUse = true;
-            }
-        } catch (e) {
-            return; // malformed output; keep last known state
+    // A running capture stream (or a running source node) means in use.
+    _recomputePrivacy() {
+        let mic = false, cam = false;
+        for (let { mediaClass, state } of this._pwNodes.values()) {
+            if (state !== 'running')
+                continue;
+            if (mediaClass.includes('Stream/Input/Audio') || mediaClass === 'Audio/Source')
+                mic = true;
+            if (mediaClass.includes('Stream/Input/Video') || mediaClass === 'Video/Source')
+                cam = true;
         }
-
-        // Many apps open the webcam straight through V4L2 (/dev/video*) without
-        // ever creating a PipeWire video node, so PipeWire alone under-reports
-        // the camera. Fold in a V4L2 open-handle check before committing.
-        this._checkV4l2Camera(camPipeWire => {
-            this._commitPrivacyState(micInUse, camInUse || camPipeWire);
-        });
+        this._commitPrivacyState(mic, cam || this._camV4l2);
     }
 
     _commitPrivacyState(micInUse, camInUse) {
@@ -421,33 +566,6 @@ export class SystemHelper {
             this._camInUse = camInUse;
             if (this.onPrivacyChanged) this.onPrivacyChanged();
         }
-    }
-
-    // Detect a camera opened via V4L2 by asking `fuser` whether any process
-    // holds a /dev/video* capture device open. Metadata-only nodes are never
-    // held open by capture apps, so a live handle is a reliable "in use" signal.
-    // Calls back with true/false; on any failure it reports false (no override).
-    _checkV4l2Camera(cb) {
-        let proc;
-        try {
-            proc = Gio.Subprocess.new(
-                ['sh', '-c', 'fuser /dev/video* 2>/dev/null'],
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
-        } catch (e) {
-            cb(false);
-            return;
-        }
-        proc.communicate_utf8_async(null, null, (p, res) => {
-            let out;
-            try {
-                [, out] = p.communicate_utf8_finish(res);
-            } catch (e) {
-                cb(false);
-                return;
-            }
-            // `fuser` prints PIDs when a device is open; empty output means idle.
-            cb(out.trim().length > 0);
-        });
     }
 
     _updateAudioStream() {
@@ -460,6 +578,8 @@ export class SystemHelper {
             // Unbind old listeners
             if (this._volNotifyId) this._audioStream.disconnect(this._volNotifyId);
             if (this._muteNotifyId) this._audioStream.disconnect(this._muteNotifyId);
+            if (this._portNotifyId) this._audioStream.disconnect(this._portNotifyId);
+            this._portNotifyId = 0;
         }
 
         this._audioStream = sink;
@@ -471,7 +591,39 @@ export class SystemHelper {
             this._muteNotifyId = this._audioStream.connect('notify::is-muted', () => {
                 this._readVolume();
             });
+            this._portNotifyId = this._audioStream.connect('notify::port', () => this._checkOutput());
             this._readVolume();
+            this._checkOutput();
+        }
+    }
+
+    // Describe the current output and report a change of device/port.
+    _checkOutput() {
+        let sink = this._audioStream;
+        if (!sink)
+            return;
+        let name = '', port = '', form = '', bluetooth = false;
+        try {
+            name = sink.get_description() ?? '';
+            form = sink.get_form_factor?.() ?? '';
+            bluetooth = (sink.get_name() ?? '').startsWith('bluez');
+            let p = sink.get_port?.();
+            port = p?.port ?? '';
+            if (p?.human_port && !bluetooth)
+                name = p.human_port;
+        } catch (e) {}
+        let key = `${sink.get_id?.()}|${port}`;
+        let first = this._outputKey === null;
+        if (key === this._outputKey)
+            return;
+        this._outputKey = key;
+        if (first)
+            return;
+        let headphones = bluetooth || /head(phone|set)|handsfree|hands-free|earpiece/i.test(`${form} ${port}`);
+        try {
+            this.onOutputChanged?.({ name, port, bluetooth, headphones });
+        } catch (e) {
+            console.error('NotchNux: output change handler failed', e);
         }
     }
 
@@ -541,73 +693,62 @@ export class SystemHelper {
         return null;
     }
 
-    _ensureBrightnessProxy() {
-        if (this._brightnessProxy !== undefined) return this._brightnessProxy;
-        try {
-            const BrightnessIface =
-                '<node><interface name="org.gnome.SettingsDaemon.Power.Screen">' +
-                '<property name="Brightness" type="i" access="readwrite"/>' +
-                '</interface></node>';
-            const BrightnessProxy = Gio.DBusProxy.makeProxyWrapper(BrightnessIface);
-            this._brightnessProxy = BrightnessProxy(
-                Gio.DBus.session,
-                'org.gnome.SettingsDaemon.Power',
-                '/org/gnome/SettingsDaemon/Power');
-        } catch (e) {
-            this._brightnessProxy = null;
-        }
-        return this._brightnessProxy;
-    }
-
+    // gnome-settings-daemon's Power.Screen Brightness (pre-GS 47 shells). Read
+    // asynchronously and cached; GNOME 49+ has no such interface, so after the
+    // first failure we stop asking.
     _getGsdBrightness() {
-        try {
-            let proxy = this._ensureBrightnessProxy();
-            if (proxy && typeof proxy.Brightness === 'number' && proxy.Brightness >= 0)
-                return Math.round(proxy.Brightness);
-        } catch (e) {
-            // ignore
+        if (!this._gsdBrightnessGone && !this._gsdBrightnessBusy) {
+            this._gsdBrightnessBusy = true;
+            Gio.DBus.session.call('org.gnome.SettingsDaemon.Power', '/org/gnome/SettingsDaemon/Power',
+                'org.freedesktop.DBus.Properties', 'Get',
+                new GLib.Variant('(ss)', ['org.gnome.SettingsDaemon.Power.Screen', 'Brightness']),
+                new GLib.VariantType('(v)'), Gio.DBusCallFlags.NO_AUTO_START, 1000, this._cancellable,
+                (c, res) => {
+                    this._gsdBrightnessBusy = false;
+                    try {
+                        let v = c.call_finish(res).recursiveUnpack()[0];
+                        this._gsdBrightness = typeof v === 'number' && v >= 0 ? Math.round(v) : null;
+                    } catch (e) {
+                        this._gsdBrightnessGone = true;
+                    }
+                });
         }
-        return null;
+        return this._gsdBrightness ?? null;
     }
 
     // --- Airplane mode --- (via gnome-settings-daemon Rfkill, the same
     // interface GNOME's own quick toggle drives; flips all radios at once).
-    _ensureRfkillProxy() {
-        if (this._rfkillProxy !== undefined) return this._rfkillProxy;
-        try {
-            const RfkillIface =
-                '<node><interface name="org.gnome.SettingsDaemon.Rfkill">' +
-                '<property name="AirplaneMode" type="b" access="readwrite"/>' +
-                '<property name="HasAirplaneMode" type="b" access="read"/>' +
-                '</interface></node>';
-            const RfkillProxy = Gio.DBusProxy.makeProxyWrapper(RfkillIface);
-            this._rfkillProxy = RfkillProxy(
-                Gio.DBus.session,
-                'org.gnome.SettingsDaemon.Rfkill',
-                '/org/gnome/SettingsDaemon/Rfkill');
-        } catch (e) {
-            this._rfkillProxy = null;
-        }
-        return this._rfkillProxy;
-    }
-
+    // Read asynchronously and cached; the old synchronous proxy wrapper
+    // blocked the shell on gnome-settings-daemon during Tray renders.
     getAirplaneMode() {
-        try {
-            let proxy = this._ensureRfkillProxy();
-            if (proxy) return proxy.AirplaneMode === true;
-        } catch (e) {
-            // ignore
+        if (!this._rfkillBusy) {
+            this._rfkillBusy = true;
+            Gio.DBus.session.call('org.gnome.SettingsDaemon.Rfkill', '/org/gnome/SettingsDaemon/Rfkill',
+                'org.freedesktop.DBus.Properties', 'Get',
+                new GLib.Variant('(ss)', ['org.gnome.SettingsDaemon.Rfkill', 'AirplaneMode']),
+                new GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, 2000, this._cancellable,
+                (c, res) => {
+                    this._rfkillBusy = false;
+                    try { this._airplane = c.call_finish(res).recursiveUnpack()[0] === true; } catch (e) {}
+                });
         }
-        return false;
+        return this._airplane === true;
     }
 
-    setAirplaneMode(on) {
-        try {
-            let proxy = this._ensureRfkillProxy();
-            if (proxy) proxy.AirplaneMode = !!on;
-        } catch (e) {
-            console.warn('NotchNux: airplane-mode control unavailable', e.message);
-        }
+    setAirplaneMode(on, cb = null) {
+        this._airplane = !!on;
+        Gio.DBus.session.call('org.gnome.SettingsDaemon.Rfkill', '/org/gnome/SettingsDaemon/Rfkill',
+            'org.freedesktop.DBus.Properties', 'Set',
+            new GLib.Variant('(ssv)', ['org.gnome.SettingsDaemon.Rfkill', 'AirplaneMode', new GLib.Variant('b', !!on)]),
+            null, Gio.DBusCallFlags.NONE, 5000, this._cancellable,
+            (c, res) => {
+                try {
+                    c.call_finish(res);
+                } catch (e) {
+                    console.warn('NotchNux: airplane-mode control unavailable', e.message);
+                }
+                cb?.();
+            });
     }
 
     // --- WiFi / Hotspot (NetworkManager) ---
@@ -849,13 +990,15 @@ export class SystemHelper {
         }
     }
 
-    // 8-char alphanumeric password (avoids ambiguous 0/O/1/l for readability).
+    // 12-char password from the kernel CSPRNG (Math.random is not one). The
+    // 32-symbol alphabet skips look-alikes (0/O, 1/l) and divides 256 evenly,
+    // so `byte & 31` is unbiased: 12 × 5 bits = 60 bits of entropy.
     _genHotspotPassword() {
         const chars = 'abcdefghijkmnpqrstuvwxyz23456789';
-        let out = '';
-        for (let i = 0; i < 8; i++)
-            out += chars[Math.floor(Math.random() * chars.length)];
-        return out;
+        let stream = Gio.File.new_for_path('/dev/urandom').read(null);
+        let bytes = stream.read_bytes(12, null).toArray();
+        stream.close(null);
+        return Array.from(bytes, b => chars[b & 31]).join('');
     }
 
     // --- WiFi networks (saved list, scan, connect) ---
@@ -965,10 +1108,7 @@ export class SystemHelper {
         this.requestWifiScan(() => {
             // NM populates the AP list asynchronously after the scan returns;
             // wait briefly so get_access_points() reflects the fresh results.
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
-                cb(this._wifiSsidInRange(ssid));
-                return GLib.SOURCE_REMOVE;
-            });
+            this._later(1500, () => cb(this._wifiSsidInRange(ssid)));
         });
     }
 
@@ -1101,9 +1241,7 @@ export class SystemHelper {
             let dev = this._backlightDevice();
             if (!dev) return;
             let raw = Math.round((clamped / 100) * dev.max);
-            let sessionPath = this._logindSessionPath();
-            if (!sessionPath) return;
-            Gio.DBus.system.call(
+            this._withLogindSession(sessionPath => Gio.DBus.system.call(
                 'org.freedesktop.login1',
                 sessionPath,
                 'org.freedesktop.login1.Session',
@@ -1113,7 +1251,7 @@ export class SystemHelper {
                 (conn, res) => {
                     try { conn.call_finish(res); }
                     catch (e) { console.warn('NotchNux: logind SetBrightness failed', e.message); }
-                });
+                }));
         } catch (e) {
             console.warn('NotchNux: brightness control unavailable on this shell', e.message);
         }
@@ -1145,45 +1283,47 @@ export class SystemHelper {
         return this._backlight;
     }
 
-    // Resolve the graphical logind session object path. First try the caller's
-    // own session (works inside gnome-shell); if that fails — e.g. the caller
-    // isn't tied to a session — fall back to this user's "Display" session,
-    // which logind reports directly and doesn't depend on the caller's PID.
-    _logindSessionPath() {
-        if (this._logindPath !== undefined) return this._logindPath;
-        this._logindPath = null;
-        try {
-            let res = Gio.DBus.system.call_sync(
-                'org.freedesktop.login1', '/org/freedesktop/login1',
-                'org.freedesktop.login1.Manager', 'GetSessionByPID',
-                new GLib.Variant('(u)', [0]), new GLib.VariantType('(o)'),
-                Gio.DBusCallFlags.NONE, 1000, null);
-            this._logindPath = res.deep_unpack()[0];
-            return this._logindPath;
-        } catch (e) {
-            // Not fatal — try the User.Display route below.
+    // Resolve the graphical logind session object path asynchronously, then
+    // run `cb(path)` (cached after the first success). First try the caller's
+    // own session (works inside gnome-shell); if that fails fall back to this
+    // user's "Display" session, which doesn't depend on the caller's PID.
+    _withLogindSession(cb) {
+        if (this._logindPath) {
+            cb(this._logindPath);
+            return;
         }
-        try {
-            let uid = this._selfUid();
-            let userRes = Gio.DBus.system.call_sync(
-                'org.freedesktop.login1', '/org/freedesktop/login1',
-                'org.freedesktop.login1.Manager', 'GetUser',
-                new GLib.Variant('(u)', [uid]), new GLib.VariantType('(o)'),
-                Gio.DBusCallFlags.NONE, 1000, null);
-            let userPath = userRes.deep_unpack()[0];
-            let disp = Gio.DBus.system.call_sync(
-                'org.freedesktop.login1', userPath,
-                'org.freedesktop.DBus.Properties', 'Get',
-                new GLib.Variant('(ss)', ['org.freedesktop.login1.User', 'Display']),
-                new GLib.VariantType('(v)'),
-                Gio.DBusCallFlags.NONE, 1000, null);
-            // Display is a variant of (so): (session_id, object_path).
-            let [sessionId, objectPath] = disp.deep_unpack()[0].deep_unpack();
-            this._logindPath = objectPath;
-        } catch (e) {
-            console.warn('NotchNux: could not resolve logind session', e.message);
-        }
-        return this._logindPath;
+        let call = (path, iface, method, params, type, next) => Gio.DBus.system.call(
+            'org.freedesktop.login1', path, iface, method, params, new GLib.VariantType(type),
+            Gio.DBusCallFlags.NONE, 1000, this._cancellable, (c, res) => {
+                let reply = null;
+                try { reply = c.call_finish(res); } catch (e) {}
+                next(reply);
+            });
+        let done = path => {
+            if (!path) {
+                console.warn('NotchNux: could not resolve logind session');
+                return;
+            }
+            this._logindPath = path;
+            cb(path);
+        };
+        call('/org/freedesktop/login1', 'org.freedesktop.login1.Manager', 'GetSessionByPID',
+            new GLib.Variant('(u)', [0]), '(o)', reply => {
+                if (reply) {
+                    done(reply.deepUnpack()[0]);
+                    return;
+                }
+                call('/org/freedesktop/login1', 'org.freedesktop.login1.Manager', 'GetUser',
+                    new GLib.Variant('(u)', [this._selfUid()]), '(o)', userReply => {
+                        if (!userReply) { done(null); return; }
+                        call(userReply.deepUnpack()[0], 'org.freedesktop.DBus.Properties', 'Get',
+                            new GLib.Variant('(ss)', ['org.freedesktop.login1.User', 'Display']), '(v)',
+                            disp => {
+                                // Display is a variant of (so): (session_id, object_path).
+                                done(disp ? disp.deepUnpack()[0].deepUnpack()[1] : null);
+                            });
+                    });
+            });
     }
 
     // Best-effort uid lookup (gjs lacks a direct getuid binding). We read it
@@ -1237,88 +1377,139 @@ export class SystemHelper {
             console.error('NotchNux: Error listing BlueZ devices', e);
         }
 
-        try {
-            if (this._upowerClient) {
-                let devices = this._upowerClient.get_devices();
-                for (let device of devices) {
-                    // kind: UPower.DeviceKind
-                    // Type values: 1 = Line Power, 2 = Battery, 3 = UPS, 4 = Monitor, 5 = Mouse, 6 = Keyboard, 7 = PDA, 8 = Phone, 11 = Headphones, 12 = Audio, 13 = Tablet
-                    let kind = device.kind;
-                    if (kind === 2) {
-                        // Check if it's external battery (not laptop battery)
-                        // Laptop battery usually starts with 'BAT' or 'battery' in object path or is_present/kind.
-                        let path = device.get_object_path() || '';
-                        if (path.includes('battery_BAT') || path.includes('DisplayDevice')) {
-                            continue;
-                        }
-                    }
-
-                    // Let's filter out laptop internal battery and only include external accessories
-                    if (kind === 5 || kind === 6 || kind === 11 || kind === 12 || kind === 13 || kind === 2) {
-                        let typeStr = 'Battery';
-                        let iconStr = 'battery-symbolic';
-                        if (kind === 5) { typeStr = 'Mouse'; iconStr = 'input-mouse-symbolic'; }
-                        else if (kind === 6) { typeStr = 'Keyboard'; iconStr = 'input-keyboard-symbolic'; }
-                        else if (kind === 11 || kind === 12) { typeStr = 'Audio Device'; iconStr = 'audio-headset-symbolic'; }
-                        else if (kind === 13) { typeStr = 'Tablet'; iconStr = 'input-tablet-symbolic'; }
-
-                        addDevice({
-                            name: device.model || 'Wireless Device',
-                            type: typeStr,
-                            percentage: Number.isFinite(device.percentage) ? Math.round(device.percentage) : null,
-                            icon: iconStr
-                        });
-                    }
-                }
-            }
-        } catch (e) {
-            console.error('NotchNux: Error listing Bluetooth/UPower devices', e);
-        }
+        // Wireless accessories UPower knows a battery for (mice, keyboards,
+        // headsets…), from an async snapshot — see _refreshUpowerAccessories.
+        this._refreshUpowerAccessories(onUpdate);
+        for (let acc of this._upowerAccessories)
+            addDevice({ ...acc });
         return [...byKey.values()].sort((a, b) => {
             if (a.connected !== b.connected) return a.connected ? -1 : 1;
             return a.name.localeCompare(b.name);
         });
     }
 
+    // UPower accessories (anything with its own battery that isn't the
+    // laptop's power supply) as plain data, read over D-Bus asynchronously.
+    // libupower's get_devices2() hands GJS objects it later frees underneath
+    // us, and is a synchronous call besides.
+    _refreshUpowerAccessories(onUpdate = null) {
+        if (this._upowerBusy) return;
+        this._upowerBusy = true;
+        const UP = 'org.freedesktop.UPower';
+        let finish = list => {
+            this._upowerBusy = false;
+            let sig = l => l.map(d => `${d.name}:${d.percentage}`).sort().join('|');
+            let changed = sig(list) !== sig(this._upowerAccessories);
+            this._upowerAccessories = list;
+            if (changed && onUpdate) onUpdate();
+        };
+        Gio.DBus.system.call(UP, '/org/freedesktop/UPower', UP, 'EnumerateDevices', null,
+            new GLib.VariantType('(ao)'), Gio.DBusCallFlags.NONE, 2000, this._cancellable, (c, res) => {
+                let paths;
+                try {
+                    [paths] = c.call_finish(res).deepUnpack();
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        this._upowerBusy = false;
+                    return;
+                }
+                let out = [];
+                let pending = paths.length;
+                if (pending === 0) { finish(out); return; }
+                for (let path of paths) {
+                    Gio.DBus.system.call(UP, path, 'org.freedesktop.DBus.Properties', 'GetAll',
+                        new GLib.Variant('(s)', [`${UP}.Device`]), new GLib.VariantType('(a{sv})'),
+                        Gio.DBusCallFlags.NONE, 2000, this._cancellable, (c2, r2) => {
+                            try {
+                                let [p] = c2.call_finish(r2).recursiveUnpack();
+                                let acc = this._upowerAccessory(p);
+                                if (acc) out.push(acc);
+                            } catch (e) {
+                                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                                    return;
+                            }
+                            if (--pending === 0) finish(out);
+                        });
+                }
+            });
+    }
+
+    // UPower Device properties -> accessory row, or null for the laptop's own
+    // supply / mains / devices without a battery reading. Type values follow
+    // UpDeviceKind (5 mouse, 6 keyboard, 8 phone, 10 tablet, 12 gamepad,
+    // 13 pen, 14 touchpad, 17 headset, 18 speakers, 19 headphones, 21 audio).
+    _upowerAccessory(p) {
+        if (p.PowerSupply === true || p.Type === 1 || p.IsPresent === false)
+            return null;
+        const KINDS = {
+            2: ['Battery', 'battery-symbolic'],
+            5: ['Mouse', 'input-mouse-symbolic'],
+            6: ['Keyboard', 'input-keyboard-symbolic'],
+            8: ['Phone', 'phone-symbolic'],
+            10: ['Tablet', 'input-tablet-symbolic'],
+            12: ['Controller', 'input-gaming-symbolic'],
+            13: ['Pen', 'input-tablet-symbolic'],
+            14: ['Touchpad', 'input-touchpad-symbolic'],
+            17: ['Audio Device', 'audio-headset-symbolic'],
+            18: ['Audio Device', 'audio-speakers-symbolic'],
+            19: ['Audio Device', 'audio-headphones-symbolic'],
+            21: ['Audio Device', 'audio-headset-symbolic'],
+        };
+        let kind = KINDS[p.Type];
+        if (!kind || !Number.isFinite(p.Percentage))
+            return null;
+        return {
+            name: p.Model || kind[0],
+            type: kind[0],
+            percentage: Math.round(p.Percentage),
+            icon: kind[1],
+        };
+    }
+
     // Serve the last snapshot and refresh it in the background: a synchronous
     // GetManagedObjects against a busy bluetoothd can stall the shell for
-    // hundreds of ms, and this runs every 3s while the Tray tab is open. The
-    // first call returns [] and the list pops in on the next repaint tick.
-    // `onUpdate` (optional) fires when the async refresh lands a changed
-    // snapshot, so the caller can re-render once the (initially empty) list
-    // actually populates instead of waiting for its next poll tick.
+    // hundreds of ms. The first call returns [] and `onUpdate` (optional) fires
+    // when the refresh lands a changed snapshot, so the caller can re-render.
     _getBluezDevices(onUpdate) {
-        this._refreshBluezDevices(onUpdate);
+        this._refreshBluez(onUpdate ? changed => { if (changed) onUpdate(); } : null);
         return this._bluezCache ?? [];
     }
 
-    _refreshBluezDevices(onUpdate) {
+    // One async GetManagedObjects feeds every Bluetooth view: the paired /
+    // connected list, the scan overlay, the adapter path and its power state.
+    _refreshBluez(onUpdate = null) {
+        if (onUpdate)
+            (this._bluezWaiters ??= new Set()).add(onUpdate);
         if (this._bluezRefreshing) return;
         this._bluezRefreshing = true;
-        Gio.DBus.system.call(
-            'org.bluez',
-            '/',
-            'org.freedesktop.DBus.ObjectManager',
-            'GetManagedObjects',
-            null,
-            null,
-            Gio.DBusCallFlags.NONE,
-            2000,
-            null,
+        Gio.DBus.system.call('org.bluez', '/', 'org.freedesktop.DBus.ObjectManager',
+            'GetManagedObjects', null, null, Gio.DBusCallFlags.NONE, 2000, this._cancellable,
             (conn, res) => {
                 this._bluezRefreshing = false;
+                let waiters = this._bluezWaiters ?? new Set();
+                this._bluezWaiters = null;
+                let objects;
                 try {
-                    let result = conn.call_finish(res);
-                    let next = this._parseBluezObjects(result);
-                    // Only notify when the snapshot actually changed, so an
-                    // unchanged poll doesn't rebuild the card out from under a
-                    // scroll/hover.
-                    let changed = this._bluezSignature(next) !== this._bluezSignature(this._bluezCache);
-                    this._bluezCache = next;
-                    if (changed && onUpdate) onUpdate();
+                    [objects] = conn.call_finish(res).recursiveUnpack();
                 } catch (e) {
                     // BlueZ unavailable or timed out; keep the last snapshot.
+                    this._btAdapterPath ??= null;
+                    for (let cb of waiters) cb(false);
+                    return;
                 }
+                let adapter = Object.entries(objects).find(([, ifaces]) => ifaces['org.bluez.Adapter1']);
+                let powered = adapter ? adapter[1]['org.bluez.Adapter1'].Powered === true : false;
+                this._btAdapterPath = adapter ? adapter[0] : null;
+                this._btDiscoveredCache = this._parseDiscovered(objects);
+                let next = this._parseBluezObjects(objects);
+                // Only report a change when the paired/connected snapshot or
+                // the radio state actually moved, so an unchanged poll doesn't
+                // rebuild the card out from under a scroll/hover.
+                let changed = powered !== this._btPowered ||
+                    this._bluezSignature(next) !== this._bluezSignature(this._bluezCache);
+                this._btPowered = powered;
+                this._bluezCache = next;
+                for (let cb of waiters) cb(changed);
             });
     }
 
@@ -1329,9 +1520,8 @@ export class SystemHelper {
         return list.map(d => `${d.name}:${d.connected ? 1 : 0}:${d.percentage}`).sort().join('|');
     }
 
-    _parseBluezObjects(result) {
+    _parseBluezObjects(objects) {
         let list = [];
-        let [objects] = result.recursiveUnpack();
         for (let [path, ifaces] of Object.entries(objects)) {
             let dev = ifaces['org.bluez.Device1'];
             if (!dev) continue;
@@ -1410,85 +1600,62 @@ export class SystemHelper {
 
     // --- Bluetooth radio + discovery (BlueZ Adapter1) ---
 
-    // Object path of the first BlueZ adapter, cached. Resolved synchronously
-    // once (a single small GetManagedObjects); callers below are all async.
-    _bluezAdapterPath() {
-        if (this._btAdapterPath !== undefined) return this._btAdapterPath;
-        this._btAdapterPath = null;
-        try {
-            let res = Gio.DBus.system.call_sync(
-                'org.bluez', '/', 'org.freedesktop.DBus.ObjectManager',
-                'GetManagedObjects', null, null,
-                Gio.DBusCallFlags.NONE, 2000, null);
-            let [objects] = res.recursiveUnpack();
-            for (let [path, ifaces] of Object.entries(objects)) {
-                if (ifaces['org.bluez.Adapter1']) { this._btAdapterPath = path; break; }
-            }
-        } catch (e) {
-            // BlueZ unavailable — leave null so callers no-op gracefully.
+    // Run `cb(adapterPath | null)` once the adapter path is known, fetching
+    // the BlueZ snapshot asynchronously the first time.
+    _withAdapter(cb) {
+        if (this._btAdapterPath !== undefined && this._btAdapterPath !== null) {
+            cb(this._btAdapterPath);
+            return;
         }
-        return this._btAdapterPath;
+        this._refreshBluez(() => cb(this._btAdapterPath ?? null));
     }
 
-    // Whether the Bluetooth adapter is powered on. Reads the cached snapshot
-    // refreshed by _refreshBtPowered(); returns false until the first read.
+    // Whether the Bluetooth adapter is powered on, from the cached snapshot
+    // (refreshed in the background); false until the first read lands.
     getBluetoothPowered() {
-        this._refreshBtPowered();
+        this._refreshBluez();
         return this._btPowered === true;
-    }
-
-    _refreshBtPowered() {
-        if (this._btPoweredRefreshing) return;
-        let path = this._bluezAdapterPath();
-        if (!path) return;
-        this._btPoweredRefreshing = true;
-        Gio.DBus.system.call(
-            'org.bluez', path, 'org.freedesktop.DBus.Properties', 'Get',
-            new GLib.Variant('(ss)', ['org.bluez.Adapter1', 'Powered']),
-            new GLib.VariantType('(v)'), Gio.DBusCallFlags.NONE, 2000, null,
-            (conn, res) => {
-                this._btPoweredRefreshing = false;
-                try { this._btPowered = conn.call_finish(res).recursiveUnpack()[0]; }
-                catch (e) { /* keep last */ }
-            });
     }
 
     // Power the Bluetooth adapter on/off (Adapter1.Powered). `cb(ok)` on return.
     setBluetoothRadio(on, cb) {
         let done = (ok) => { if (cb) cb(!!ok); };
-        let path = this._bluezAdapterPath();
-        if (!path) { done(false); return; }
-        Gio.DBus.system.call(
-            'org.bluez', path, 'org.freedesktop.DBus.Properties', 'Set',
-            new GLib.Variant('(ssv)', ['org.bluez.Adapter1', 'Powered',
-                new GLib.Variant('b', !!on)]),
-            null, Gio.DBusCallFlags.NONE, 5000, null,
-            (conn, res) => {
-                try { conn.call_finish(res); this._btPowered = !!on; done(true); }
-                catch (e) { console.warn('NotchNux: BT power toggle failed', e.message); done(false); }
-            });
+        this._withAdapter(path => {
+            if (!path) { done(false); return; }
+            Gio.DBus.system.call(
+                'org.bluez', path, 'org.freedesktop.DBus.Properties', 'Set',
+                new GLib.Variant('(ssv)', ['org.bluez.Adapter1', 'Powered',
+                    new GLib.Variant('b', !!on)]),
+                null, Gio.DBusCallFlags.NONE, 5000, this._cancellable,
+                (conn, res) => {
+                    try { conn.call_finish(res); this._btPowered = !!on; done(true); }
+                    catch (e) { console.warn('NotchNux: BT power toggle failed', e.message); done(false); }
+                });
+        });
     }
 
     // Begin scanning for nearby devices (Adapter1.StartDiscovery). `cb(ok)`.
     startBluetoothDiscovery(cb) {
         let done = (ok) => { if (cb) cb(!!ok); };
-        let path = this._bluezAdapterPath();
-        if (!path) { done(false); return; }
-        Gio.DBus.system.call(
-            'org.bluez', path, 'org.bluez.Adapter1', 'StartDiscovery',
-            null, null, Gio.DBusCallFlags.NONE, 5000, null,
-            (conn, res) => {
-                try { conn.call_finish(res); done(true); }
-                catch (e) {
-                    // "InProgress" just means discovery was already running.
-                    done(/InProgress/.test(e.message));
-                }
-            });
+        this._withAdapter(path => {
+            if (!path) { done(false); return; }
+            Gio.DBus.system.call(
+                'org.bluez', path, 'org.bluez.Adapter1', 'StartDiscovery',
+                null, null, Gio.DBusCallFlags.NONE, 5000, this._cancellable,
+                (conn, res) => {
+                    try { conn.call_finish(res); done(true); }
+                    catch (e) {
+                        // "InProgress" just means discovery was already running.
+                        done(/InProgress/.test(e.message));
+                    }
+                });
+        });
     }
 
     // Stop scanning (Adapter1.StopDiscovery). Best-effort; errors are ignored.
+    // Not tied to our cancellable: it must still go out during teardown.
     stopBluetoothDiscovery() {
-        let path = this._bluezAdapterPath();
+        let path = this._btAdapterPath;
         if (!path) return;
         Gio.DBus.system.call(
             'org.bluez', path, 'org.bluez.Adapter1', 'StopDiscovery',
@@ -1497,48 +1664,31 @@ export class SystemHelper {
     }
 
     // Snapshot of ALL nearby Device1 objects (unlike getBluetoothDevices, which
-    // filters to paired/connected). Serves the last snapshot and refreshes in
-    // the background so a busy bluetoothd never stalls the shell. Each entry:
+    // filters to paired/connected), refreshed in the background. Each entry:
     // { name, address, dbusPath, paired, connected, icon }.
     getDiscoveredBluetoothDevices() {
-        this._refreshDiscoveredBt();
+        this._refreshBluez();
         return this._btDiscoveredCache ?? [];
     }
 
-    _refreshDiscoveredBt() {
-        if (this._btDiscoveredRefreshing) return;
-        this._btDiscoveredRefreshing = true;
-        Gio.DBus.system.call(
-            'org.bluez', '/', 'org.freedesktop.DBus.ObjectManager',
-            'GetManagedObjects', null, null,
-            Gio.DBusCallFlags.NONE, 2000, null,
-            (conn, res) => {
-                this._btDiscoveredRefreshing = false;
-                try {
-                    let [objects] = conn.call_finish(res).recursiveUnpack();
-                    let list = [];
-                    for (let [path, ifaces] of Object.entries(objects)) {
-                        let dev = ifaces['org.bluez.Device1'];
-                        if (!dev) continue;
-                        list.push({
-                            name: dev.Alias || dev.Name || dev.Address || 'Unknown device',
-                            address: dev.Address || path,
-                            dbusPath: path,
-                            paired: dev.Paired === true,
-                            connected: dev.Connected === true,
-                            icon: this._bluezIcon(dev.Icon, dev.UUIDs || []),
-                        });
-                    }
-                    // Named devices first (unnamed are usually noise), then A–Z.
-                    list.sort((a, b) => {
-                        let an = /^([0-9A-F]{2}:){5}/i.test(a.name) ? 1 : 0;
-                        let bn = /^([0-9A-F]{2}:){5}/i.test(b.name) ? 1 : 0;
-                        if (an !== bn) return an - bn;
-                        return a.name.localeCompare(b.name);
-                    });
-                    this._btDiscoveredCache = list;
-                } catch (e) { /* keep last snapshot */ }
+    _parseDiscovered(objects) {
+        let list = [];
+        for (let [path, ifaces] of Object.entries(objects)) {
+            let dev = ifaces['org.bluez.Device1'];
+            if (!dev) continue;
+            list.push({
+                name: dev.Alias || dev.Name || dev.Address || 'Unknown device',
+                address: dev.Address || path,
+                dbusPath: path,
+                paired: dev.Paired === true,
+                connected: dev.Connected === true,
+                icon: this._bluezIcon(dev.Icon, dev.UUIDs || []),
             });
+        }
+        // Named devices first (unnamed are usually noise), then A–Z.
+        let unnamed = d => (/^([0-9A-F]{2}[:-]){5}/i.test(d.name) ? 1 : 0);
+        list.sort((a, b) => unnamed(a) - unnamed(b) || a.name.localeCompare(b.name));
+        return list;
     }
 
     // Pair (if needed) then connect a discovered device by BlueZ path.
@@ -1633,6 +1783,17 @@ export class SystemHelper {
             console.error('NotchNux: Error ejecting drive', e);
         }
     }
+}
+
+// Index of the byte sequence `seq` in `arr`, or -1.
+function indexOfBytes(arr, seq) {
+    let first = seq[0];
+    for (let i = arr.indexOf(first); i >= 0 && i <= arr.length - seq.length; i = arr.indexOf(first, i + 1)) {
+        let k = 1;
+        while (k < seq.length && arr[i + k] === seq[k]) k++;
+        if (k === seq.length) return i;
+    }
+    return -1;
 }
 
 // Helper to convert GBytes/ByteArray to Javascript string

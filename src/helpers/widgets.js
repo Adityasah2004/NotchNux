@@ -87,7 +87,6 @@ class Vinyl extends St.DrawingArea {
         super._init({ width: size, height: size, style_class: 'nook-vinyl' });
         this._size = size;
         this._spinning = false;
-        this._spinId = 0;
         this.set_pivot_point(0.5, 0.5);
         this.connect('repaint', () => this._draw());
     }
@@ -153,23 +152,22 @@ class Vinyl extends St.DrawingArea {
     startSpin() {
         if (this._spinning) return;
         this._spinning = true;
-        this._spinStartedAt = GLib.get_monotonic_time();
-        this._spinId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-            if (!this._spinning)
-                return GLib.SOURCE_REMOVE;
-            let elapsedMs = (GLib.get_monotonic_time() - this._spinStartedAt) / 1000;
-            this.rotation_angle_z = (elapsedMs / 9000 * 360) % 360;
-            return GLib.SOURCE_CONTINUE;
-        });
+        if (!this._spinTimeline) {
+            this._spinTimeline = Clutter.Timeline.new_for_actor(this, 9000);
+            this._spinTimeline.set_repeat_count(-1);
+            this._spinTimeline.connect('new-frame', () => {
+                if (!this._spinning) return;
+                this.rotation_angle_z = this._spinTimeline.get_progress() * 360;
+            });
+        }
+        this._spinTimeline.start();
     }
 
+    // Pause (not stop) so the record holds its angle and resumes from there,
+    // instead of snapping back to 0° on every play/pause.
     stopSpin() {
         this._spinning = false;
-        if (this._spinId) {
-            GLib.Source.remove(this._spinId);
-            this._spinId = 0;
-        }
-        this.remove_all_transitions();
+        this._spinTimeline?.pause();
     }
 });
 
@@ -194,7 +192,7 @@ class AlbumArtDisc extends St.Widget {
 
         try {
             let uri = GLib.filename_to_uri(path, null);
-            this.set_style(`background-image: url("${uri}"); background-size: cover; background-position: center;`);
+            this.set_style(`background-image: url("${uri}"); background-size: cover;`);
             this.visible = true;
         } catch (e) {
             console.error('NotchNux: Failed to load circular album art', e);
@@ -332,6 +330,65 @@ class RingMeter extends St.DrawingArea {
         setSource(cr, FACE);
         cr.fill();
 
+        cr.$dispose();
+    }
+});
+
+// ============================================================
+// Focus timer ring
+// ============================================================
+// A thick progress ring with a round cap and a bright knob riding the end of
+// the arc. Used at three sizes: the Focus tab, the Home card, and a tiny one
+// in the collapsed pill while a session runs (no knob at that size).
+export const BREAK_GREEN = [0.36, 0.86, 0.62];
+
+export const FocusRing = GObject.registerClass(
+class FocusRing extends St.DrawingArea {
+    _init(size = 160, thickness = 10) {
+        super._init({ width: size, height: size, style_class: 'nook-focus-ring' });
+        this._size = size;
+        this._thickness = thickness;
+        this._value = 0;
+        this._color = null;   // null = live accent
+        this._muted = false;
+        this.connect('repaint', () => this._draw());
+    }
+
+    // `value` 0..1 of the arc; `color` an [r,g,b] (null follows the accent);
+    // `muted` dims the arc (paused).
+    set(value, color = null, muted = false) {
+        let v = Math.max(0, Math.min(1, value));
+        if (Math.abs(v - this._value) < 0.0005 && color === this._color && muted === this._muted)
+            return;
+        this._value = v;
+        this._color = color;
+        this._muted = muted;
+        this.queue_repaint();
+    }
+
+    _draw() {
+        let cr = this.get_context();
+        let s = this._size;
+        let c = s / 2;
+        let t = this._thickness;
+        let r = c - t / 2 - 1;
+        let start = -Math.PI / 2;
+        cr.setLineWidth(t);
+        cr.setLineCap(Cairo.LineCap.ROUND);
+        setSource(cr, [1, 1, 1, 0.09]);
+        cr.arc(c, c, r, 0, 2 * Math.PI);
+        cr.stroke();
+        if (this._value > 0.002) {
+            let end = start + 2 * Math.PI * this._value;
+            setSource(cr, this._color ?? ACCENT, this._muted ? 0.45 : 1);
+            cr.arc(c, c, r, start, end);
+            cr.stroke();
+            if (s >= 40) {
+                cr.arc(c + Math.cos(end) * r, c + Math.sin(end) * r, t * 0.3, 0, 2 * Math.PI);
+                setSource(cr, [1, 1, 1], this._muted ? 0.5 : 0.95);
+                cr.fill();
+            }
+        }
         cr.$dispose();
     }
 });
@@ -487,6 +544,7 @@ class EqBars extends St.BoxLayout {
         this._running = true;
         for (let b of this._bars) {
             b._id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, b.delay, () => {
+                b._id = 0;   // fired: stop() must not remove it again
                 this._bounce(b.actor);
                 return GLib.SOURCE_REMOVE;
             });
@@ -501,11 +559,7 @@ class EqBars extends St.BoxLayout {
             mode: Clutter.AnimationMode.EASE_IN_OUT_SINE,
             onComplete: () => {
                 if (!this._running) return;
-                actor._bounceId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-                    actor._bounceId = 0;
-                    this._bounce(actor);
-                    return GLib.SOURCE_REMOVE;
-                });
+                this._bounce(actor);
             },
         });
     }
@@ -514,7 +568,6 @@ class EqBars extends St.BoxLayout {
         this._running = false;
         for (let b of this._bars) {
             if (b._id) { GLib.Source.remove(b._id); b._id = 0; }
-            if (b.actor._bounceId) { GLib.Source.remove(b.actor._bounceId); b.actor._bounceId = 0; }
             b.actor.remove_all_transitions();
             b.actor.scale_y = 0.3;
         }

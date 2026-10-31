@@ -11,6 +11,7 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.js';
 
 import { SystemHelper } from './helpers/system.js';
@@ -18,9 +19,16 @@ import { MprisHelper } from './helpers/mpris.js';
 import { WeatherHelper } from './helpers/weather.js';
 import { MediaHelper } from './helpers/media.js';
 import { ShelfHelper } from './helpers/shelf.js';
+import { FileDropBridge } from './helpers/filedrop.js';
 import { WallpaperHelper } from './helpers/wallpaper.js';
-import { Vinyl, AlbumArtDisc, Knob, RingMeter, AnalogClock, EqBars, CameraView, ACCENT, AMBER, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
+import { Vinyl, AlbumArtDisc, Knob, AnalogClock, EqBars, CameraView, ACCENT, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, blurPreset } from './helpers/config.js';
+import { fmt } from './helpers/format.js';
+import { GlassBackdrop, createShoulder, SHOULDER_SIZE, PILL_HEIGHT } from './helpers/island.js';
+import { springTo, stopSpring, addPressFeedback } from './helpers/motion.js';
+import { installProductivity } from './tabs/productivity.js';
+import { installLedge, swapContent } from './tabs/ledge.js';
+import { installTray } from './tabs/tray.js';
 
 // Configuration constants
 // Minimum idle width. _pillWidth() measures the actual content (clock + battery
@@ -31,7 +39,6 @@ const PILL_WIDTH = 260;
 // Minimum width while a track is playing (title zone present). Same deal:
 // content measurement can push wider, this is the floor.
 const PILL_WIDTH_MUSIC = 340;
-const PILL_HEIGHT = 40;
 
 // 12-hour clock with an explicit AM/PM marker (e.g. "5:04 PM"). Forcing
 // hour12 keeps the format stable regardless of the user's locale, so the pill
@@ -42,7 +49,7 @@ const PILL_TIME_FMT = { hour: 'numeric', minute: '2-digit', hour12: true };
 const PILL_DATE_FMT = { weekday: 'short', day: 'numeric' };
 // Compose the full pill clock text: "Thu, 19  ·  3:19 PM".
 function pillClockText(date) {
-    return `${date.toLocaleDateString([], PILL_DATE_FMT)}  ·  ${date.toLocaleTimeString([], PILL_TIME_FMT)}`;
+    return `${fmt(date, PILL_DATE_FMT)}  ·  ${fmt(date, PILL_TIME_FMT)}`;
 }
 // Dashboard width is fixed for a stable, centered card; height is measured
 // from the active tab's content so each tab is only as tall as it needs.
@@ -77,7 +84,7 @@ export const NotchNux = GObject.registerClass({
         this.isExpanded = false;
         this._isExpanding = false;
         this._pointerInside = false;
-        this._activeTab = 'media';
+        this._activeTab = null;   // _buildDashboard picks the first visible tab
         this._selectedCalendarDate = new Date();
         this._selectedCalendarDate.setHours(0, 0, 0, 0);
         this._calendarServerEvents = new Map();
@@ -113,30 +120,39 @@ export const NotchNux = GObject.registerClass({
         this._artPending = new Map();
         this._artCacheDir = Gio.File.new_for_path(GLib.build_filenamev(
             [GLib.get_user_cache_dir(), 'notchnux', 'art']));
-        try {
-            this._artCacheDir.make_directory_with_parents(null);
-        } catch (e) {
-            if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.EXISTS))
-                console.error('NotchNux: Failed to create album art cache dir', e);
-        }
+        GLib.mkdir_with_parents(this._artCacheDir.get_path(), 0o700);
+        this._artCancellable = new Gio.Cancellable();
+        this._artPruneId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 20, () => {
+            this._artPruneId = 0;
+            this._pruneArtCache();
+            return GLib.SOURCE_REMOVE;
+        });
 
         // Initialize helper modules
         this._system = new SystemHelper();
         this._mpris = new MprisHelper();
         this._weather = new WeatherHelper();
-        // The shelf is scratch space: wipe whatever survived the last session
-        // so each shell start begins with an empty holding area.
+        // The shelf is scratch space for one login: wipe whatever survived the
+        // last session (but not on every lock/unlock — see ShelfHelper).
         this._shelf = new ShelfHelper();
-        this._shelf.clearShelf();
+        this._shelf.clearOncePerSession();
+        // Last known GSConnect state, refreshed asynchronously by the Shelf tab.
+        this._shareDevices = [];
+        this._shareAvailable = true;
+        this._shareSig = JSON.stringify([true, []]);
         // Rotates the desktop wallpaper through a user-chosen folder. Driven
         // entirely by config; started/paused below once helpers are up.
         this._wallpaper = new WallpaperHelper();
 
         // Inner rounded surface — this is what the user sees.
+        // Clipped: during the expand/collapse spring the box is briefly smaller
+        // than the dashboard fading in or out, and unclipped content hung below
+        // the rounded bottom edge for a few frames.
         this._surface = new St.BoxLayout({
             style_class: 'notchnux-island',
             x_expand: true,
             y_expand: true,
+            clip_to_allocation: true,
             vertical: true });
         this.add_child(this._surface);
 
@@ -147,21 +163,36 @@ export const NotchNux = GObject.registerClass({
         // 3. Transient notification-peek banner
         this._buildNotifBanner();
 
-        this._surface.add_child(this._pill);
+        // The pill and the alert bar share one slot at the top of the island
+        // and swap in place (see tabs/ledge.js swapContent).
+        this._compactStack = new St.Widget({
+            layout_manager: new Clutter.BinLayout(), x_expand: true });
+        this._compactStack.add_child(this._pill);
+        this._surface.add_child(this._compactStack);
         this._surface.add_child(this._dashboard);
         this._surface.add_child(this._notifBanner);
 
         this._dashboard.visible = false;
         this._notifBanner.visible = false;
+        // Tasks / notes / focus timer (+ the pill's live timer zone).
+        this._initProductivity();
+        // Alerts, hide-when-idle, launcher, clipboard, lyrics, keep awake…
+        this._initLedge();
         // Recolour the active-state chrome to match the persisted accent.
         this._applyAccentStyles();
-        // Attach the backdrop-blur effect (created disabled) and apply the
-        // persisted glass preset + collapsed radius. Real gaussian blur of
-        // whatever is behind the surface; see _applyBlur for how the surface is
-        // made translucent so the blur is actually visible.
+        // Shoulders + the (hidden unless enabled) glass backdrop.
         this._buildBlur();
         this._applyBlur();
         this.set_size(PILL_WIDTH, PILL_HEIGHT);
+
+        this.connect('destroy', () => this._onDestroy());
+        // Size the pill to its real content the first time it's on screen
+        // (everything before that ran off-stage at the floor width).
+        let mappedId = this.connect('notify::mapped', () => {
+            if (!this.mapped) return;
+            this.disconnect(mappedId);
+            this._syncPillWidth();
+        });
 
         // Hover + click on the widget
         this.connect('enter-event', (a, e) => this._onCrossing(e, true));
@@ -170,29 +201,39 @@ export const NotchNux = GObject.registerClass({
 
         // Click anywhere else on the stage collapses the dashboard.
         this._stageClickId = global.stage.connect('button-press-event', (s, e) => this._onStageClicked(e));
+        this._keyFocusId = global.stage.connect('notify::key-focus', () => this._onStageKeyFocus());
 
         // Helper callbacks refresh the live tab
-        this._mpris.onMetadataChanged = () => this._refreshLive();
-        this._mpris.onPlaybackChanged = () => this._refreshLive();
-        this._system.onVolumeChanged = () => this._refreshLive();
-        this._weather.onWeatherUpdated = () => this._refreshLive();
+        // MPRIS fires metadata + playback callbacks back to back; coalesce them
+        // into one in-place update per main-loop turn.
+        this._mpris.onMetadataChanged = () => this._queueMediaUpdate();
+        this._mpris.onPlaybackChanged = () => this._queueMediaUpdate();
+        this._system.onVolumeChanged = () => this._onVolumeChanged();
+        this._weather.onWeatherUpdated = () => this._onWeatherUpdated();
         // Mic mute + mic/camera in-use changes repaint the pill indicators.
         this._system.onMicChanged = () => this._updatePrivacyIndicators();
         this._system.onPrivacyChanged = () => this._updatePrivacyIndicators();
         // WiFi/NM state changes (incl. NM finishing its async startup) re-render
         // the Tray tab so the WiFi row populates and stays live.
-        this._system.onWifiChanged = () => {
-            if (this.isExpanded && this._activeTab === 'system')
-                this._renderActiveTab();
-        };
+        this._system.onWifiChanged = () => this._queueTrayCardsRefresh();
 
         if (this._config.isFeatureEnabled('calendarSync'))
             this._initCalendarServer();
         this._initNotificationWatch();
+        this._system.setPrivacyPolling(this._config.isFeatureEnabled('showPrivacy'));
         this._startClock();
         if (this._config.isFeatureEnabled('weatherAutoRefresh'))
             this._startWeatherRefresh();
-        this._weather.updateWeather();
+        // GNOME re-enables us on every unlock; a forecast fetched a few minutes
+        // ago is restored from cache, so only hit GeoClue + the network when it
+        // is actually stale — and not in the middle of the unlock animation.
+        if (!this._weather.isFresh) {
+            this._weatherKickId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 3, () => {
+                this._weatherKickId = 0;
+                this._weather.updateWeather();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
         // Reflect any already-playing media in the pill right away, rather
         // than waiting for the next MPRIS property-change callback.
         this._refreshLive();
@@ -200,6 +241,8 @@ export const NotchNux = GObject.registerClass({
 
         this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this.reposition());
         this.reposition();
+        // Files dragged from other apps open the Shelf and can be dropped on it.
+        this._initFileDrop();
 
         // Keep the notch drawn above window content. addTopChrome with
         // trackFullscreen:false stops GNOME from *hiding* the notch on the
@@ -229,64 +272,91 @@ export const NotchNux = GObject.registerClass({
         // watching battery/fullscreen so it can auto-pause.
         this._wallpaper.configure(this._config.wallpaper);
         this._startWallpaperPauseMonitor();
+        this._system.onPowerReady = () => this._hookBatteryDevice();
+        this._hookBatteryDevice();
+
+        // Pre-warm the dashboard once the shell has settled after login /
+        // unlock, so the first hover-open doesn't pay St's one-off style
+        // resolution (~70 ms) in the middle of its animation.
+        this._prewarmId = GLib.timeout_add(GLib.PRIORITY_LOW, 2000, () => {
+            this._prewarmId = 0;
+            this._prewarmDashboard();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Build the active tab and resolve its styles while nothing is animating.
+    // Showing, measuring and hiding happen in one JS turn, so no frame is ever
+    // painted with the dashboard visible.
+    _prewarmDashboard() {
+        if (this._destroyed || this.isExpanded || this._peekActive || !this.get_stage())
+            return;
+        let host = this._hostFor(this._activeTab);
+        if (host.get_n_children() === 0)
+            this._renderActiveTab();
+        let wasVisible = host.visible;
+        host.visible = true;
+        this._dashboard.visible = true;
+        this._dashboard.get_preferred_height(DASHBOARD_WIDTH);
+        this._dashboard.visible = false;
+        host.visible = wasVisible;
     }
 
     // Feed the wallpaper rotator the current battery + fullscreen state and keep
-    // it updated. UPower's display device emits notify::state/notify::percentage
-    // through the client; fullscreen changes come from the display's
-    // in-fullscreen-changed signal. We poll once immediately so the initial
-    // state is correct even before the first signal.
+    // it updated: battery via _hookBatteryDevice(), fullscreen via the
+    // display's in-fullscreen-changed signal.
     _startWallpaperPauseMonitor() {
-        let pushState = () => {
-            let onBattery = false;
-            try {
-                let client = this._system._upowerClient;
-                let dev = client ? client.get_display_device() : null;
-                // state 2 = discharging (i.e. on battery). Anything else (charging,
-                // fully charged, AC with no battery) counts as not on battery.
-                if (dev && dev.state === 2)
-                    onBattery = true;
-            } catch (e) {}
-            let inFullscreen = false;
-            try {
-                // Any monitor in fullscreen pauses rotation.
-                let n = global.display.get_n_monitors();
-                for (let i = 0; i < n; i++) {
-                    if (global.display.get_monitor_in_fullscreen(i)) {
-                        inFullscreen = true;
-                        break;
-                    }
-                }
-            } catch (e) {}
-            this._wallpaper.setPauseState({ onBattery, inFullscreen });
-        };
-
-        pushState();
-
+        this._pushWallpaperPauseState();
         try {
-            let client = this._system._upowerClient;
-            let dev = client ? client.get_display_device() : null;
-            if (dev) {
-                this._wpBatteryDevice = dev;
-                this._wpBatteryStateId = dev.connect('notify::state', pushState);
-            }
-        } catch (e) {}
-
-        try {
-            this._wpFullscreenId = global.display.connect('in-fullscreen-changed', pushState);
+            this._wpFullscreenId = global.display.connect('in-fullscreen-changed',
+                () => this._pushWallpaperPauseState());
         } catch (e) {}
     }
 
+    _pushWallpaperPauseState() {
+        // UPower state 2 = discharging (on battery); anything else (charging,
+        // full, AC with no battery) counts as not on battery.
+        let onBattery = this._system.displayDevice?.state === 2;
+        let inFullscreen = false;
+        try {
+            let n = global.display.get_n_monitors();
+            for (let i = 0; i < n && !inFullscreen; i++)
+                inFullscreen = global.display.get_monitor_in_fullscreen(i);
+        } catch (e) {}
+        this._wallpaper?.setPauseState({ onBattery, inFullscreen });
+    }
+
     _stopWallpaperPauseMonitor() {
-        if (this._wpBatteryStateId && this._wpBatteryDevice) {
-            try { this._wpBatteryDevice.disconnect(this._wpBatteryStateId); } catch (e) {}
-        }
-        this._wpBatteryStateId = 0;
-        this._wpBatteryDevice = null;
         if (this._wpFullscreenId) {
             try { global.display.disconnect(this._wpFullscreenId); } catch (e) {}
             this._wpFullscreenId = 0;
         }
+    }
+
+    // Follow the laptop battery (UPower display device): the pill readout and
+    // the wallpaper's pause-on-battery both react to it. Called at startup and
+    // again when the async UPower client comes up.
+    _hookBatteryDevice() {
+        this._unhookBatteryDevice();
+        let dev = this._system.displayDevice;
+        if (!dev) return;
+        this._batteryDevice = dev;
+        this._batteryIds = ['notify::percentage', 'notify::state'].map(sig =>
+            dev.connect(sig, () => {
+                this._updateClock();
+                this._pushWallpaperPauseState();
+                this._onPowerSample();
+            }));
+        this._updateClock();
+        this._pushWallpaperPauseState();
+        this._onPowerSample();
+    }
+
+    _unhookBatteryDevice() {
+        for (let id of this._batteryIds ?? [])
+            this._batteryDevice.disconnect(id);
+        this._batteryIds = null;
+        this._batteryDevice = null;
     }
 
     // Snapshot of the config values the shell reacts to, used to diff against
@@ -302,6 +372,8 @@ export const NotchNux = GObject.registerClass({
             wallpaperKey: JSON.stringify(this._config.wallpaper),
             blurKey: JSON.stringify(this._config.blur),
             trayMirrorKey: this._config.trayMirrorKey,
+            pinnedKey: JSON.stringify(this._config.pinnedTabs),
+            keepAwake: this._config.keepAwake,
         };
     }
 
@@ -337,6 +409,7 @@ export const NotchNux = GObject.registerClass({
     // snapshot. Kept diff-based so an accent tweak doesn't needlessly rebuild
     // the whole dashboard, and a tab toggle doesn't repaint unrelated chrome.
     _onConfigFileChanged() {
+        if (this._destroyed) return;
         let prev = this._configState;
         this._config.reload();
         let next = this._configSnapshot();
@@ -345,6 +418,8 @@ export const NotchNux = GObject.registerClass({
         if (next.accent !== prev.accent) {
             setAccent(this._config.accentRgb);
             this._applyAccentStyles();
+            // Tab content bakes the accent into inline styles.
+            this._invalidateAllTabs();
         }
 
         // Blur/glass changed in prefs: re-apply the preset + current-state
@@ -373,41 +448,66 @@ export const NotchNux = GObject.registerClass({
         if (next.tabsKey !== prev.tabsKey) {
             this._tabOrder = this._config.visibleTabs;
             this._rebuildDashboard();
+            this._syncClipboardWatch();
+        } else if (next.pinnedKey !== prev.pinnedKey) {
+            this._syncRail();
         }
+        if (next.keepAwake !== prev.keepAwake)
+            this._setKeepAwake(next.keepAwake, { persist: false });
 
         // Which indicators the Tray tab mirrors changed in prefs: repaint the
         // Tray tab so the row reflects the new selection. Only meaningful while
         // it's the visible tab; otherwise the next render picks it up. Guarded on
         // the user's enable map (trayMirrorKey), not the published catalog, so
         // our own catalog writes don't re-enter here.
-        if (next.trayMirrorKey !== prev.trayMirrorKey &&
-            this._activeTab === 'system' && this.isExpanded)
+        if (next.trayMirrorKey !== prev.trayMirrorKey && this._invalidateTab('system'))
             this._renderActiveTab();
     }
 
-    destroy() {
+    // Runs from the actor's 'destroy' signal, so it also fires when the shell
+    // tears the stage down from C at logout/shutdown (which never calls a JS
+    // destroy() override). Everything async below checks _destroyed.
+    _onDestroy() {
+        if (this._destroyed)
+            return;
+        this._destroyed = true;
+        // Destroyed by the shell itself (logout/shutdown) rather than by
+        // disable(): MessageTray, the panel and popup menus are already
+        // disposed then, and touching them only spams "already disposed".
+        // The process is exiting, so stop our own sources and skip those.
+        let shellGone = !this._disabling;
+        this._releaseKeyboard();
+        if (!shellGone)
+            this._closeScanOverlay();
+        this._destroyLedge();
+        this._destroyProductivity();
+        stopSpring(this);
+        this._railTimeline?.stop();
         this._stopClock();
         this._stopWeatherRefresh();
         this._stopSystemRefresh();
         this._stopMediaAnimations();
         this._stopPillMarquee();
         if (this._pillEq) this._pillEq.stop();
-        if (this._blurRadiusTimeline) {
-            this._blurRadiusTimeline.stop();
-            this._blurRadiusTimeline = null;
-        }
-        // Restore clipped redraws — this Clutter flag is compositor-global, so
-        // it must never outlive the extension.
-        this._setClippedRedrawsDisabled(false);
         this._destroyCalendarServer();
         this._teardownStudio();
         if (this._media) { this._media.destroy(); this._media = null; }
         // Stop the wallpaper rotator and its pause monitor before tearing down
         // SystemHelper, since the monitor is connected to its UPower device.
         this._stopWallpaperPauseMonitor();
+        this._unhookBatteryDevice();
         if (this._wallpaper) { this._wallpaper.destroy(); this._wallpaper = null; }
         this._system.destroy();
         this._mpris.destroy();
+        this._fileDrop?.destroy();
+        this._fileDrop = null;
+        this._shelf.destroy();
+        this._weather.destroy();
+        this._artCancellable.cancel();
+        if (this._artPruneId) {
+            GLib.Source.remove(this._artPruneId);
+            this._artPruneId = 0;
+        }
         if (this._artSession) {
             this._artSession.abort();
             this._artSession = null;
@@ -415,9 +515,11 @@ export const NotchNux = GObject.registerClass({
         this._artPending.clear();
         this._artCache.clear();
 
-        this._teardownNotificationWatch();
-        this._destroyPowerMenu();
-        this._restorePanel();
+        if (!shellGone) {
+            this._teardownNotificationWatch();
+            this._destroyMoreMenu();
+            this._restorePanel();
+        }
         if (this._configMonitor) {
             if (this._configMonitorId)
                 this._configMonitor.disconnect(this._configMonitorId);
@@ -429,6 +531,10 @@ export const NotchNux = GObject.registerClass({
             global.stage.disconnect(this._stageClickId);
             this._stageClickId = null;
         }
+        if (this._keyFocusId) {
+            global.stage.disconnect(this._keyFocusId);
+            this._keyFocusId = 0;
+        }
         this._clearTimers();
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
@@ -437,10 +543,12 @@ export const NotchNux = GObject.registerClass({
             global.display.disconnect(this._restackedId);
             this._restackedId = 0;
         }
-        super.destroy();
+        this._monitorsChangedId = 0;
     }
 
-    _clearTimers() {
+    // Pending hover expand/collapse. Cleared on an explicit collapse so a
+    // stale timer can't reopen or re-close the notch.
+    _clearHoverTimers() {
         if (this._collapseTimeoutId) {
             GLib.Source.remove(this._collapseTimeoutId);
             this._collapseTimeoutId = null;
@@ -448,6 +556,15 @@ export const NotchNux = GObject.registerClass({
         if (this._expandTimeoutId) {
             GLib.Source.remove(this._expandTimeoutId);
             this._expandTimeoutId = null;
+        }
+    }
+
+    // Every timer we own — teardown only.
+    _clearTimers() {
+        this._clearHoverTimers();
+        if (this._afterCollapseId) {
+            GLib.Source.remove(this._afterCollapseId);
+            this._afterCollapseId = 0;
         }
         if (this._calendarScrollFlushId) {
             GLib.Source.remove(this._calendarScrollFlushId);
@@ -465,9 +582,13 @@ export const NotchNux = GObject.registerClass({
             GLib.Source.remove(this._configReloadId);
             this._configReloadId = 0;
         }
-        if (this._tabScrollFrameId) {
-            GLib.Source.remove(this._tabScrollFrameId);
-            this._tabScrollFrameId = 0;
+        if (this._weatherKickId) {
+            GLib.Source.remove(this._weatherKickId);
+            this._weatherKickId = 0;
+        }
+        if (this._prewarmId) {
+            GLib.Source.remove(this._prewarmId);
+            this._prewarmId = 0;
         }
         if (this._trayToggleRefreshId) {
             GLib.Source.remove(this._trayToggleRefreshId);
@@ -476,6 +597,29 @@ export const NotchNux = GObject.registerClass({
         if (this._trayReRenderId) {
             GLib.Source.remove(this._trayReRenderId);
             this._trayReRenderId = 0;
+        }
+        if (this._wpScrollIdleId) {
+            GLib.Source.remove(this._wpScrollIdleId);
+            this._wpScrollIdleId = 0;
+        }
+        if (this._trayCardsId) {
+            GLib.Source.remove(this._trayCardsId);
+            this._trayCardsId = 0;
+        }
+        if (this._clipResetId) {
+            GLib.Source.remove(this._clipResetId);
+            this._clipResetId = 0;
+        }
+        if (this._railLaterId) {
+            if (this._railLaterUsesLaters)
+                global.compositor?.get_laters?.()?.remove(this._railLaterId);
+            else
+                GLib.Source.remove(this._railLaterId);
+            this._railLaterId = 0;
+        }
+        if (this._mediaUpdateId) {
+            GLib.Source.remove(this._mediaUpdateId);
+            this._mediaUpdateId = 0;
         }
     }
 
@@ -491,8 +635,13 @@ export const NotchNux = GObject.registerClass({
     reposition() {
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return;
-        let width = this.isExpanded ? DASHBOARD_WIDTH : this._pillWidth();
-        this.set_position(monitor.x + Math.floor((monitor.width - width) / 2), monitor.y);
+        if (!this.isExpanded && this.get_stage()) {
+            let g = this._restGeometry();
+            this.set_position(g.x, g.y);
+        } else {
+            let width = this.isExpanded ? DASHBOARD_WIDTH : this._pillWidth();
+            this.set_position(monitor.x + Math.floor((monitor.width - width) / 2), monitor.y);
+        }
         // Keep the top-edge scroll strip aligned to the (possibly new) primary
         // monitor geometry.
         this._positionTopScroll();
@@ -501,10 +650,15 @@ export const NotchNux = GObject.registerClass({
     // Measure how tall the currently-rendered dashboard wants to be at the
     // fixed dashboard width, so each tab animates to its own natural height.
     _measureDashboardHeight() {
-        // Measure at exactly the dashboard width. (The carousel header can want
-        // to be wider than the card, so don't let its preferred width inflate
-        // the measuring width — that would under-report the content height.)
+        // A tab that is still sliding out overlaps the incoming one in the
+        // content stack; it must not count toward the target height.
+        let leaving = [...(this._leavingHosts ?? [])].filter(h => h.visible);
+        for (let h of leaving) h.visible = false;
+        // Measure at exactly the dashboard width. (The rail can want to be
+        // wider than the card, so don't let its preferred width inflate the
+        // measuring width — that would under-report the content height.)
         let [, natHeight] = this._dashboard.get_preferred_height(DASHBOARD_WIDTH);
+        for (let h of leaving) h.visible = true;
         // The pill now stays pinned above the dashboard inside the surface, so
         // the expanded box must be tall enough for both. Add the pill's height.
         let pillH = 0;
@@ -521,14 +675,15 @@ export const NotchNux = GObject.registerClass({
     // Animate the widget to fit the active tab's content. Called after any
     // render that can change the content height while expanded.
     _resizeToContent() {
+        if (this._destroyed) return;
         if (!this.isExpanded) return;
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return;
         let targetHeight = this._measureDashboardHeight();
         let targetX = monitor.x + Math.floor((monitor.width - DASHBOARD_WIDTH) / 2);
-        this.ease({
-            x: targetX, y: monitor.y, width: DASHBOARD_WIDTH, height: targetHeight,
-            duration: 220, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        // Barely-underdamped: content-size changes settle with a hint of give.
+        springTo(this, { x: targetX, y: monitor.y, width: DASHBOARD_WIDTH, height: targetHeight },
+            { duration: 440, damping: 0.86 });
     }
 
     // True if `actor` is this widget or any descendant.
@@ -853,37 +1008,36 @@ export const NotchNux = GObject.registerClass({
         this._tabs = {};
         for (let t of TAB_DEFS)
             this._tabs[t.id] = { label: t.label, icon: t.icon };
-        // Ordered list of *visible* tab ids (config order, enabled only) — the
-        // carousel and forward/back navigation walk this list.
+        // Not a configurable tab: the grid behind the header's grid button.
+        this._tabs.launcher = { label: 'All', icon: 'view-app-grid-symbolic' };
+        // Ordered list of *visible* tab ids (config order, enabled only).
         this._tabOrder = this._config.visibleTabs;
-        // Fall back to at least the media tab if the user disabled everything,
-        // so the dashboard never renders an empty header with nothing to show.
         if (this._tabOrder.length === 0)
-            this._tabOrder = ['media'];
+            this._tabOrder = ['home'];
 
-        // Carousel header: a horizontally-scrolling strip of tab pills. The
-        // strip scrolls (drag / mouse-wheel / clicking a partly-hidden tab)
-        // instead of forcing every tab to fit in the fixed dashboard width.
         let headerWrap = new St.BoxLayout({
             style_class: 'notchnux-dashboard-header-wrap',
             vertical: false,
             x_expand: true });
 
-        let headerRow = new St.ScrollView({
-            style_class: 'notchnux-dashboard-header',
+        // Tab rail: icon buttons over one travelling accent indicator. Only the
+        // active tab reveals its label (its clip's width animates open), so all
+        // twelve tabs fit the dashboard width — no carousel hiding half of them.
+        let rail = new St.BoxLayout({
+            style_class: 'notchnux-tab-rail',
+            reactive: true,
+            clip_to_allocation: true,
             x_expand: true });
-        headerRow.set_policy(St.PolicyType.EXTERNAL, St.PolicyType.NEVER);
-        headerRow.set_overlay_scrollbars(true);
-
-        this._tabStrip = new St.BoxLayout({
-            style_class: 'notchnux-tab-strip',
-            vertical: false });
-        headerRow.set_child(this._tabStrip);
-
-        // Mouse-wheel over the header scrolls the carousel horizontally.
-        // Wheel/trackpad over the header moves through tabs, so the strip can
-        // be driven without having to click each pill.
-        headerRow.connect('scroll-event', (actor, event) => {
+        // Inner layer with absolute positioning: the strip sits at (0,0) and
+        // the indicator is placed exactly under the active button.
+        let railLayer = new St.Widget({ layout_manager: new Clutter.FixedLayout() });
+        this._tabIndicator = new St.Widget({ style_class: 'notchnux-tab-indicator', opacity: 0 });
+        this._tabStrip = new St.BoxLayout({ style_class: 'notchnux-tab-strip' });
+        railLayer.add_child(this._tabIndicator);
+        railLayer.add_child(this._tabStrip);
+        rail.add_child(railLayer);
+        // Wheel/trackpad over the rail steps through tabs.
+        rail.connect('scroll-event', (actor, event) => {
             let dir = event.get_scroll_direction();
             let now = GLib.get_monotonic_time();
             if (now - this._lastTabScrollAt < 180000)
@@ -897,28 +1051,108 @@ export const NotchNux = GObject.registerClass({
             this._lastTabScrollAt = now;
             return Clutter.EVENT_STOP;
         });
-        this._tabScroll = headerRow;
+        // The indicator and label widths need real allocations; place them
+        // (without animation) once the strip has been laid out.
+        this._railPlaced = false;
+        this._tabStrip.connect('notify::allocation', () => {
+            if (!this._railPlaced)
+                this._queueRailPlacement();
+        });
 
+        this._fillRail();
+
+
+        // One "more" button holds settings and the session actions (the old
+        // separate power + gear buttons cost the rail ~80 px).
+        this._moreButton = new St.Button({
+            style_class: 'notchnux-more-btn', reactive: true, can_focus: true,
+            accessible_name: 'More', y_align: Clutter.ActorAlign.CENTER });
+        this._moreButton.set_child(new St.Icon({ icon_name: 'view-more-symbolic', icon_size: 16 }));
+        addPressFeedback(this._moreButton);
+        this._buildMoreMenu();
+        this._moreButton.connect('clicked', () => this._moreMenu.toggle());
+
+        // Content: one host per visited tab, stacked in a BinLayout with only
+        // the active one visible. Kept hosts make switching back instant and
+        // let the outgoing and incoming tab cross-slide.
+        this._contentContainer = new St.Widget({
+            style_class: 'notchnux-content-container',
+            layout_manager: new Clutter.BinLayout(),
+            x_expand: true,
+            y_expand: true });
+        this._tabHosts = new Map();
+        this._leavingHosts = new Set();
+
+        // Grid: every tab and toggle, and where header shortcuts are picked.
+        this._gridButton = new St.Button({
+            style_class: 'notchnux-more-btn nn-grid-btn', reactive: true, can_focus: true,
+            accessible_name: 'All', y_align: Clutter.ActorAlign.CENTER });
+        this._gridButton.set_child(new St.Icon({ icon_name: 'view-app-grid-symbolic', icon_size: 16 }));
+        addPressFeedback(this._gridButton);
+        this._gridButton.connect('clicked', () => this._toggleLauncher());
+        this._attachTrayTooltip(this._gridButton, 'All', () => this._activeTab !== 'launcher');
+
+        headerWrap.add_child(rail);
+        headerWrap.add_child(this._gridButton);
+        headerWrap.add_child(this._moreButton);
+        this._dashboard.add_child(headerWrap);
+        this._dashboard.add_child(this._contentContainer);
+
+        // Keep the current tab across rebuilds; otherwise start on the first.
+        if (!this._tabOrder.includes(this._activeTab) && this._activeTab !== 'launcher')
+            this._activeTab = this._tabOrder[0];
+        this._tabButtons[this._activeTab]?.add_style_class_name('notchnux-tab-btn-active');
+        this._tintTabButton(this._activeTab, true);
+        this._syncRail();
+    }
+
+    // The header shows Home, up to MAX_PINNED shortcuts, and — while one is
+    // open — the tab you reached through the grid. Everything else lives in
+    // the grid (the launcher), one click away.
+    _railIds() {
+        let visible = this._tabOrder;
+        let ids = visible.includes('home') ? ['home'] : [];
+        for (let id of this._config.pinnedTabs) {
+            if (visible.includes(id) && !ids.includes(id))
+                ids.push(id);
+        }
+        let active = this._activeTab;
+        if (active && active !== 'launcher' && this._tabs[active] && !ids.includes(active))
+            ids.push(active);
+        return ids;
+    }
+
+    _fillRail() {
+        // The Alerts badge lives on its rail button; forget it before the
+        // buttons go away.
+        this._tabCountBadge = null;
+        this._tabCountLabel = null;
+        this._tabStrip.destroy_all_children();
         this._tabButtons = {};
-        for (let id of this._tabOrder) {
+        this._tabLabels = {};
+        for (let id of this._railIds()) {
             let tab = this._tabs[id];
             if (!tab) continue;
-            let btn = new St.Button({ style_class: 'notchnux-tab-btn', reactive: true, can_focus: true });
-            let row = new St.BoxLayout();
-            row.add_child(new St.Icon({ icon_name: tab.icon, style_class: 'notchnux-tab-icon', icon_size: 12, y_align: Clutter.ActorAlign.CENTER }));
-            // Keep the label at its full width — St ellipsizes to "…" by default
-            // once the strip can't fit the fixed dashboard width, which is what
-            // clipped the tab names. The strip scrolls instead (see below), so
-            // labels stay whole no matter how many tabs get added.
-            let label = new St.Label({ text: tab.label, y_align: Clutter.ActorAlign.CENTER });
+            let btn = new St.Button({
+                style_class: 'notchnux-tab-btn', reactive: true, can_focus: true,
+                accessible_name: tab.label });
+            let row = new St.BoxLayout({ y_align: Clutter.ActorAlign.CENTER });
+            row.add_child(new St.Icon({
+                icon_name: tab.icon, style_class: 'notchnux-tab-icon', icon_size: 16,
+                y_align: Clutter.ActorAlign.CENTER }));
+            let clip = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                clip_to_allocation: true, width: 0,
+                y_align: Clutter.ActorAlign.CENTER });
+            let label = new St.Label({
+                text: tab.label, style_class: 'notchnux-tab-label',
+                x_align: Clutter.ActorAlign.START, y_align: Clutter.ActorAlign.CENTER });
             label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-            row.add_child(label);
-            // Alerts tab carries a live count badge beside its label so the
-            // number of pending notifications is visible without opening it.
+            clip.add_child(label);
+            row.add_child(clip);
+            // Alerts carries a live count badge so pending notifications show
+            // without opening the tab.
             if (id === 'notifications') {
-                // Bin-wrapping the label (like nook-alerts-badge) guarantees the
-                // digit gets an allocation — a bare Label in this x_expand row can
-                // collapse to zero width and render as an empty dot.
                 this._tabCountBadge = new St.Bin({ style_class: 'notchnux-tab-count', y_align: Clutter.ActorAlign.CENTER });
                 this._tabCountLabel = new St.Label({ y_align: Clutter.ActorAlign.CENTER });
                 this._tabCountBadge.set_child(this._tabCountLabel);
@@ -927,90 +1161,63 @@ export const NotchNux = GObject.registerClass({
             }
             btn.set_child(row);
             btn.connect('clicked', () => this._switchTab(id));
+            addPressFeedback(btn, 0.92);
+            this._attachTrayTooltip(btn, tab.label, () => id !== this._activeTab);
             this._tabStrip.add_child(btn);
             this._tabButtons[id] = btn;
+            this._tabLabels[id] = { clip, label };
         }
-        // Populate the alerts count badge with the current notification total.
+        this._railKey = this._railIds().join(',');
         this._updateTabCountBadge();
+    }
 
-        // Power button: opens a small menu with the standard session actions
-        // (suspend / log out / restart / power off / lock). Gated on the
-        // showPowerButton feature toggle so it can be hidden entirely.
-        this._powerButton = new St.Button({
-            style_class: 'notchnux-power-btn',
-            reactive: true,
-            can_focus: true,
-            x_align: Clutter.ActorAlign.END });
-        this._powerButton.set_child(new St.Icon({
-            icon_name: 'system-shutdown-symbolic',
-            icon_size: 15,
-            x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER }));
-        this._buildPowerMenu();
-        this._powerButton.connect('clicked', () => this._powerMenu.toggle());
-        this._powerButton.visible = this._config.isFeatureEnabled('showPowerButton');
+    // Re-fill the rail if its set of buttons changed (pins edited, or a tab
+    // opened from the grid), then put the indicator under the active one.
+    _syncRail() {
+        if (!this._tabStrip)
+            return;
+        if (this._railIds().join(',') !== this._railKey) {
+            this._railTimeline?.stop();
+            this._fillRail();
+            this._railPlaced = false;
+            this._queueRailPlacement();
+        }
+        this._gridButton?.set_style(this._activeTab === 'launcher'
+            ? `color: ${accentHex()}; background-color: rgba(${accentRgbStr()}, 0.16);` : null);
+    }
 
-        this._settingsButton = new St.Button({
-            style_class: 'notchnux-settings-btn',
-            reactive: true,
-            can_focus: true,
-            x_align: Clutter.ActorAlign.END });
-        this._settingsButton.set_child(new St.Icon({
-            icon_name: 'preferences-system-symbolic',
-            icon_size: 15,
-            x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER }));
-        // The gear opens the native preferences window (prefs.js) in its own
-        // GTK process. Edits there land in config.json, which _watchConfig()
-        // picks up to re-apply live.
-        this._settingsButton.connect('clicked', () => {
+    // The "more" menu: NotchNux settings, then GNOME's own session actions
+    // (SystemActions owns the confirm dialogs and availability checks).
+    _buildMoreMenu() {
+        this._destroyMoreMenu();
+        if (!this._systemActions)
+            this._systemActions = SystemActions.getDefault();  // module fn, not a class
+
+        this._moreMenuManager = new PopupMenu.PopupMenuManager(this._moreButton);
+        this._moreMenu = new PopupMenu.PopupMenu(this._moreButton, 0.5, St.Side.TOP);
+        this._moreMenu.actor.add_style_class_name('notchnux-power-menu');
+        Main.uiGroup.add_child(this._moreMenu.actor);
+        this._moreMenu.close();
+        this._moreMenuManager.addMenu(this._moreMenu);
+
+        let settings = new PopupMenu.PopupImageMenuItem('NotchNux Settings…', 'preferences-system-symbolic');
+        settings.connect('activate', () => {
+            this.collapse();
             try {
                 this.extension.openPreferences();
             } catch (e) {
                 console.error('NotchNux: Failed to open preferences.', e);
             }
         });
+        this._moreMenu.addMenuItem(settings);
 
-        this._contentContainer = new St.BoxLayout({
-            style_class: 'notchnux-content-container',
-            x_expand: true,
-            y_expand: true,
-            vertical: true });
-
-        headerWrap.add_child(headerRow);
-        headerWrap.add_child(this._powerButton);
-        headerWrap.add_child(this._settingsButton);
-        this._dashboard.add_child(headerWrap);
-        this._dashboard.add_child(this._contentContainer);
-
-        // Start on the first visible tab (media when enabled, otherwise
-        // whatever the user ordered first).
-        this._activeTab = this._tabOrder.includes('media') ? 'media' : this._tabOrder[0];
-        if (this._tabButtons[this._activeTab])
-            this._tabButtons[this._activeTab].add_style_class_name('notchnux-tab-btn-active');
-    }
-
-    // Build the power button's popup menu. Each item drives GNOME's own
-    // SystemActions, which owns the confirm dialogs and availability checks
-    // (e.g. suspend is hidden where unsupported). The menu is owned by a
-    // PopupMenuManager and mounted in Main.uiGroup so it floats above the notch.
-    _buildPowerMenu() {
-        // A dashboard rebuild recreates the button, so drop any prior menu.
-        this._destroyPowerMenu();
-        if (!this._systemActions)
-            this._systemActions = SystemActions.getDefault();  // module fn, not a class
-
-        this._powerMenuManager = new PopupMenu.PopupMenuManager(this._powerButton);
-        this._powerMenu = new PopupMenu.PopupMenu(this._powerButton, 0.5, St.Side.TOP);
-        this._powerMenu.actor.add_style_class_name('notchnux-power-menu');
-        Main.uiGroup.add_child(this._powerMenu.actor);
-        this._powerMenu.close();
-        this._powerMenuManager.addMenu(this._powerMenu);
-
+        if (!this._config.isFeatureEnabled('showPowerButton'))
+            return;
+        this._moreMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const addAction = (label, iconName, actionName) => {
             let item = new PopupMenu.PopupImageMenuItem(label, iconName);
             item.connect('activate', () => {
-                // Collapse the notch first so the confirm dialog isn't behind it.
+                // Collapse first so the confirm dialog isn't behind the notch.
                 this.collapse();
                 try {
                     this._systemActions.activateAction(actionName);
@@ -1018,24 +1225,21 @@ export const NotchNux = GObject.registerClass({
                     console.error(`NotchNux: system action '${actionName}' failed.`, e);
                 }
             });
-            this._powerMenu.addMenuItem(item);
-            return item;
+            this._moreMenu.addMenuItem(item);
         };
-
         addAction('Lock', 'system-lock-screen-symbolic', 'lock-screen');
         addAction('Suspend', 'media-playback-pause-symbolic', 'suspend');
-        this._powerMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         addAction('Log Out…', 'system-log-out-symbolic', 'logout');
         addAction('Restart…', 'view-refresh-symbolic', 'restart');
         addAction('Power Off…', 'system-shutdown-symbolic', 'power-off');
     }
 
-    _destroyPowerMenu() {
-        if (this._powerMenu) {
-            this._powerMenu.destroy();
-            this._powerMenu = null;
+    _destroyMoreMenu() {
+        if (this._moreMenu) {
+            this._moreMenu.destroy();
+            this._moreMenu = null;
         }
-        this._powerMenuManager = null;
+        this._moreMenuManager = null;
     }
 
     // Apply the current hidePanel / reclaimSpace config to the GNOME top panel.
@@ -1416,25 +1620,21 @@ export const NotchNux = GObject.registerClass({
     // carousel reflects the change without needing a shell restart.
     _rebuildDashboard() {
         let wasExpanded = this.isExpanded;
-        // Preserve the current tab if it's still visible; otherwise fall back.
-        let prevTab = this._activeTab;
-        this._teardownStudio();
+        // Tear down everything the old tab hosts own before they're destroyed
+        // (_buildDashboard keeps the current tab if it's still visible).
+        for (let tab of this._tabHosts?.keys() ?? [])
+            this._teardownTabContent(tab);
+        this._railTimeline?.stop();
         this._surface.remove_child(this._dashboard);
         this._dashboard.destroy();
         this._buildDashboard();
         this._surface.add_child(this._dashboard);
         this._dashboard.visible = wasExpanded;
-        if (this._tabOrder.includes(prevTab) && prevTab !== this._activeTab) {
-            // _buildDashboard already marked the default first tab active;
-            // move that highlight to the tab we were actually on.
-            if (this._tabButtons[this._activeTab])
-                this._tabButtons[this._activeTab].remove_style_class_name('notchnux-tab-btn-active');
-            this._activeTab = prevTab;
-            if (this._tabButtons[this._activeTab])
-                this._tabButtons[this._activeTab].add_style_class_name('notchnux-tab-btn-active');
-        }
         this._applyAccentStyles();
-        this._renderActiveTab();
+        if (wasExpanded) {
+            this._showActiveTab();
+            this._resizeToContent();
+        }
     }
 
     // The stylesheet paints selected/active chrome in a fixed blue. To honour
@@ -1442,13 +1642,17 @@ export const NotchNux = GObject.registerClass({
     // from the current ACCENT. Inline style wins over the style class, so this
     // recolours the active tab pill without touching the CSS. Called on
     // startup, after a rebuild, and whenever accent changes.
+    // The active tab's icon and label take the accent (inline, since the
+    // accent is user-chosen); the others fall back to the stylesheet.
+    _tintTabButton(id, active) {
+        this._tabButtons?.[id]?.set_style(active ? `color: ${accentHex()};` : null);
+    }
+
     _applyAccentStyles() {
         let rgb = accentRgbStr();
-        this._accentTabActiveStyle =
-            `background-color: rgba(${rgb}, 0.18); border: 1px solid rgba(${rgb}, 0.4);`;
-        // Repaint the currently-active tab pill.
-        for (let [id, btn] of Object.entries(this._tabButtons ?? {}))
-            btn.set_style(id === this._activeTab ? this._accentTabActiveStyle : null);
+        // The travelling indicator under the active tab carries the accent.
+        this._tabIndicator?.set_style(`background-color: rgba(${rgb}, 0.16);`);
+        this._tintTabButton(this._activeTab, true);
         // The collapsed pill's EQ bars are built once, so recolour them live.
         if (this._pillEq)
             this._pillEq.setAccentColor();
@@ -1457,244 +1661,331 @@ export const NotchNux = GObject.registerClass({
     }
 
     // ============================================================
-    // Backdrop blur / "glass" appearance
+    // Island silhouette + glass appearance
     // ============================================================
     //
-    // The blur is a single Shell.BlurEffect(mode = BACKGROUND) on the visible
-    // surface. Its `radius` is animated between the collapsed and expanded
-    // strengths during expand()/collapse(); the glass *look* (tint, rim,
-    // brightness) comes from the chosen preset and is applied as inline style
-    // over the .notchnux-island class.
+    // Solid by default: a near-black island flush with the top edge, flared
+    // into it by two concave shoulders, with no rim and no drop shadow (a
+    // shadow on a box that springs every frame is what used to smear). Glass
+    // swaps the solid fill for a tinted, translucent one over a GlassBackdrop
+    // (see helpers/island.js for why that is not a BACKGROUND blur any more).
     _buildBlur() {
-        // Named so we can find/replace it; BACKGROUND samples what's drawn
-        // behind the actor. Start disabled — _applyBlur enables it if the user
-        // turned blur on.
-        this._blurEffect = new Shell.BlurEffect({
-            name: 'notchnux-blur',
-            mode: Shell.BlurMode.BACKGROUND,
-            radius: 0,
-            brightness: 1.0,
-        });
-        this._surface.add_effect(this._blurEffect);
-        // Base drop-shadow reused whenever we override the surface style for a
-        // glass preset (the stylesheet's is otherwise lost to set_style).
+        this._shoulders = [createShoulder(-1), createShoulder(1)];
+        for (let sh of this._shoulders)
+            this.add_child(sh);
+        this._glass = new GlassBackdrop();
+        this.insert_child_below(this._glass.actor, this._surface);
         this._blurActive = false;
-        // Tracks whether we've currently suppressed Clutter clipped redraws for
-        // the blur (see _setClippedRedrawsDisabled). Global flag — keep it honest.
-        this._clippedRedrawsDisabled = false;
+
+        let sync = () => this._syncIslandShape();
+        for (let prop of ['x', 'y', 'width', 'height'])
+            this.connect(`notify::${prop}`, sync);
+        // Corner radius comes from the island's CSS class (pill/peek/open).
+        this._surface.connect('style-changed', () => {
+            this._islandRadiusCache = null;
+            sync();
+        });
+        // The hover swell scales the surface; keep the shoulders and the glass
+        // glued to its edges.
+        this._surface.connect('notify::scale-x', sync);
+        this._surface.connect('notify::scale-y', sync);
     }
 
-    // Re-read the persisted blur config and apply it: enable/disable the effect,
-    // set the preset tint/rim/brightness, and set the radius for the *current*
-    // pill state (expand/collapse animate it from here). Safe to call any time.
+    _islandRadius() {
+        if (this._islandRadiusCache != null)
+            return this._islandRadiusCache;
+        try {
+            this._islandRadiusCache = this._surface.get_theme_node().get_border_radius(St.Corner.BOTTOMLEFT);
+        } catch (e) {
+            return 20;
+        }
+        return this._islandRadiusCache;
+    }
+
+    // motion.js hooks: hold the glass buffers at one size covering the whole
+    // spring (with room for the overshoot) instead of resizing every frame.
+    _onSpringStart(from, target) {
+        if (!this._blurActive || !this._glass)
+            return;
+        let w = Math.max(from.width ?? this.width, target.width ?? this.width);
+        let h = Math.max(from.height ?? this.height, target.height ?? this.height);
+        this._glass.setEnvelope(w * 1.05, h * 1.05);
+        this._syncIslandShape();
+    }
+
+    _onSpringSettled() {
+        if (!this._glass)
+            return;
+        this._glass.setEnvelope(0, 0);
+        this._syncIslandShape();
+    }
+
+    _syncIslandShape() {
+        // Off-stage (during construction) St has no theme node to read.
+        if (this._destroyed || !this._glass || !this.get_stage())
+            return;
+        let sx = this._surface.scale_x;
+        let grow = (sx - 1) * this.width / 2;
+        this._shoulders[0].translation_x = -SHOULDER_SIZE - grow;
+        this._shoulders[1].translation_x = SHOULDER_SIZE + grow;
+        if (!this._blurActive)
+            return;
+        this._glass.sync(this.x, this.y, this.width, this.height, this._islandRadius(),
+            sx, this._surface.scale_y);
+    }
+
+    // Re-read the persisted glass config and apply it. Safe to call any time.
     _applyBlur() {
-        if (!this._blurEffect)
+        if (!this._glass)
             return;
         let cfg = this._config.blur;
         this._blurCfg = cfg;
+        this._blurActive = cfg.enabled;
 
         if (!cfg.enabled) {
-            // Fully off: neutral effect + let the stylesheet's opaque surface
-            // and shadow take over again. Re-enable clipped redraws (the perf
-            // optimization we suppress only while blur is on).
-            this._blurActive = false;
-            this._blurEffect.set_enabled(false);
-            this._blurEffect.radius = 0;
+            this._glass.actor.visible = false;
+            this._glass.setBlur(0);
             this._surface.set_style(null);
-            this._setClippedRedrawsDisabled(false);
+            for (let sh of this._shoulders)
+                sh.visible = true;
+            this._syncIslandShape();
             return;
         }
 
         let p = blurPreset(cfg.preset);
-        this._blurActive = true;
-        this._blurEffect.set_enabled(true);
-        this._blurEffect.brightness = p.brightness;
-        // Radius for whichever state we're in right now; the animations pick up
-        // from this value.
-        this._blurEffect.radius = this.isExpanded ? cfg.expandedRadius : cfg.collapsedRadius;
-
-        // Make the surface translucent so the blurred backdrop shows through,
-        // tinted per the preset. We override background/border/shadow inline
-        // (set_style replaces, not merges, so we must restate the shadow). The
-        // rounded corners + radius transitions still come from the CSS class.
-        this._surface.set_style(this._blurSurfaceStyle(p));
-
-        // Blur is live: suppress clipped redraws so re-rendering content (the
-        // spinning disc, EQ bars, clock) doesn't leave stale blur outlines.
-        this._setClippedRedrawsDisabled(true);
+        this._glass.setBlur(this.isExpanded ? cfg.expandedRadius : cfg.collapsedRadius, p.brightness);
+        this._surface.set_style(
+            `background-color: rgba(${p.tint}, ${p.alpha});`);
+        // The shoulders are solid; on glass they would read as two dark tabs.
+        for (let sh of this._shoulders)
+            sh.visible = false;
+        this._glass.actor.visible = true;
+        this._syncIslandShape();
     }
 
-    // Inline style implementing a glass preset over .notchnux-island. Kept as
-    // one string so _applyBlur / the expand-collapse paths can reuse it.
-    _blurSurfaceStyle(p) {
-        return (
-            `background-color: rgba(${p.tint}, ${p.alpha});` +
-            `border: 1px solid rgba(255, 255, 255, ${p.rim});` +
-            `border-top: 1px solid rgba(255, 255, 255, ${p.rimTop});` +
-            `box-shadow: 0px 8px 26px rgba(0, 0, 0, 0.30);`
-        );
-    }
-
-    // Trailing outlines / "breathing" artifacts on a BACKGROUND-blurred surface.
-    //
-    // Clutter optimizes painting with *clipped redraws*: when an actor changes it
-    // only repaints the small rectangle that actually changed. But a background
-    // blur samples a region *larger* than that clip, so whenever anything inside
-    // or near the notch redraws — the spinning vinyl disc, the EQ bars, the clock
-    // tick, a resize — Clutter repaints only the tiny clip and leaves the blur's
-    // sampled area partly stale. That stale edge is the outline that lingers, and
-    // the frame-to-frame staleness is the shimmer/"breathing" seen on exactly the
-    // components that re-render themselves. It's invisible to screenshots/recorders
-    // because it lives in the compositor's framebuffer, not the scene graph.
-    //
-    // This is a documented Clutter limitation, not a bug in our drawing. The fix,
-    // as used by blur-my-shell (which pioneered GNOME background blur), is to turn
-    // off clipped redraws globally via the Clutter debug flag so every frame does a
-    // full redraw and the blur is never left stale. It has a real compositor-wide
-    // cost, so we only set it while our blur is actually enabled and always clear
-    // it on teardown — never leave it on when blur is off or the extension unloads.
-    _setClippedRedrawsDisabled(disabled) {
-        // Idempotent: don't add/remove the flag twice.
-        if (disabled === this._clippedRedrawsDisabled)
-            return;
-        try {
-            let flag = Clutter.DrawDebugFlag.DISABLE_CLIPPED_REDRAWS;
-            // GNOME 48+ exposes the toggle on Clutter directly; older shells go
-            // through Meta.{add,remove}_clutter_debug_flags.
-            let hasClutterApi = typeof Clutter.add_debug_flags === 'function';
-            if (disabled) {
-                if (hasClutterApi)
-                    Clutter.add_debug_flags(null, flag, null);
-                else
-                    Meta.add_clutter_debug_flags(null, flag, null);
-            } else {
-                if (hasClutterApi)
-                    Clutter.remove_debug_flags(null, flag, null);
-                else
-                    Meta.remove_clutter_debug_flags(null, flag, null);
-            }
-            this._clippedRedrawsDisabled = disabled;
-        } catch (e) {
-            console.error('NotchNux: failed to toggle clipped redraws', e);
-        }
-    }
-
-    // Animate the blur radius toward the target for a state change. Clutter has
-    // no implicit-animation path for a plain GObject effect property, so we
-    // drive it with a short timeline. No-op (and instant) when blur is off.
-    _animateBlurRadius(target, duration) {
-        if (!this._blurEffect || !this._blurActive) {
-            if (this._blurEffect) this._blurEffect.radius = 0;
-            return;
-        }
-        if (this._blurRadiusTimeline) {
-            this._blurRadiusTimeline.stop();
-            this._blurRadiusTimeline = null;
-        }
-        let from = this._blurEffect.radius;
-        if (from === target || duration <= 0) {
-            this._blurEffect.radius = target;
-            return;
-        }
-        let tl = Clutter.Timeline.new_for_actor(this._surface, duration);
-        tl.set_progress_mode(Clutter.AnimationMode.EASE_OUT_QUINT);
-        tl.connect('new-frame', () => {
-            let t = tl.get_progress();
-            this._blurEffect.radius = Math.round(from + (target - from) * t);
-        });
-        tl.connect('stopped', () => {
-            this._blurEffect.radius = target;
-            this._blurRadiusTimeline = null;
-        });
-        this._blurRadiusTimeline = tl;
-        tl.start();
+    // Glass strength follows the open/closed state. Applied in one step: the
+    // blur re-allocates its buffers on every radius change.
+    _animateBlurRadius(target) {
+        if (this._blurActive)
+            this._glass.setBlur(target);
     }
 
     _switchTab(tabId) {
         if (!this._tabs[tabId] || tabId === this._activeTab)
             return;
-        if (this._tabButtons[this._activeTab]) {
-            this._tabButtons[this._activeTab].remove_style_class_name('notchnux-tab-btn-active');
-            this._tabButtons[this._activeTab].set_style(null);
-        }
+        let prev = this._activeTab;
+        let order = [...this._tabOrder, 'launcher'];
+        let dir = Math.sign(order.indexOf(tabId) - order.indexOf(prev)) || 1;
+        this._leaveTab(prev);
+        this._tabButtons[prev]?.remove_style_class_name('notchnux-tab-btn-active');
+        this._tintTabButton(prev, false);
+        if (prev !== 'launcher')
+            this._lastTab = prev;
         this._activeTab = tabId;
-        if (this._tabButtons[this._activeTab]) {
-            this._tabButtons[this._activeTab].add_style_class_name('notchnux-tab-btn-active');
-            this._tabButtons[this._activeTab].set_style(this._accentTabActiveStyle ?? null);
-        }
-        this._scrollActiveTabIntoView();
-        this._renderActiveTab();
+        this._syncRail();
+        this._tabButtons[tabId]?.add_style_class_name('notchnux-tab-btn-active');
+        this._tintTabButton(tabId, true);
+        this._updateTabCountBadge();
+        this._animateRail(tabId);
+        if (this.isExpanded)
+            this._showActiveTab({ animate: true, dir });
     }
 
+    // Wheel over the header steps through the header's own buttons.
     _switchTabRelative(delta) {
-        let idx = this._tabOrder.indexOf(this._activeTab);
+        let ids = this._railIds();
+        if (ids.length === 0)
+            return;
+        let idx = ids.indexOf(this._activeTab);
         if (idx < 0)
-            idx = 0;
-        let next = (idx + delta + this._tabOrder.length) % this._tabOrder.length;
-        this._switchTab(this._tabOrder[next]);
+            idx = delta > 0 ? -1 : 0;
+        let next = (idx + delta + ids.length) % ids.length;
+        this._switchTab(ids[next]);
     }
 
-    // Slide the carousel so the active tab pill is fully visible.
-    //
-    // The read (button x/width, adjustment upper/page_size) is only meaningful
-    // once the strip has been allocated. When switching to a tab near the far
-    // end — especially right after the pill expands — those values are still
-    // stale/zero, so the scroll silently no-ops and the tab stays off-screen
-    // until a close/reopen re-lays-out the strip. Defer to the next paint so we
-    // read a settled allocation, and retry once if it still isn't ready.
-    _scrollActiveTabIntoView() {
-        let attempt = (retriesLeft) => {
-            let btn = this._tabButtons[this._activeTab];
-            if (!btn || !this._tabScroll) return;
-            let adj = this._tabScroll.get_hadjustment();
-            // upper==page_size means "nothing to scroll" — but before the strip
-            // is allocated upper is also 0, indistinguishable from that. If the
-            // active button hasn't been given a real width yet, wait a frame.
-            if (btn.get_width() <= 0 && retriesLeft > 0) {
-                this._tabScrollFrameId = GLib.timeout_add(
-                    GLib.PRIORITY_DEFAULT, 16, () => {
-                        this._tabScrollFrameId = 0;
-                        attempt(retriesLeft - 1);
-                        return GLib.SOURCE_REMOVE;
-                    });
-                return;
-            }
-            let x = btn.get_x();
-            let w = btn.get_width();
-            let maxScroll = Math.max(0, adj.upper - adj.page_size);
-            if (x < adj.value)
-                adj.value = Math.max(0, x - 8);
-            else if (x + w > adj.value + adj.page_size)
-                adj.value = Math.min(maxScroll, x + w - adj.page_size + 8);
-        };
-        // Run after the current layout cycle so the first read sees a settled
-        // allocation; the retry covers the just-expanded case where even that
-        // isn't ready yet.
-        if (this._tabScrollFrameId) {
-            GLib.Source.remove(this._tabScrollFrameId);
-            this._tabScrollFrameId = 0;
-        }
-        this._tabScrollFrameId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
-            this._tabScrollFrameId = 0;
-            attempt(3);
+    // Natural width of a tab's label (incl. its CSS margin), once staged.
+    _tabLabelWidth(id) {
+        let l = this._tabLabels[id]?.label;
+        return l && l.get_stage() ? Math.ceil(l.get_preferred_width(-1)[1]) : 0;
+    }
+
+    // Place the indicator + label reveal instantly (first layout, rebuilds).
+    // Runs from a "later" so it never resizes actors inside a layout pass.
+    _queueRailPlacement() {
+        if (this._railLaterId)
+            return;
+        let laters = global.compositor?.get_laters?.();
+        let run = () => {
+            this._railLaterId = 0;
+            this._placeRail();
             return GLib.SOURCE_REMOVE;
-        });
+        };
+        this._railLaterId = laters
+            ? laters.add(Meta.LaterType.BEFORE_REDRAW, run)
+            : GLib.idle_add(GLib.PRIORITY_DEFAULT, run);
+        this._railLaterUsesLaters = !!laters;
     }
 
+    _placeRail() {
+        if (this._destroyed || !this._tabStrip?.get_stage())
+            return;
+        this._railPlaced = true;
+        if (!this._tabButtons[this._activeTab]) {
+            // The grid is open: no header button is active.
+            for (let { clip } of Object.values(this._tabLabels))
+                clip.width = 0;
+            this._tabIndicator.opacity = 0;
+            return;
+        }
+        this._animateRail(this._activeTab, { instant: true });
+        this._tabIndicator.ease({ opacity: 255, duration: 200, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+    }
+
+    // Where every rail button sits for a given set of label widths: each
+    // button's width is its icon/padding base plus its label clip, packed left
+    // to right with the strip's spacing. Pure arithmetic on preferred sizes —
+    // never reads allocations, which lag a frame behind width changes.
+    _railGeometry(labelWidths) {
+        let spacing = this._tabStrip.get_layout_manager()?.spacing ?? 0;
+        let geo = {};
+        let x = 0;
+        for (let id of this._railIds()) {
+            let btn = this._tabButtons[id];
+            if (!btn) continue;
+            let clip = this._tabLabels[id].clip;
+            let base = btn.get_preferred_width(-1)[1] - clip.width;
+            let w = base + labelWidths[id];
+            geo[id] = { x, w, h: btn.get_preferred_height(-1)[1] };
+            x += w + spacing;
+        }
+        return geo;
+    }
+
+    // Travel the indicator to `next` while its label opens and the previous
+    // one closes — one timeline drives all of it, so the indicator lands
+    // exactly as the buttons settle.
+    _animateRail(next, { instant = false } = {}) {
+        // No header button for `next` (the grid is open): fold every label
+        // and fade the indicator away.
+        let none = !this._tabButtons[next];
+        if (this._railPlaced)
+            this._tabIndicator.ease({ opacity: none ? 0 : 255, duration: 160, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        if (!this._railPlaced || !this._tabStrip.get_stage()) {
+            this._railPlaced = false;
+            this._queueRailPlacement();
+            return;
+        }
+        this._railTimeline?.stop();
+        let from = {}, to = {};
+        for (let [id, { clip }] of Object.entries(this._tabLabels)) {
+            from[id] = clip.width;
+            to[id] = id === next ? this._tabLabelWidth(id) : 0;
+        }
+        let ind = this._tabIndicator;
+        let ix0 = ind.x, iw0 = ind.width;
+        let target = none ? { x: ix0, w: iw0 } : this._railGeometry(to)[next];
+        ind.y = 0;
+        if (!none)
+            ind.height = target.h;
+        let lerp = (a, b, p) => a + (b - a) * p;
+        let apply = p => {
+            for (let [id, { clip }] of Object.entries(this._tabLabels))
+                clip.width = lerp(from[id], to[id], p);
+            ind.x = lerp(ix0, target.x, p);
+            ind.width = lerp(iw0, target.w, p);
+        };
+        let duration = Math.round(360 * (St.Settings.get().slow_down_factor || 1));
+        if (instant || !St.Settings.get().enable_animations) {
+            apply(1);
+            return;
+        }
+        let tl = new Clutter.Timeline({ actor: this._tabStrip, duration });
+        tl.set_progress_mode(Clutter.AnimationMode.EASE_OUT_QUINT);
+        tl.connect('new-frame', () => apply(tl.get_progress()));
+        tl.connect('completed', () => {
+            apply(1);
+            if (this._railTimeline === tl)
+                this._railTimeline = null;
+        });
+        this._railTimeline = tl;
+        tl.start();
+    }
+
+    // The host actor a tab renders into (created hidden on first use).
+    _hostFor(tab) {
+        let host = this._tabHosts.get(tab);
+        if (!host) {
+            host = new St.BoxLayout({
+                style_class: 'notchnux-tab-host', vertical: true,
+                x_expand: true, y_expand: true, visible: false });
+            this._contentContainer.add_child(host);
+            this._tabHosts.set(tab, host);
+        }
+        return host;
+    }
+
+    // Tab renderers add their panel through this, into the tab's own host.
+    _mount(panel) {
+        (this._mountTarget ?? this._hostFor(this._activeTab)).add_child(panel);
+    }
+
+    // Leaving `tab` (switch or collapse): stop whatever it was running. Its
+    // actors stay alive (hidden) for a fast switch back.
+    _leaveTab(tab) {
+        if (tab === 'media') {
+            this._pauseMediaAnimations();
+            this._stopLyricsTick();
+        }
+        if (tab === 'studio') {
+            // Camera off whenever Studio isn't on screen; re-render on return.
+            this._teardownStudio();
+            this._markTabDirty('studio');
+        }
+        if (tab === 'system') {
+            this._closeScanOverlay();
+            this._system.stopSysPolling();
+        }
+        if (tab === 'launcher')
+            this._launcherEdit = false;
+        this._releaseKeyboard?.();
+    }
+
+    // Stop timers/animations owned by `tab`'s content and forget its actor
+    // references, right before that content is destroyed.
+    _teardownTabContent(tab) {
+        if (tab === 'media') this._stopMediaAnimations();
+        if (tab === 'studio') this._teardownStudio();
+        if (tab === 'system') this._closeScanOverlay();
+        this._dropTabRefs(tab);
+    }
+
+    _markTabDirty(tab) {
+        let host = this._tabHosts?.get(tab);
+        if (host)
+            host._dirty = true;
+    }
+
+    // (Re)build the active tab into its host.
     _renderActiveTab() {
-        // Stop any running Cairo-widget animations before their actors are
-        // destroyed — EqBars in particular drives GLib timers that would
-        // otherwise fire into freed actors.
-        this._stopMediaAnimations();
-        // Leaving whatever tab was showing: stop the live camera preview and
-        // close any open device pickers before their actors are freed. Recording
-        // (if any) intentionally survives a tab switch.
-        this._teardownStudio();
-        // Close any open WiFi/Bluetooth scan overlay before its actors (and the
-        // tab content it floats over) are freed; also stops discovery/timers.
-        this._closeScanOverlay();
-        this._contentContainer.destroy_all_children();
-        switch (this._activeTab) {
+        if (this._destroyed) return;
+        let tab = this._activeTab;
+        let host = this._hostFor(tab);
+        this._teardownTabContent(tab);
+        host.destroy_all_children();
+        if (tab === 'system')
+            this._system.startSysPolling();
+        this._mountTarget = host;
+        try {
+            switch (tab) {
+            case 'home': this._renderHomeTab(); break;
+            case 'tasks': this._renderTasksTab(); break;
+            case 'focus':
+                if (this._focusMode === 'stopwatch') this._renderStopwatchPanel();
+                else this._renderFocusTab();
+                break;
+            case 'launcher': this._renderLauncherTab(); break;
+            case 'clipboard': this._renderClipboardTab(); break;
+            case 'notes': this._renderNotesTab(); break;
             case 'media': this._renderMediaTab(); break;
             case 'system': this._renderSystemTab(); break;
             case 'weather': this._renderWeatherTab(); break;
@@ -1703,11 +1994,179 @@ export const NotchNux = GObject.registerClass({
             case 'notifications': this._renderNotificationsTab(); break;
             case 'shelf': this._renderShelfTab(); break;
             case 'wallpaper': this._renderWallpaperTab(); break;
+            }
+        } finally {
+            this._mountTarget = null;
         }
-        // Re-fit to the new content height, unless expand() is driving its own
-        // open animation (it renders first, then animates size itself).
+        host._dirty = false;
+        host._renderedDay = this._dayKey(new Date());
+        // A file drag is falling through to the drop catcher: the fresh
+        // actors must not eat the pointer either.
+        if (this._dropPassThrough)
+            this._walkDropPassThrough(true);
+        // Re-fit to the new content height, unless expand() or a tab switch
+        // is driving its own animation (they measure after showing the host).
+        if (this.isExpanded && !this._isExpanding && !this._presenting)
+            this._resizeToContent();
+    }
+
+    // Make the active tab's host the visible one — cross-sliding from the
+    // previous tab when `animate` — rendering or refreshing it as needed.
+    _showActiveTab({ animate = false, dir = 1 } = {}) {
+        let tab = this._activeTab;
+        let host = this._hostFor(tab);
+        this._presenting = true;
+        try {
+            if (host.get_n_children() === 0 || host._dirty ||
+                host._renderedDay !== this._dayKey(new Date()))
+                this._renderActiveTab();
+            else
+                this._refreshTabInPlace(tab);
+        } finally {
+            this._presenting = false;
+        }
+        this._presentHost(host, animate, dir);
+    }
+
+    // Refresh a kept tab without rebuilding it.
+    _refreshTabInPlace(tab) {
+        switch (tab) {
+        case 'media':
+            this._updateMediaTab(this._mpris.getActiveTrackInfo());
+            break;
+        case 'system':
+            this._system.startSysPolling();
+            this._updateSystemTabMeters();
+            this._queueTrayCardsRefresh();
+            break;
+        case 'notifications':
+            if (this._notificationsSignature(this._collectNotifications()) !== this._notifSignature)
+                this._renderActiveTab();
+            break;
+        case 'home':
+            this._refreshHomeTab?.();
+            break;
+        case 'focus':
+            if (this._swUi) this._swUi.update();
+            else this._refreshFocusTab?.();
+            break;
+        case 'launcher':
+            this._launcherUi?.update();
+            break;
+        case 'clipboard':
+            this._clipUi?.fill();
+            break;
+        case 'calendar':
+        case 'weather':
+        case 'tasks':
+        case 'notes':
+            // Kept current by their change handlers (or marked dirty).
+            break;
+        default:
+            // Shelf, wallpaper, studio: cheap, and their state lives outside us.
+            this._renderActiveTab();
+        }
+    }
+
+    // Tab change: the outgoing view shrinks a touch and fades fast, the new
+    // one grows in from the top edge (the same swap the pill and its alerts
+    // use). Transforms and opacity only — never a relayout per frame.
+    _presentHost(host, animate, dir) {
+        let swap = St.Settings.get().enable_animations && animate;
+        for (let h of this._tabHosts.values()) {
+            if (h === host || !h.visible)
+                continue;
+            h.remove_all_transitions();
+            if (!swap) {
+                h.visible = false;
+                continue;
+            }
+            this._leavingHosts.add(h);
+            h.set_pivot_point(0.5, 0);
+            h.ease({
+                opacity: 0, scale_x: 0.97, scale_y: 0.97,
+                duration: 120, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onStopped: () => {
+                    h.visible = false;
+                    h.opacity = 255;
+                    h.scale_x = h.scale_y = 1;
+                    this._leavingHosts.delete(h);
+                },
+            });
+        }
+        host.remove_all_transitions();
+        host.translation_x = 0;
+        if (swap) {
+            swapContent(null, host);
+            // Hosts overlap during the swap; clip them to the content area.
+            this._contentContainer.clip_to_allocation = true;
+            if (this._clipResetId) GLib.Source.remove(this._clipResetId);
+            this._clipResetId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 420, () => {
+                this._clipResetId = 0;
+                if (this._contentContainer)
+                    this._contentContainer.clip_to_allocation = false;
+                return GLib.SOURCE_REMOVE;
+            });
+        } else {
+            host.visible = true;
+            host.opacity = 255;
+            host.scale_x = host.scale_y = 1;
+        }
         if (this.isExpanded && !this._isExpanding)
             this._resizeToContent();
+    }
+
+    // Data for `tabs` changed: refresh now if one is on screen, otherwise make
+    // sure the next open re-renders instead of reusing the kept content.
+    _invalidateTab(...tabs) {
+        let refreshNow = false;
+        for (let tab of tabs) {
+            if (tab === this._activeTab && this.isExpanded)
+                refreshNow = true;
+            else
+                this._markTabDirty(tab);
+        }
+        return refreshNow;
+    }
+
+    // Accent / feature changes bake into every tab: re-render the visible one
+    // and let the others rebuild when next shown.
+    _invalidateAllTabs() {
+        for (let tab of this._tabHosts?.keys() ?? [])
+            this._markTabDirty(tab);
+        if (this.isExpanded)
+            this._showActiveTab();
+    }
+
+    // Forget every actor reference a tab render stashed on `this`. Called just
+    // before the tab content is destroyed, so a late idle/timeout/async reply
+    // finds null instead of touching a disposed actor (each of these used to
+    // produce "already disposed" criticals after a quick tab switch).
+    _dropTabRefs(tab) {
+        const REFS = {
+            system: ['_trayMeters', '_trayUi'],
+            wallpaper: ['_wpScroll', '_wpThumbs', '_wpSubtitle'],
+            calendar: ['_calPanel', '_calAgenda', '_calDateStrip', '_calDateStripRow',
+                '_calSummaryDay', '_calSummaryDate'],
+            shelf: ['_shareStatus'],
+            media: ['_knobValue', '_mediaUi', '_lyricsUi'],
+            home: ['_homeUi'],
+            tasks: ['_tasksUi'],
+            focus: ['_focusUi', '_swUi'],
+            launcher: ['_launcherUi'],
+            clipboard: ['_clipUi'],
+            notes: ['_notesUi'],
+        };
+        for (let ref of REFS[tab] ?? [])
+            this[ref] = null;
+    }
+
+    // Collapsing keeps the Music tab's actors for a fast re-open, but nothing
+    // should animate or tick behind a closed notch.
+    _pauseMediaAnimations() {
+        this._mediaUi?.vinyl.stopSpin();
+        this._mediaUi?.eq.stop();
+        this._stopTimelineTick();
     }
 
     // Halt vinyl spin + EQ bounce and drop the references, so nothing keeps
@@ -1720,6 +2179,9 @@ export const NotchNux = GObject.registerClass({
         this._timelineFill = null;
         this._timelineBase = null;
         this._timelineElapsed = null;
+        this._timelineTotal = null;
+        this._timelineTrack = null;
+        this._mediaUi = null;
     }
 
     _loadAlbumArt(url, art) {
@@ -1787,47 +2249,105 @@ export const NotchNux = GObject.registerClass({
             this._finishAlbumArtResolve(url, path);
             return;
         }
+        this._downloadAlbumArt(url, target);
+    }
 
-        let msg = Soup.Message.new('GET', url);
-        this._artSession.send_and_read_async(
-            msg,
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (session, res) => {
+    // Album-art URLs come from whatever app owns an MPRIS name, so treat them
+    // as untrusted: only accept an image/* response, and stream it with a hard
+    // size cap instead of buffering an arbitrarily large body in the shell.
+    _downloadAlbumArt(url, target) {
+        const MAX_BYTES = 5 * 1024 * 1024;
+        let fail = () => this._finishAlbumArtResolve(url, null);
+        let msg;
+        try {
+            msg = Soup.Message.new('GET', url);
+        } catch (e) {
+            fail();
+            return;
+        }
+        if (!msg) { fail(); return; }
+        this._artSession.send_async(msg, GLib.PRIORITY_LOW, this._artCancellable, (session, res) => {
+            let stream;
+            try {
+                stream = session.send_finish(res);
+            } catch (e) {
+                fail();
+                return;
+            }
+            let type = msg.response_headers.get_content_type()[0] ?? '';
+            let declared = msg.response_headers.get_content_length();
+            if (msg.get_status() !== Soup.Status.OK || !type.startsWith('image/') || declared > MAX_BYTES) {
+                stream.close_async(GLib.PRIORITY_LOW, null, null);
+                fail();
+                return;
+            }
+            let chunks = [];
+            let total = 0;
+            let readMore = () => stream.read_bytes_async(64 * 1024, GLib.PRIORITY_LOW, this._artCancellable, (s2, r2) => {
+                let bytes;
                 try {
-                    let bytes = session.send_and_read_finish(res);
-                    if (msg.get_status() !== Soup.Status.OK || bytes.get_size() === 0) {
-                        this._finishAlbumArtResolve(url, null);
+                    bytes = s2.read_bytes_finish(r2);
+                } catch (e) {
+                    fail();
+                    return;
+                }
+                let n = bytes.get_size();
+                if (n > 0) {
+                    total += n;
+                    if (total > MAX_BYTES) {
+                        stream.close_async(GLib.PRIORITY_LOW, null, null);
+                        fail();
                         return;
                     }
-
-                    target.replace_contents_bytes_async(
-                        bytes,
-                        null,
-                        false,
-                        Gio.FileCreateFlags.REPLACE_DESTINATION,
-                        null,
-                        (file, writeRes) => {
-                            try {
-                                file.replace_contents_finish(writeRes);
-                                this._finishAlbumArtResolve(url, path);
-                            } catch (e) {
-                                console.error('NotchNux: Failed to cache album art', e);
-                                this._finishAlbumArtResolve(url, null);
-                            }
-                        }
-                    );
-                } catch (e) {
-                    console.error('NotchNux: Failed to download album art', e);
-                    this._finishAlbumArtResolve(url, null);
+                    chunks.push(bytes.toArray());
+                    readMore();
+                    return;
                 }
+                stream.close_async(GLib.PRIORITY_LOW, null, null);
+                if (total === 0) { fail(); return; }
+                let all = new Uint8Array(total);
+                let off = 0;
+                for (let c of chunks) { all.set(c, off); off += c.length; }
+                target.replace_contents_bytes_async(new GLib.Bytes(all), null, false,
+                    Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION,
+                    this._artCancellable, (file, wres) => {
+                        try {
+                            file.replace_contents_finish(wres);
+                            this._finishAlbumArtResolve(url, file.get_path());
+                        } catch (e) {
+                            fail();
+                        }
+                    });
+            });
+            readMore();
+        });
+    }
+
+    // Keep the on-disk art cache bounded (newest 200 files).
+    _pruneArtCache() {
+        try {
+            let en = this._artCacheDir.enumerate_children('standard::name,time::modified',
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+            let files = [];
+            let info;
+            while ((info = en.next_file(null)) !== null)
+                files.push([info.get_name(), info.get_attribute_uint64('time::modified')]);
+            en.close(null);
+            files.sort((a, b) => b[1] - a[1]);
+            for (let [n] of files.slice(200)) {
+                try { this._artCacheDir.get_child(n).delete(null); } catch (e) {}
             }
-        );
+        } catch (e) {}
     }
 
     _finishAlbumArtResolve(url, path) {
-        if (path)
+        if (this._destroyed) return;
+        if (path) {
             this._artCache.set(url, path);
+            // Bounded memo: drop the oldest entry (Map keeps insertion order).
+            if (this._artCache.size > 200)
+                this._artCache.delete(this._artCache.keys().next().value);
+        }
 
         let callbacks = this._artPending.get(url) || [];
         this._artPending.delete(url);
@@ -1836,11 +2356,14 @@ export const NotchNux = GObject.registerClass({
     }
 
     _refreshLive() {
+        if (this._destroyed) return;
         let info = this._mpris.getActiveTrackInfo();
         // Show the pill music zone whenever a player has media loaded (playing
         // OR paused) — a paused Spotify track is still "the media you're on".
-        let showMusic = info.hasMedia &&
+        // One live activity at a time: a running focus timer takes the zone.
+        let showMusic = info.hasMedia && !this._prod?.focusActive && !this._prod?.stopwatch.running &&
             (info.status === 'Playing' || info.status === 'Paused');
+        this._musicPlaying = showMusic && info.status === 'Playing';
         let wasVisible = this._pillMusicBox.visible;
         this._pillMusicBox.visible = showMusic;
 
@@ -1851,8 +2374,9 @@ export const NotchNux = GObject.registerClass({
                 this._pillTitle.set_text(label);
                 this._startPillMarquee();
             }
-            // Bars only bounce while actually playing; a paused track sits still.
-            if (info.status === 'Playing') this._pillEq.start();
+            // Bars only bounce while actually playing (and visible); a paused
+            // track sits still.
+            if (info.status === 'Playing' && !this._alertShowing && !this._tucked) this._pillEq.start();
             else this._pillEq.stop();
         } else {
             this._pillEq.stop();
@@ -1860,11 +2384,66 @@ export const NotchNux = GObject.registerClass({
             this._pillTitle.set_text('');
         }
 
-        // Grow/shrink the pill to make room for (or reclaim) the title.
-        if (showMusic !== wasVisible && !this.isExpanded)
-            this._applyPillWidth();
+        // Grow/shrink the pill smoothly to make room for (or reclaim) the title.
+        if (showMusic !== wasVisible) {
+            if (showMusic) {
+                this._pillMusicBox.opacity = 0;
+                this._pillMusicBox.ease({
+                    opacity: 255,
+                    duration: 220,
+                    mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+                });
+            }
+            if (!this.isExpanded)
+                this._applyPillWidth();
+        }
 
-        if (this.isExpanded)
+        if (this.isExpanded && this._activeTab === 'media')
+            this._updateMediaTab(info);
+        else if (this.isExpanded && this._activeTab === 'home')
+            this._homeUi?.updateMedia(info);
+        this._syncPillStats?.();
+        this._updateTuck?.();
+    }
+
+    _queueMediaUpdate() {
+        if (this._mediaUpdateId || this._destroyed)
+            return;
+        this._mediaUpdateId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._mediaUpdateId = 0;
+            this._refreshLive();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Volume moved (knob scroll, keyboard keys, another app): only the knob
+    // and the Tray sound tile care, so never rebuild a whole tab for it.
+    _onVolumeChanged() {
+        if (this._destroyed) return;
+        let ui = this._mediaUi;
+        if (ui && this._activeTab === 'media') {
+            ui.knob.setValue(this._system.volume / 100);
+            ui.knobValue.set_text(String(this._system.volume));
+        }
+        if (this._activeTab === 'system')
+            this._syncTraySliders?.();
+    }
+
+    _onWeatherUpdated() {
+        if (this._destroyed) return;
+        if (this._invalidateTab('weather', 'home'))
+            this._renderActiveTab();
+    }
+
+    // Calendar server pushed new/removed events: refresh just the agenda when
+    // the Calendar tab is on screen (Home picks it up on its next render).
+    _onCalendarEventsChanged() {
+        if (this._destroyed) return;
+        if (!this._invalidateTab('calendar', 'home'))
+            return;
+        if (this._activeTab === 'calendar' && this._refreshCalendarAgenda())
+            this._resizeToContent();
+        else
             this._renderActiveTab();
     }
 
@@ -1874,6 +2453,7 @@ export const NotchNux = GObject.registerClass({
     // We only surface an indicator when it has something to say, so an idle
     // machine keeps a clean pill.
     _updatePrivacyIndicators() {
+        if (this._destroyed) return;
         if (!this._pillMic) return;
         let before = this._pillMic.visible + '|' + this._pillCam.visible;
 
@@ -1915,6 +2495,8 @@ export const NotchNux = GObject.registerClass({
         let after = this._pillMic.visible + '|' + this._pillCam.visible;
         if (after !== before && !this.isExpanded)
             this._applyPillWidth();
+        if (after !== before)
+            this._updateTuck?.();
     }
 
     // Even gap (px) the pill keeps between neighbouring zones — the "slot" width
@@ -1931,7 +2513,8 @@ export const NotchNux = GObject.registerClass({
     // the pill to exactly that: sum of visible zone widths + one _ZONE_GAP per
     // interior gap + the content box's padding.
     _pillWidth() {
-        let floor = this._pillMusicBox.visible ? PILL_WIDTH_MUSIC : PILL_WIDTH;
+        let floor = this._pillMusicBox.visible || this._pillFocusBox?.visible || this._pillSwBox?.visible
+            ? PILL_WIDTH_MUSIC : PILL_WIDTH;
         // Measuring preferred widths queries the theme node, which is only valid
         // once the actor is on the stage. Before then (early setup / reposition)
         // fall back to the floor; the real width is applied once staged.
@@ -1940,6 +2523,12 @@ export const NotchNux = GObject.registerClass({
         // Collect the widths of the zones that are actually visible, in flow
         // order. The clock is always present; music/battery/priv are optional.
         let zones = [];
+        if (this._pillFocusBox?.visible)
+            zones.push(this._pillFocusBox.get_preferred_width(-1)[1]);
+        if (this._pillSwBox?.visible)
+            zones.push(this._pillSwBox.get_preferred_width(-1)[1]);
+        if (this._pillStatsBox?.visible)
+            zones.push(this._pillStatsBox.get_preferred_width(-1)[1]);
         if (this._pillMusicBox.visible)
             zones.push(this._pillMusicBox.get_preferred_width(-1)[1]);
         zones.push(this._pillClock.get_preferred_width(-1)[1]);
@@ -1963,13 +2552,20 @@ export const NotchNux = GObject.registerClass({
     // Animate the collapsed pill to its current target width, keeping it centred
     // on the monitor.
     _applyPillWidth() {
+        if (this._destroyed) return;
+        // Before addTopChrome stages us, sizes can't be measured (St logs
+        // "not in the stage"); the first map syncs the width instead.
+        if (!this.get_stage()) return;
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return;
+        this._balancePillClock();
+        // An alert or the tucked strip owns the geometry right now; the pill
+        // gets its width back when they let go.
+        if (this.isExpanded || this._peekActive || this._alertShowing || this._tucked)
+            return;
         let width = this._pillWidth();
         let targetX = monitor.x + Math.floor((monitor.width - width) / 2);
-        this.ease({ x: targetX, width: width, duration: 220,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD });
-        this._balancePillClock();
+        springTo(this, { x: targetX, width }, { duration: 380, damping: 1 });
     }
 
     // Distribute the zones evenly. With the pill sized by _pillWidth to hold all
@@ -2058,24 +2654,21 @@ export const NotchNux = GObject.registerClass({
     // ============================================================
     // Tab: Media
     // ============================================================
+    // Music: one tab, two views. "Player" is the vinyl + volume knob; the
+    // lyrics button in the transport swaps them for a cover tile and synced
+    // lyrics (Apple Music's layout). The title, transport and timeline are
+    // the same actors in both views, so switching never rebuilds the tab.
     _renderMediaTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel', vertical: true, x_expand: true, y_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-music', vertical: true, x_expand: true, y_expand: true });
         let info = this._mpris.getActiveTrackInfo();
-        let playing = info.status === 'Playing';
 
-        // Player body: vinyl · info+transport · volume knob.
         let body = new St.BoxLayout({ style_class: 'nook-media-body', vertical: false, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
 
-        // --- Spinning vinyl (Cairo) ---
+        // --- Player view: spinning vinyl (Cairo) with the art pressed in ---
         let vinyl = new Vinyl(140);
         this._vinyl = vinyl;
-        if (playing) vinyl.startSpin();
         let vinylWrap = new St.Bin({ y_align: Clutter.ActorAlign.CENTER });
-        let vinylStack = new St.Widget({
-            layout_manager: new Clutter.BinLayout(),
-            width: 140,
-            height: 140
-        });
+        let vinylStack = new St.Widget({ layout_manager: new Clutter.BinLayout(), width: 140, height: 140 });
         vinylStack.add_child(vinyl);
         let artDisc = new AlbumArtDisc(52);
         artDisc.x_align = Clutter.ActorAlign.CENTER;
@@ -2083,99 +2676,111 @@ export const NotchNux = GObject.registerClass({
         let artFrame = new St.Bin({
             style_class: 'nook-vinyl-art-frame',
             x_align: Clutter.ActorAlign.CENTER,
-            y_align: Clutter.ActorAlign.CENTER
+            y_align: Clutter.ActorAlign.CENTER,
         });
         artFrame.set_child(artDisc);
         vinylStack.add_child(artFrame);
-        this._loadAlbumArt(info.albumArt, artDisc);
         vinylWrap.set_child(vinylStack);
         body.add_child(vinylWrap);
 
-        // --- Info + transport ---
-        let mid = new St.BoxLayout({ style_class: 'nook-media-mid', vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        // --- Lyrics view: a square cover tile (placeholder note underneath) ---
+        let coverWrap = new St.Widget({ style_class: 'nook-cover', layout_manager: new Clutter.BinLayout(),
+            width: 92, height: 92, y_align: Clutter.ActorAlign.START, visible: false });
+        coverWrap.add_child(new St.Icon({ icon_name: 'audio-x-generic-symbolic', icon_size: 30,
+            style_class: 'nook-cover-placeholder', x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER }));
+        let cover = new AlbumArtDisc(92);
+        cover.add_style_class_name('nook-cover-art');
+        coverWrap.add_child(cover);
+        body.add_child(coverWrap);
 
-        // "NOW PLAYING" eyebrow + animated EQ bars.
-        let eyebrow = new St.BoxLayout({ style_class: 'nook-eyebrow-row', vertical: false });
-        let eyebrowLabel = new St.Label({ text: playing ? 'NOW PLAYING' : (info.hasMedia ? 'PAUSED' : 'NO MEDIA'), style_class: 'nook-eyebrow', y_align: Clutter.ActorAlign.CENTER });
+        // --- Info + transport (shared by both views) ---
+        let mid = new St.BoxLayout({ style_class: 'nook-media-mid', vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        let eyebrow = new St.BoxLayout({ style_class: 'nook-eyebrow-row', vertical: false, x_expand: true });
+        let eyebrowLabel = new St.Label({ style_class: 'nook-eyebrow', y_align: Clutter.ActorAlign.CENTER });
         eyebrowLabel.set_style(`color: ${accentHex()};`);
         eyebrowLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         eyebrow.add_child(eyebrowLabel);
         let eq = new EqBars();
         this._eq = eq;
-        if (playing) eq.start();
         eyebrow.add_child(eq);
+        eyebrow.add_child(new St.Widget({ x_expand: true }));
+        let lyricsBadge = new St.Label({ style_class: 'nn-lyrics-badge', y_align: Clutter.ActorAlign.CENTER, visible: false });
+        lyricsBadge.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+        eyebrow.add_child(lyricsBadge);
         mid.add_child(eyebrow);
 
-        // Coerce to string defensively: if mpris ever hands back an un-unwrapped
-        // GLib.Variant, passing it as an St.Label `text:` throws and takes the
-        // whole render (and thus expand) down with it.
-        let title = String(info.hasMedia ? info.title : 'Nothing playing');
-        let artist = String(info.hasMedia ? info.artist : 'Start something in your player');
-        if (title.length > 44) title = title.substring(0, 42) + '…';
-        if (artist.length > 48) artist = artist.substring(0, 46) + '…';
-        mid.add_child(new St.Label({ text: title, style_class: 'nook-track-title' }));
-        mid.add_child(new St.Label({ text: artist, style_class: 'nook-track-artist' }));
+        let titleLabel = new St.Label({ style_class: 'nook-track-title' });
+        titleLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        let artistLabel = new St.Label({ style_class: 'nook-track-artist' });
+        artistLabel.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        mid.add_child(titleLabel);
+        mid.add_child(artistLabel);
 
-        // Transport controls.
-        let controls = new St.BoxLayout({ style_class: 'nook-transport', vertical: false });
-        // `active` tints the icon with the accent to signal an on/engaged toggle
-        // (shuffle on, repeat all/one); `reactive: false` dims unsupported ones.
-        let mkBtn = (icon, cb, reactive, primary, active = false) => {
-            let b = new St.Button({ style_class: primary ? 'nook-transport-btn nook-transport-primary' : 'nook-transport-btn', reactive: reactive !== false });
-            // The CSS paints the primary (play/pause) button a fixed blue; override
-            // it with the current accent so it tracks the user's chosen colour.
+        // Transport controls. Each returns { btn, icon } so updates can retint
+        // and re-enable them in place.
+        let controls = new St.BoxLayout({ style_class: 'nook-transport', vertical: false, x_expand: true });
+        let mkBtn = (cb, primary = false, parent = controls) => {
+            let btn = new St.Button({ style_class: primary ? 'nook-transport-btn nook-transport-primary' : 'nook-transport-btn',
+                can_focus: true });
+            // The CSS paints the primary (play/pause) button a fixed blue; follow
+            // the user's accent instead.
             if (primary) {
                 let rgb = accentRgbStr();
-                b.set_style(`background-color: rgba(${rgb}, 1); box-shadow: 0px 2px 8px rgba(${rgb}, 0.28);`);
+                btn.set_style(`background-color: rgba(${rgb}, 1);`);
             }
-            let ic = new St.Icon({ icon_name: icon, icon_size: primary ? 18 : 16, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
-            if (active && !primary)
-                ic.set_style(`color: ${accentHex()};`);
-            b.set_child(ic);
-            b.connect('clicked', cb);
-            return b;
+            let icon = new St.Icon({ icon_size: primary ? 18 : 16, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
+            btn.set_child(icon);
+            btn.connect('clicked', cb);
+            addPressFeedback(btn, primary ? 0.9 : 0.86);
+            parent.add_child(btn);
+            return { btn, icon };
         };
-        controls.add_child(mkBtn('media-skip-backward-symbolic', () => this._mpris.previous(), info.canPrev));
-        controls.add_child(mkBtn(playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic', () => this._mpris.playPause(), info.canPlay, true));
-        controls.add_child(mkBtn('media-skip-forward-symbolic', () => this._mpris.next(), info.canNext));
-        // Shuffle: lit when on; dimmed if the player doesn't support it.
-        controls.add_child(mkBtn(
-            'media-playlist-shuffle-symbolic',
-            () => { this._mpris.toggleShuffle(); this._refreshLive(); },
-            info.hasShuffle, false, info.shuffle));
-        // Repeat: cycles off → all → one. "Repeat one" uses the dedicated icon
-        // when the theme has it. Lit for both all and one.
-        let loopIcon = info.loopStatus === 'Track'
-            ? 'media-playlist-repeat-song-symbolic' : 'media-playlist-repeat-symbolic';
-        controls.add_child(mkBtn(
-            loopIcon,
-            () => { this._mpris.cycleLoop(); this._refreshLive(); },
-            info.hasLoop, false, info.loopStatus !== 'None'));
+        let prev = mkBtn(() => this._mpris.previous());
+        prev.icon.icon_name = 'media-skip-backward-symbolic';
+        let play = mkBtn(() => this._mpris.playPause(), true);
+        let next = mkBtn(() => this._mpris.next());
+        next.icon.icon_name = 'media-skip-forward-symbolic';
+        let shuffle = mkBtn(() => this._mpris.toggleShuffle());
+        shuffle.icon.icon_name = 'media-playlist-shuffle-symbolic';
+        let loop = mkBtn(() => this._mpris.cycleLoop());
+        controls.add_child(new St.Widget({ x_expand: true }));
+        let lyricsBtn = mkBtn(() => this._setMusicLyrics(!this._mediaUi?.lyricsOn));
+        lyricsBtn.icon.icon_name = 'media-view-subtitles-symbolic';
+        lyricsBtn.btn.accessible_name = 'Lyrics';
+        this._attachTrayTooltip?.(lyricsBtn.btn, 'Lyrics');
         mid.add_child(controls);
         body.add_child(mid);
 
-        // --- Volume knob (Cairo, scroll to change) ---
+        // --- Player view: volume knob (Cairo, scroll to change) ---
         let knobCol = new St.BoxLayout({ style_class: 'nook-knob-col', vertical: true, y_align: Clutter.ActorAlign.CENTER });
         let knob = new Knob(74);
         knob.setValue(this._system.volume / 100);
-        // Scroll over the knob nudges the volume ±4%.
         let knobBtn = new St.Button({ style_class: 'nook-knob-btn', reactive: true, can_focus: false });
         knobBtn.set_child(knob);
+        let knobOverlay = new St.Bin({ style_class: 'nook-knob-value', x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
+        let knobValue = new St.Label({ text: String(this._system.volume), style_class: 'nook-knob-num' });
+        knobOverlay.set_child(knobValue);
+        this._knobValue = knobValue;
+        // Scroll over the knob nudges the volume ±4%. The knob repaints right
+        // away; the mixer's notify then lands in _onVolumeChanged, which only
+        // touches these two actors.
         knobBtn.connect('scroll-event', (a, e) => {
             let dir = e.get_scroll_direction();
-            let delta = (dir === Clutter.ScrollDirection.UP) ? 4 : (dir === Clutter.ScrollDirection.DOWN) ? -4 : 0;
+            let delta = 0;
+            if (dir === Clutter.ScrollDirection.UP) delta = 4;
+            else if (dir === Clutter.ScrollDirection.DOWN) delta = -4;
+            else if (dir === Clutter.ScrollDirection.SMOOTH) {
+                let [, dy] = e.get_scroll_delta();
+                delta = Math.round(-dy * 4);
+            }
             if (delta) {
                 let v = Math.max(0, Math.min(100, this._system.volume + delta));
                 this._system.setVolume(v);
                 knob.setValue(v / 100);
-                this._knobValue.set_text(String(v));
+                knobValue.set_text(String(v));
             }
             return Clutter.EVENT_STOP;
         });
-        let knobOverlay = new St.Bin({ style_class: 'nook-knob-value', x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
-        this._knobValue = new St.Label({ text: String(this._system.volume), style_class: 'nook-knob-num' });
-        knobOverlay.set_child(this._knobValue);
-        // Stack the number over the drawn knob.
         let knobStack = new St.Widget({ layout_manager: new Clutter.BinLayout() });
         knobStack.add_child(knobBtn);
         knobStack.add_child(knobOverlay);
@@ -2188,77 +2793,166 @@ export const NotchNux = GObject.registerClass({
 
         panel.add_child(body);
 
-        // --- Timeline scrubber (below the controls & knob) ---
-        // Aligned to start where the track title starts — i.e. indented past the
-        // vinyl by the vinyl width (140) plus the media body's 20px spacing — and
-        // running to the knob's right edge. Scroll anywhere on it to move
-        // ahead / back; the fill and time labels update live via a 1s tick.
-        // 156 = 140 (vinyl) + 20 (body spacing) − 4 (the timeline's own left
-        // padding) so the bar's visible edge lines up with the title glyphs.
+        // --- Lyrics view: the synced-lyrics window ---
+        let lyrics = this._buildLyricsBlock(lyricsBadge);
+        lyrics.visible = false;
+        panel.add_child(lyrics);
+
+        // --- Timeline scrubber. In the player view it's indented to line up
+        // with the title: 156 = 140 (vinyl) + 20 (body spacing) − 4 (padding).
         let timelineRow = new St.BoxLayout({ vertical: false, x_expand: true });
-        timelineRow.add_child(new St.Widget({ width: 156 }));
-        let timeline = this._buildMediaTimeline(info);
+        let timelineIndent = new St.Widget({ width: 156 });
+        timelineRow.add_child(timelineIndent);
+        let timeline = this._buildMediaTimeline();
         timeline.x_expand = true;
         timelineRow.add_child(timeline);
         panel.add_child(timelineRow);
 
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
+
+        this._mediaUi = {
+            vinyl, eq, artDisc, cover, artUrl: null,
+            eyebrow: eyebrowLabel, title: titleLabel, artist: artistLabel,
+            prev, play, next, shuffle, loop, lyricsBtn, knob, knobValue,
+            vinylWrap, coverWrap, knobCol, lyrics, lyricsBadge, timelineIndent,
+            lyricsOn: false, lyricsKey: undefined,
+        };
+        lyricsBtn.btn.visible = false;
+        this._applyMusicView(this._config.musicLyrics, false);
+        this._updateMediaTab(info);
+    }
+
+    // Switch the Music tab between the player and lyrics views, remembering
+    // the choice. The swap is a short cross-fade plus the usual height spring.
+    _setMusicLyrics(on) {
+        if (!this._mediaUi || this._mediaUi.lyricsOn === on)
+            return;
+        this._writeConfig(c => c.setMusicLyrics(on));
+        this._applyMusicView(on, true);
+        this._updateMediaTab(this._mpris.getActiveTrackInfo());
+        if (!on)
+            this._stopLyricsTick();
+    }
+
+    _applyMusicView(on, animate) {
+        let ui = this._mediaUi;
+        ui.lyricsOn = on;
+        ui.vinylWrap.visible = !on;
+        ui.knobCol.visible = !on;
+        ui.coverWrap.visible = on;
+        ui.lyrics.visible = on;
+        ui.timelineIndent.visible = !on;
+        if (!on)
+            ui.lyricsBadge.visible = false;
+        ui.lyricsBtn.icon.set_style(on ? `color: ${accentHex()};` : null);
+        ui.lyricsBtn.btn.set_style(on ? `background-color: rgba(${accentRgbStr()}, 0.16);` : null);
+        if (on) ui.vinyl.stopSpin();
+        if (!animate || !St.Settings.get().enable_animations)
+            return;
+        // New view arrives from slightly below and fades in; the outgoing one
+        // is simply hidden (the notch's own height spring carries the change).
+        for (let a of on ? [ui.coverWrap, ui.lyrics] : [ui.vinylWrap, ui.knobCol]) {
+            a.remove_all_transitions();
+            a.opacity = 0;
+            a.translation_y = 6;
+            a.ease({ opacity: 255, translation_y: 0, duration: 240, mode: Clutter.AnimationMode.EASE_OUT_CUBIC });
+        }
+        this._resizeToContent();
+    }
+
+    // Re-stamp the Music tab from fresh track info without rebuilding it. The
+    // old code tore down the vinyl, knob, timeline and art on every MPRIS,
+    // volume, weather and calendar event — scrolling the volume knob destroyed
+    // the knob under the cursor on each tick.
+    _updateMediaTab(info) {
+        let ui = this._mediaUi;
+        if (!ui)
+            return;
+        this._mediaInfo = info;
+        let playing = info.status === 'Playing';
+        ui.eyebrow.set_text(playing ? 'NOW PLAYING' : (info.hasMedia ? 'PAUSED' : 'NO MEDIA'));
+        if (playing) {
+            if (!ui.lyricsOn) ui.vinyl.startSpin();
+            ui.eq.start();
+        } else {
+            ui.vinyl.stopSpin();
+            ui.eq.stop();
+        }
+
+        // Coerce defensively: an un-unwrapped GLib.Variant would throw in set_text.
+        ui.title.set_text(String(info.hasMedia ? info.title : 'Nothing playing'));
+        ui.artist.set_text(String(info.hasMedia ? info.artist : 'Start something in your player'));
+
+        ui.play.icon.icon_name = playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic';
+        ui.play.btn.reactive = info.hasMedia && info.canPlay !== false;
+        ui.prev.btn.reactive = info.hasMedia && info.canPrev !== false;
+        ui.next.btn.reactive = info.hasMedia && info.canNext !== false;
+        // Shuffle / repeat: lit (accent) when engaged, dimmed when unsupported.
+        let lit = on => (on ? `color: ${accentHex()};` : null);
+        ui.shuffle.btn.reactive = !!info.hasShuffle;
+        ui.shuffle.icon.set_style(lit(info.shuffle));
+        ui.loop.btn.reactive = !!info.hasLoop;
+        ui.loop.icon.icon_name = info.loopStatus === 'Track'
+            ? 'media-playlist-repeat-song-symbolic' : 'media-playlist-repeat-symbolic';
+        ui.loop.icon.set_style(lit(info.hasLoop && info.loopStatus !== 'None'));
+        ui.knob.setValue(this._system.volume / 100);
+        ui.knobValue.set_text(String(this._system.volume));
+
+        if (info.albumArt !== ui.artUrl) {
+            ui.artUrl = info.albumArt;
+            ui.artDisc.setArtPath(null);
+            ui.cover.setArtPath(null);
+            this._loadAlbumArt(info.albumArt, ui.artDisc);
+            this._loadAlbumArt(info.albumArt, ui.cover);
+        }
+        this._syncTimeline(info);
+        // Show the lyrics button only when this song has lyrics (may switch
+        // the view back to the player), then feed the lyrics view if it's up.
+        this._syncLyricsAvailability(info);
+        if (ui.lyricsOn)
+            this._lyricsUi?.onTrack(info);
     }
 
     // Full-width playback timeline placed below the media body. Shows elapsed /
-    // total time with an accent-filled progress bar, and seeks on scroll.
-    _buildMediaTimeline(info) {
-        let lenUs = Number(info.length) || 0;
-        this._timelineLenUs = lenUs;
-        this._timelineTrackId = info.trackId ?? null;
-        // Seed the position from a live read so the bar isn't empty on open.
-        // Async: the reply lands a few ms later and just repaints the fill.
+    // total time with an accent-filled progress bar, and seeks on scroll. Built
+    // empty; _syncTimeline() fills it from the current track.
+    _buildMediaTimeline() {
+        this._timelineKey = null;
         this._timelinePosUs = 0;
-        if (info.hasMedia) {
-            this._mpris.getPositionAsync(pos => {
-                try {
-                    this._timelinePosUs = pos;
-                    this._updateTimelineFill();
-                } catch (e) {
-                    // The tab may have been rebuilt/destroyed before the reply.
-                }
-            });
-        }
+        this._timelineLenUs = 0;
+        this._timelineTrackId = null;
 
         let wrap = new St.BoxLayout({ style_class: 'nook-timeline', vertical: true, x_expand: true });
 
         // The track is a reactive button so it captures scroll events across the
-        // whole width. The base is a full-width bar (sized by the parent box);
-        // the accent fill is a child of the base, absolutely positioned at its
-        // left edge (x=0) via a FixedLayout, so it grows strictly left→right.
-        // (A BinLayout centres a fixed-width child regardless of x_align on some
-        // Clutter versions, which is what floated the fill in the middle.)
-        let trackBtn = new St.Button({ style_class: 'nook-timeline-track', reactive: info.hasMedia, can_focus: false, x_expand: true });
+        // whole width. The accent fill spans the whole base and shows progress
+        // through scale_x anchored at the left edge: a transform needs no
+        // relayout, so per-second updates never dirty the allocation (resizing
+        // the fill from a notify::allocation handler re-queued layout mid-pass
+        // and spammed "needs an allocation"), and the bar can glide smoothly.
+        let trackBtn = new St.Button({ style_class: 'nook-timeline-track', can_focus: false, x_expand: true });
         let base = new St.Widget({
             style_class: 'nook-timeline-base',
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
-            layout_manager: new Clutter.FixedLayout() });
-        let fill = new St.Widget({ style_class: 'nook-timeline-fill' });
+            layout_manager: new Clutter.BinLayout() });
+        let fill = new St.Widget({ style_class: 'nook-timeline-fill', x_expand: true, y_expand: true });
         fill.set_style(`background-color: ${accentHex()};`);
-        // Anchor the fill to the base's top-left; only its width changes as the
-        // track progresses, so it always fills from the left.
-        fill.set_position(0, 0);
+        fill.set_pivot_point(0, 0.5);
+        fill.scale_x = 0;
         base.add_child(fill);
         trackBtn.set_child(base);
         this._timelineFill = fill;
         this._timelineBase = base;
-        // The base width is unknown until allocated; recompute the fill once the
-        // base gets its real size (and on any later resize).
-        base.connect('notify::width', () => this._updateTimelineFill());
-        base.connect('notify::height', () => this._updateTimelineFill());
+        this._timelineTrack = trackBtn;
 
         let labels = new St.BoxLayout({ style_class: 'nook-timeline-labels', vertical: false, x_expand: true });
-        let elapsed = new St.Label({ text: this._fmtTime(this._timelinePosUs), style_class: 'nook-timeline-elapsed' });
-        let total = new St.Label({ text: lenUs > 0 ? this._fmtTime(lenUs) : '--:--', style_class: 'nook-timeline-total', x_align: Clutter.ActorAlign.END, x_expand: true });
+        let elapsed = new St.Label({ text: '0:00', style_class: 'nook-timeline-elapsed' });
+        let total = new St.Label({ text: '--:--', style_class: 'nook-timeline-total', x_align: Clutter.ActorAlign.END, x_expand: true });
         labels.add_child(elapsed);
         labels.add_child(total);
         this._timelineElapsed = elapsed;
+        this._timelineTotal = total;
 
         wrap.add_child(trackBtn);
         wrap.add_child(labels);
@@ -2266,7 +2960,7 @@ export const NotchNux = GObject.registerClass({
         // Scroll to scrub: one notch = ±5s, throttled so a spin doesn't spam
         // D-Bus. Only meaningful when we know the track length and can seek.
         trackBtn.connect('scroll-event', (actor, event) => {
-            if (!info.hasMedia || this._timelineLenUs <= 0)
+            if (!this._mediaInfo?.hasMedia || this._timelineLenUs <= 0)
                 return Clutter.EVENT_PROPAGATE;
             let now = GLib.get_monotonic_time();
             if (now - this._lastTimelineScrollAt < 60000)
@@ -2288,11 +2982,38 @@ export const NotchNux = GObject.registerClass({
             this._scrubTimeline(step * 1000000);
             return Clutter.EVENT_STOP;
         });
-
-        this._updateTimelineFill();
-        if (info.status === 'Playing' && lenUs > 0)
-            this._startTimelineTick();
         return wrap;
+    }
+
+    // Point the timeline at `info`'s track: reset on a track change, resync the
+    // position from the player, and run the 1 s tick only while playing.
+    _syncTimeline(info) {
+        if (!this._timelineBase)
+            return;
+        let key = `${info.trackId}|${info.title}|${info.length}`;
+        if (key !== this._timelineKey) {
+            this._timelineKey = key;
+            this._timelinePosUs = 0;
+        }
+        this._timelineLenUs = Number(info.length) || 0;
+        this._timelineTrackId = info.trackId ?? null;
+        this._timelineTotal.set_text(this._timelineLenUs > 0 ? this._fmtTime(this._timelineLenUs) : '--:--');
+        this._timelineTrack.reactive = !!info.hasMedia;
+        if (info.hasMedia) {
+            this._mpris.getPositionAsync(pos => {
+                if (this._timelineKey !== key || !this._timelineBase)
+                    return;
+                this._timelinePosUs = pos;
+                this._updateTimelineFill();
+            });
+        }
+        this._updateTimelineFill();
+        if (info.status === 'Playing' && this._timelineLenUs > 0) {
+            if (!this._timelineTickId)
+                this._startTimelineTick();
+        } else {
+            this._stopTimelineTick();
+        }
     }
 
     // Move the playhead by deltaUs (µs, signed), clamp to the track, update the
@@ -2309,41 +3030,39 @@ export const NotchNux = GObject.registerClass({
             this._mpris.seek(deltaUs); // fall back to relative seek
     }
 
-    // Repaint the fill width and elapsed label from the cached position.
-    _updateTimelineFill() {
+    // Repaint the progress fill and elapsed label from the cached position.
+    // `glideMs` > 0 eases the bar there linearly (the 1 s tick), so playback
+    // reads as continuous motion instead of a once-a-second jump.
+    _updateTimelineFill(glideMs = 0) {
         let len = this._timelineLenUs;
         let frac = len > 0 ? Math.max(0, Math.min(1, this._timelinePosUs / len)) : 0;
-        if (this._timelineFill && this._timelineBase) {
-            let w = this._timelineBase.get_width();
-            let h = this._timelineBase.get_height();
-            // Dimensions are 0 until the base is allocated; the base's
-            // notify::width / notify::height handlers re-invoke this once it has
-            // real dimensions. The fill is a FixedLayout child of the base pinned
-            // at (0,0), so we set its width (fraction of the base) and match its
-            // height to the base so the accent bar fills strictly left→right.
-            if (w > 0) {
-                this._timelineFill.set_width(Math.round(w * frac));
-                if (h > 0)
-                    this._timelineFill.set_height(h);
-                this._timelineFill.set_position(0, 0);
-            }
+        let fill = this._timelineFill;
+        if (fill) {
+            fill.remove_transition('scale-x');
+            if (glideMs > 0)
+                fill.ease({ scale_x: frac, duration: glideMs, mode: Clutter.AnimationMode.LINEAR });
+            else
+                fill.scale_x = frac;
         }
-        if (this._timelineElapsed)
-            this._timelineElapsed.set_text(this._fmtTime(this._timelinePosUs));
+        this._timelineElapsed?.set_text(this._fmtTime(this._timelinePosUs));
     }
 
     _startTimelineTick() {
         this._stopTimelineTick();
+        let ticks = 0;
         this._timelineTickId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
-            // Advance locally by 1s; periodically resync from the player to
-            // correct drift (and catch external seeks).
-            this._timelinePosUs += 1000000;
-            if (this._timelinePosUs >= this._timelineLenUs && this._timelineLenUs > 0) {
-                this._timelinePosUs = this._timelineLenUs;
-                this._updateTimelineFill();
-                return GLib.SOURCE_CONTINUE;
+            // Advance locally by 1 s and glide the bar; every 10 s resync from
+            // the player to correct drift and catch external seeks.
+            this._timelinePosUs = Math.min(this._timelinePosUs + 1000000,
+                this._timelineLenUs > 0 ? this._timelineLenUs : Infinity);
+            this._updateTimelineFill(1000);
+            if (++ticks % 10 === 0) {
+                let key = this._timelineKey;
+                this._mpris.getPositionAsync(pos => {
+                    if (this._timelineKey === key && this._timelineFill && pos > 0)
+                        this._timelinePosUs = pos;
+                });
             }
-            this._updateTimelineFill();
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -2368,324 +3087,6 @@ export const NotchNux = GObject.registerClass({
     // ============================================================
     // Tab: System
     // ============================================================
-    _renderSystemTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel', vertical: true, x_expand: true, y_expand: true });
-
-        // --- Radial meters: CPU / RAM / SWAP / DISK / BRIGHTNESS ---
-        let meters = new St.BoxLayout({ style_class: 'nook-meters-row', vertical: false, x_expand: true });
-        // `onScroll(delta)` (optional) makes the tile an interactive knob: it
-        // returns the new percentage to display, or null to leave it unchanged.
-        // `displayText` (optional) overrides the centered "NN%" readout — used
-        // by the network tile which shows a rate string ("1.2 MB/s") while the
-        // ring still fills proportionally to `pct`.
-        // `displayText` may be a string ("1.2 MB/s") for a single readout, or an
-        // array of strings (["↓ 0.4 KB/s", "↑ 0.4 KB/s"]) to stack each as its
-        // own label in a tight 2px-spaced box — used by the network tile.
-        // `subRates` (optional) is an array of strings rendered as a tidy
-        // stacked block *below* the ring (above the label) — used by the NET
-        // tile so the ↓/↑ rates get their own breathing room instead of being
-        // crammed into the ring center.
-        let mkMeter = (label, pct, icon, color = ACCENT, onScroll = null, displayText = null, subRates = null) => {
-            let t = new St.BoxLayout({ style_class: 'nook-meter-tile', vertical: true, x_expand: true, x_align: Clutter.ActorAlign.CENTER });
-            let ring = new RingMeter(58, color);
-            ring.setValue(pct / 100);
-
-            // Build the centered readout actor.
-            let readout;
-            let numLabel = null;
-            if (Array.isArray(displayText)) {
-                // Each rate on its own line as a separate label; 2px gap between.
-                readout = new St.BoxLayout({ vertical: true, style_class: 'nook-meter-rates',
-                    x_align: Clutter.ActorAlign.CENTER });
-                for (let line of displayText)
-                    readout.add_child(new St.Label({ text: line,
-                        style_class: 'nook-meter-num nook-meter-num-sm',
-                        x_align: Clutter.ActorAlign.CENTER }));
-            } else {
-                numLabel = new St.Label({ text: displayText !== null ? displayText : `${pct}%`, style_class: displayText !== null ? 'nook-meter-num nook-meter-num-sm' : 'nook-meter-num' });
-                readout = numLabel;
-            }
-            let stack = new St.Widget({ layout_manager: new Clutter.BinLayout() });
-            stack.add_child(ring);
-            let numBin = new St.Bin({ x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
-            numBin.set_child(readout);
-            stack.add_child(numBin);
-
-            if (onScroll) {
-                // Wrap the ring in a reactive button so scrolling nudges the value.
-                let btn = new St.Button({ style_class: 'nook-meter-knob-btn', reactive: true, can_focus: false });
-                btn.set_child(stack);
-                btn.connect('scroll-event', (a, e) => {
-                    let dir = e.get_scroll_direction();
-                    let delta = (dir === Clutter.ScrollDirection.UP) ? 5 : (dir === Clutter.ScrollDirection.DOWN) ? -5 : 0;
-                    if (delta) {
-                        let v = onScroll(delta);
-                        if (v !== null && v !== undefined) {
-                            ring.setValue(v / 100);
-                            numLabel.set_text(`${v}%`);
-                        }
-                    }
-                    return Clutter.EVENT_STOP;
-                });
-                t.add_child(btn);
-            } else {
-                t.add_child(stack);
-            }
-
-            // Optional rates block below the ring (NET tile).
-            if (Array.isArray(subRates) && subRates.length) {
-                let sub = new St.BoxLayout({ vertical: true, style_class: 'nook-meter-subrates',
-                    x_align: Clutter.ActorAlign.CENTER });
-                for (let line of subRates)
-                    sub.add_child(new St.Label({ text: line, style_class: 'nook-meter-subrate',
-                        x_align: Clutter.ActorAlign.CENTER }));
-                t.add_child(sub);
-            }
-
-            let lbl = new St.BoxLayout({ style_class: 'nook-meter-label-row', x_align: Clutter.ActorAlign.CENTER });
-            lbl.add_child(new St.Icon({ icon_name: icon, icon_size: 13, y_align: Clutter.ActorAlign.CENTER }));
-            lbl.add_child(new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER }));
-            t.add_child(lbl);
-            return t;
-        };
-        meters.add_child(mkMeter('CPU', this._system.getCpuUsage(), 'system-run-symbolic'));
-        meters.add_child(mkMeter('RAM', this._system.getRamUsage(), 'media-flash-symbolic'));
-        meters.add_child(mkMeter('SWAP', this._system.getSwapUsage(), 'media-flash-symbolic'));
-        meters.add_child(mkMeter('DISK', this._system.getDiskUsage(), 'drive-harddisk-symbolic'));
-        // Live network throughput as two separate cards — download and upload —
-        // each its own ring meter. Rings fill against a soft 12.5 MB/s ceiling
-        // (~100 Mbit); the center readout shows the rate split into value + unit
-        // on two lines so it fits the ring cleanly.
-        const NET_CEIL = 12.5 * 1024 * 1024;
-        let downRate = this._system.getNetDownRate();
-        let upRate = this._system.getNetUpRate();
-        let downPct = Math.min(100, Math.round((downRate / NET_CEIL) * 100));
-        let upPct = Math.min(100, Math.round((upRate / NET_CEIL) * 100));
-        let downLabel = this._system.getNetDownLabel();
-        let upLabel = this._system.getNetUpLabel();
-        // Ring center: rate split into value + unit on two lines.
-        let splitRate = (r) => { let i = r.indexOf(' '); return i < 0 ? [r, ''] : [r.slice(0, i), r.slice(i + 1)]; };
-        let downTile = mkMeter('DOWN', downPct, 'go-down-symbolic', ACCENT, null, splitRate(downLabel));
-        downTile.add_style_class_name('nook-meter-tile-net');
-        meters.add_child(downTile);
-        let upTile = mkMeter('UP', upPct, 'go-up-symbolic', ACCENT, null, splitRate(upLabel));
-        upTile.add_style_class_name('nook-meter-tile-net');
-        meters.add_child(upTile);
-        // Brightness as an interactive knob-tile. When no backend reports a
-        // brightness value we show 0% but still allow scroll (which no-ops).
-        let bright = this._system.getBrightness();
-        meters.add_child(mkMeter('LIGHT', bright === null ? 0 : bright, 'display-brightness-symbolic', AMBER, (delta) => {
-            let cur = this._system.getBrightness();
-            if (cur === null) cur = 50;
-            let v = Math.max(0, Math.min(100, cur + delta));
-            this._system.setBrightness(v);
-            return v;
-        }));
-        panel.add_child(meters);
-
-        // --- Lower row: devices card + quick-toggle grid ---
-        let lower = new St.BoxLayout({ style_class: 'nook-tray-lower', vertical: false, x_expand: true });
-
-        // Devices card (battery levels of wireless accessories + this machine).
-        // x_expand lets it flex to fill the space left by the fixed-width toggle
-        // grid instead of overrunning the panel with a hard-coded width.
-        let devCard = new St.BoxLayout({ style_class: 'nook-devices-card', vertical: true, x_expand: true });
-        // Header row: eyebrow on the left, Bluetooth radio toggle on the right.
-        let devHead = new St.BoxLayout({ style_class: 'nook-devices-head', vertical: false, x_expand: true });
-        devHead.add_child(new St.Label({ text: 'DEVICES', style_class: 'nook-card-eyebrow',
-            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-        let btOn = this._system.getBluetoothPowered();
-        let btToggle = new St.Button({
-            style_class: 'nook-mini-toggle' + (btOn ? ' nook-mini-toggle-on' : ''),
-            reactive: true, can_focus: true, y_align: Clutter.ActorAlign.CENTER });
-        btToggle.set_child(new St.Icon({
-            icon_name: btOn ? 'bluetooth-active-symbolic' : 'bluetooth-disabled-symbolic',
-            icon_size: 14 }));
-        btToggle.connect('clicked', () => {
-            btToggle.reactive = false;
-            this._system.setBluetoothRadio(!btOn, () => this._scheduleTrayReRender());
-        });
-        devHead.add_child(btToggle);
-        devCard.add_child(devHead);
-
-        // The bluez list is fetched async: the first call returns an empty
-        // snapshot and the paired/connected devices land a tick later. Pass a
-        // callback so the card re-renders as soon as they populate instead of
-        // showing only "This device" until the next 3s poll.
-        let devices = this._system.getBluetoothDevices(() => this._scheduleTrayReRender());
-        let bat = this._system.getBatteryInfo();
-        let rows = [{ name: 'This device', icon: 'battery-good-symbolic', pct: bat.percentage }];
-        // Show every paired/connected accessory inline (like the pair overlay,
-        // minus live scanning) so the user can connect straight from the card.
-        // The list grows with content and scrolls past ~4 rows.
-        for (let d of devices)
-            rows.push({ name: d.name, icon: d.icon, pct: d.percentage,
-                status: d.connected ? 'Connected' : 'Paired',
-                // Carry the fields needed to toggle the connection on click.
-                dbusPath: d.dbusPath, connected: d.connected, bluetooth: true });
-        if (rows.length === 1)
-            rows.push({ name: 'No wireless devices', icon: 'bluetooth-disconnected-symbolic', pct: null });
-
-        // Rows are added straight to the card (a ScrollView collapses to zero
-        // height in this side-by-side layout). To keep the card compact we cap
-        // at DEV_CAP rows and add a "+N more…" line that opens the full list in
-        // the pair overlay.
-        const DEV_CAP = 3;
-        let devList = new St.BoxLayout({ style_class: 'nook-devices-list', vertical: true, x_expand: true });
-        for (let d of rows.slice(0, DEV_CAP))
-            devList.add_child(this._buildDeviceRow(d));
-        let devExtra = rows.length - DEV_CAP;
-        if (devExtra > 0)
-            devList.add_child(this._buildMoreRow(`+${devExtra} more…`, () => this._openBluetoothScanOverlay()));
-        devCard.add_child(devList);
-
-        // Footer: scan for and pair a new device via the in-notch overlay.
-        let addDev = new St.Button({ style_class: 'nook-add-row', reactive: true, x_expand: true, can_focus: true });
-        let addDevInner = new St.BoxLayout({ vertical: false, x_expand: true });
-        addDevInner.add_child(new St.Icon({ icon_name: 'list-add-symbolic', icon_size: 14,
-            style_class: 'nook-add-icon', y_align: Clutter.ActorAlign.CENTER }));
-        addDevInner.add_child(new St.Label({ text: 'Add device…', style_class: 'nook-add-label',
-            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-        addDev.set_child(addDevInner);
-        addDev.connect('clicked', () => this._openBluetoothScanOverlay());
-        devCard.add_child(addDev);
-
-        // devCard is added to the left column further down (stacked above WiFi)
-        // rather than straight into the lower row, so the two cards together
-        // fill the toggle cluster's height with no gap below "Add device…".
-
-        // Quick-toggles arranged in a plus around a central circular airplane
-        // button. Each arm is a rounded tile whose center-facing corners are
-        // heavily rounded, so the circle nestles into the cavity between them.
-        let dndSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
-        let isDnd = !dndSettings.get_boolean('show-banners');
-
-        // Cluster geometry (px). Arms sit N/E/S/W; the circle overlaps them.
-        const ARM_W = 96, ARM_H = 58;          // arm tile size (horizontal arms)
-        const V_ARM_W = 58, V_ARM_H = 96;      // vertical arm tile size
-        const CIRCLE = 72;                     // center circle diameter
-        // Gap kept between each arm's inner edge and the circle so the tiles
-        // don't cut into it.
-        const GAP = 6;
-        // Footprint sized so the circle sits centred with an arm + gap on each
-        // side: horizontal = V_ARM_W + GAP + CIRCLE + GAP + V_ARM_W, and the
-        // vertical run of arm + gap + circle + gap + arm.
-        const CL_W = V_ARM_W + GAP + CIRCLE + GAP + V_ARM_W;   // 200
-        const CL_H = ARM_H + GAP + CIRCLE + GAP + ARM_H;       // 200
-        const cx = CL_W / 2, cy = CL_H / 2;
-
-        let cluster = new St.Widget({ style_class: 'nook-cluster', layout_manager: new Clutter.FixedLayout() });
-        cluster.set_size(CL_W, CL_H);
-
-        let mkArm = (icon, name, sub, active, corner, cb) => {
-            let cls = 'nook-toggle nook-arm nook-arm-' + corner + (active ? ' nook-toggle-on' : '');
-            let b = new St.Button({ style_class: cls, reactive: true, x_expand: true });
-            let col = new St.BoxLayout({ vertical: true, x_expand: true,
-                x_align: Clutter.ActorAlign.CENTER });
-            col.add_child(new St.Icon({ icon_name: icon, icon_size: 18,
-                style_class: 'nook-toggle-icon', x_align: Clutter.ActorAlign.CENTER }));
-            let txt = new St.BoxLayout({ vertical: true, style_class: 'nook-toggle-text',
-                x_expand: true, x_align: Clutter.ActorAlign.CENTER });
-            txt.add_child(new St.Label({ text: name, style_class: 'nook-toggle-name',
-                x_align: Clutter.ActorAlign.CENTER, x_expand: true }));
-            txt.add_child(new St.Label({ text: sub, style_class: 'nook-toggle-sub',
-                x_align: Clutter.ActorAlign.CENTER, x_expand: true }));
-            col.add_child(txt);
-            b.set_child(col);
-            if (cb) b.connect('clicked', cb);
-            return b;
-        };
-
-        // Inner edge of each arm, offset from the circle so tiles never overlap it.
-        const halfC = CIRCLE / 2;
-
-        let muted = this._system.isMuted;
-        // TOP arm — Sound (cavity on its bottom edge).
-        let top = mkArm(muted ? 'audio-volume-muted-symbolic' : 'audio-volume-high-symbolic',
-            muted ? 'Muted' : 'Sound', muted ? 'Off' : `${this._system.volume}%`, muted, 'top', () => {
-            this._system.setMuted(!this._system.isMuted); this._renderActiveTab();
-        });
-        top.set_size(ARM_W, ARM_H);
-        top.set_position(Math.round(cx - ARM_W / 2), Math.round(cy - halfC - GAP - ARM_H));
-
-        // BOTTOM arm — Focus (cavity on its top edge).
-        let bottom = mkArm(isDnd ? 'notifications-disabled-symbolic' : 'preferences-system-notifications-symbolic',
-            'Focus', isDnd ? 'On' : 'Off', isDnd, 'bottom', () => {
-            dndSettings.set_boolean('show-banners', isDnd); this._renderActiveTab();
-        });
-        bottom.set_size(ARM_W, ARM_H);
-        bottom.set_position(Math.round(cx - ARM_W / 2), Math.round(cy + halfC + GAP));
-
-        // LEFT arm — Screenshot (cavity on its right edge).
-        let left = mkArm('accessories-screenshot-symbolic', 'Shot', 'Capture', false, 'left', () => {
-            this._collapseImmediately(); Main.screenshotUI.open();
-        });
-        left.set_size(V_ARM_W, V_ARM_H);
-        left.set_position(Math.round(cx - halfC - GAP - V_ARM_W), Math.round(cy - V_ARM_H / 2));
-
-        // RIGHT arm — Lock (cavity on its left edge).
-        let right = mkArm('preferences-desktop-screensaver-symbolic', 'Lock', 'Screen', false, 'right', () => {
-            this._collapseImmediately(); Main.screenShield.lock(true);
-        });
-        right.set_size(V_ARM_W, V_ARM_H);
-        right.set_position(Math.round(cx + halfC + GAP), Math.round(cy - V_ARM_H / 2));
-
-        // CENTER — circular airplane-mode toggle, on top of the arms.
-        let airOn = this._system.getAirplaneMode();
-        let center = new St.Button({ style_class: 'nook-air-btn' + (airOn ? ' nook-air-on' : ''), reactive: true });
-        center.set_size(CIRCLE, CIRCLE);
-        center.set_position(Math.round(cx - CIRCLE / 2), Math.round(cy - CIRCLE / 2));
-        let airCol = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
-        airCol.add_child(new St.Icon({ icon_name: 'airplane-mode-symbolic', icon_size: 22, style_class: 'nook-air-icon', x_align: Clutter.ActorAlign.CENTER }));
-        airCol.add_child(new St.Label({ text: airOn ? 'On' : 'Off', style_class: 'nook-air-sub', x_align: Clutter.ActorAlign.CENTER }));
-        center.set_child(airCol);
-        center.connect('clicked', () => {
-            this._system.setAirplaneMode(!this._system.getAirplaneMode());
-            this._renderActiveTab();
-        });
-
-        cluster.add_child(top);
-        cluster.add_child(bottom);
-        cluster.add_child(left);
-        cluster.add_child(right);
-        cluster.add_child(center);
-
-        // Two-column lower area: the left column stacks DEVICES over WIFI so
-        // together they fill the right column's height (toggle cluster + TOP
-        // BAR) with no dead space. The right column stacks the cluster over the
-        // mirrored top-bar row.
-        let leftCol = new St.BoxLayout({ style_class: 'nook-tray-leftcol', vertical: true, x_expand: true });
-        leftCol.add_child(devCard);
-        let wifiCard = this._buildWifiCard();
-        if (wifiCard)
-            leftCol.add_child(wifiCard);
-
-        let rightCol = new St.BoxLayout({ style_class: 'nook-tray-rightcol', vertical: true });
-        rightCol.add_child(cluster);
-
-        // Mirrored top-bar indicators (extensions + system status area).
-        // Non-destructive: the real panel keeps its actors; we render a row of
-        // icons that mirror Main.panel.statusArea and open each indicator's own
-        // menu when clicked. Lets the notch stand in for the (often hidden) bar.
-        if (this._config.isFeatureEnabled('mirrorTray')) {
-            let tray = this._buildTrayMirror();
-            if (tray) {
-                tray.add_style_class_name('nook-tray-mirror-beside');
-                // Grow to fill the space left under the cluster so its height
-                // matches the WiFi card beside it instead of hugging one icon row.
-                tray.y_expand = true;
-                tray.y_align = Clutter.ActorAlign.FILL;
-                rightCol.add_child(tray);
-            }
-        }
-
-        lower.add_child(leftCol);
-        lower.add_child(rightCol);
-        panel.add_child(lower);
-
-        this._contentContainer.add_child(panel);
-    }
-
     // A muted "+N more…" row that reveals the full list in an overlay. Used to
     // cap the DEVICES / WIFI cards at a few rows without a (collapsing)
     // ScrollView.
@@ -2706,7 +3107,7 @@ export const NotchNux = GObject.registerClass({
             ? new St.Button({ style_class: 'nook-device-row nook-device-row-btn', reactive: true, x_expand: true, can_focus: true })
             : new St.BoxLayout({ style_class: 'nook-device-row', vertical: false, x_expand: true });
         let inner = clickable
-            ? new St.BoxLayout({ vertical: false, x_expand: true })
+            ? new St.BoxLayout({ style_class: 'nook-device-row-inner', vertical: false, x_expand: true })
             : row;
         inner.add_child(new St.Icon({ icon_name: d.icon, icon_size: 16, style_class: 'nook-device-icon', y_align: Clutter.ActorAlign.CENTER }));
         inner.add_child(new St.Label({ text: d.name, style_class: 'nook-device-name', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
@@ -2740,156 +3141,8 @@ export const NotchNux = GObject.registerClass({
             let want = !d.connected;
             row.connect('clicked', () => {
                 row.reactive = false;
-                this._system.setBluetoothConnected(d.dbusPath, want, (ok) => {
-                    this._renderActiveTab();
-                });
-            });
-        }
-        return row;
-    }
-
-    // WiFi status + toggle card for the Tray tab, or null when there's no WiFi
-    // hardware (or NM isn't up yet). Clicking the row toggles the WiFi radio; the
-    // hotspot button starts/stops an AP-mode connection. Sits under the devices
-    // card; kept compact so it and the top-bar row share one strip.
-    _buildWifiCard() {
-        let info = this._system.getWifiInfo();
-        if (!info.available) return null;
-
-        let card = new St.BoxLayout({ style_class: 'nook-wifi-card', vertical: true, x_expand: true });
-
-        // Header: eyebrow + hotspot button + Wi-Fi radio toggle. The radio and
-        // hotspot are explicit controls now; the network list below handles
-        // connecting to individual networks.
-        let head = new St.BoxLayout({ style_class: 'nook-wifi-head', vertical: false, x_expand: true });
-        head.add_child(new St.Label({ text: 'WIFI', style_class: 'nook-card-eyebrow',
-            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-
-        // Hotspot button — only meaningful while WiFi is on.
-        let hotBtn = new St.Button({
-            style_class: 'nook-wifi-hotspot' + (info.hotspot ? ' nook-wifi-hotspot-on' : ''),
-            reactive: info.enabled, can_focus: info.enabled, y_align: Clutter.ActorAlign.CENTER,
-        });
-        hotBtn.set_child(new St.Icon({ icon_name: 'network-wireless-hotspot-symbolic', icon_size: 15 }));
-        hotBtn.set_opacity(info.enabled ? 255 : 90);
-        hotBtn.connect('clicked', () => {
-            if (!info.enabled) return;
-            hotBtn.reactive = false;
-            this._system.setHotspotEnabled(!info.hotspot, (ok, detail) => {
-                if (ok && detail && detail.ssid)
-                    Main.notify('NotchNux Hotspot',
-                        `SSID: ${detail.ssid}\nPassword: ${detail.password}`);
-                // Warn when the client had to be dropped: this adapter can only
-                // share a channel for AP+client on 2.4 GHz, and we were on 5 GHz.
-                if (ok && detail && detail.concurrent === false)
-                    Main.notify('NotchNux Hotspot',
-                        'Wi-Fi was on a 5 GHz channel, which can\'t host a hotspot. ' +
-                        'The hotspot started on 2.4 GHz and the Wi-Fi connection was dropped ' +
-                        '(this adapter has a single radio).');
-                this._scheduleTrayReRender();
-            });
-        });
-        head.add_child(hotBtn);
-
-        // Wi-Fi radio toggle (mirrors the Bluetooth mini-toggle).
-        let wifiToggle = new St.Button({
-            style_class: 'nook-mini-toggle' + (info.enabled ? ' nook-mini-toggle-on' : ''),
-            reactive: true, can_focus: true, y_align: Clutter.ActorAlign.CENTER });
-        wifiToggle.set_child(new St.Icon({
-            icon_name: info.enabled ? 'network-wireless-signal-good-symbolic'
-                : 'network-wireless-offline-symbolic',
-            icon_size: 14 }));
-        wifiToggle.connect('clicked', () => {
-            wifiToggle.reactive = false;
-            this._system.setWifiEnabled(!info.enabled);
-            this._scheduleTrayReRender();
-        });
-        head.add_child(wifiToggle);
-        card.add_child(head);
-
-        // Off / hotspot / not-connected states have no network list, so they
-        // get a one-line status row. When actually connected we skip this and
-        // show the connected network as the first item of the list below
-        // (mirrors how DEVICES lists "This device" as a normal row).
-        if (!info.enabled || info.hotspot || !info.connected) {
-            let statusIcon = info.hotspot ? 'network-wireless-hotspot-symbolic'
-                : info.enabled ? 'network-wireless-signal-none-symbolic'
-                : 'network-wireless-offline-symbolic';
-            let primary = !info.enabled ? 'Wi-Fi Off'
-                : info.hotspot ? 'Hotspot'
-                : 'Not connected';
-            let secondary = !info.enabled ? 'Off'
-                : info.hotspot ? 'Sharing'
-                : 'On';
-            let statusRow = new St.BoxLayout({ style_class: 'nook-wifi-row', vertical: false, x_expand: true });
-            statusRow.add_child(new St.Icon({ icon_name: statusIcon, icon_size: 16, style_class: 'nook-wifi-icon', y_align: Clutter.ActorAlign.CENTER }));
-            statusRow.add_child(new St.Label({ text: primary, style_class: 'nook-wifi-name', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-            statusRow.add_child(new St.Label({ text: secondary, style_class: 'nook-wifi-sub', y_align: Clutter.ActorAlign.CENTER }));
-            card.add_child(statusRow);
-        }
-
-        // Saved/known networks — the connected one first (showing its signal %),
-        // then other saved profiles to click-to-connect. Added straight to the
-        // card (a ScrollView collapses to zero height here); capped at NET_CAP
-        // with a "+N more…" line into the scan overlay.
-        if (info.enabled && !info.hotspot) {
-            let saved = this._system.getSavedWifiConnections();
-            if (saved.length > 0) {
-                const NET_CAP = 3;
-                let list = new St.BoxLayout({ style_class: 'nook-wifi-list', vertical: true, x_expand: true });
-                for (let net of saved.slice(0, NET_CAP))
-                    list.add_child(this._buildSavedWifiRow(net));
-                let netExtra = saved.length - NET_CAP;
-                if (netExtra > 0)
-                    list.add_child(this._buildMoreRow(`+${netExtra} more…`, () => this._openWifiScanOverlay()));
-                card.add_child(list);
-            }
-
-            // Footer: scan for and join a new network via the overlay.
-            let addNet = new St.Button({ style_class: 'nook-add-row', reactive: true, x_expand: true, can_focus: true });
-            let addNetInner = new St.BoxLayout({ vertical: false, x_expand: true });
-            addNetInner.add_child(new St.Icon({ icon_name: 'list-add-symbolic', icon_size: 14,
-                style_class: 'nook-add-icon', y_align: Clutter.ActorAlign.CENTER }));
-            addNetInner.add_child(new St.Label({ text: 'Add network…', style_class: 'nook-add-label',
-                x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-            addNet.set_child(addNetInner);
-            addNet.connect('clicked', () => this._openWifiScanOverlay());
-            card.add_child(addNet);
-        }
-
-        return card;
-    }
-
-    // One saved-network row in the WiFi card. Clicking activates that saved
-    // profile; the currently-connected one is badged and non-actionable.
-    _buildSavedWifiRow(net) {
-        let row = new St.Button({ style_class: 'nook-wifi-net-row', reactive: !net.connected,
-            can_focus: !net.connected, x_expand: true });
-        let inner = new St.BoxLayout({ vertical: false, x_expand: true });
-        inner.add_child(new St.Icon({
-            icon_name: net.connected ? 'network-wireless-signal-excellent-symbolic'
-                : 'network-wireless-signal-good-symbolic',
-            icon_size: 14, style_class: 'nook-wifi-net-icon', y_align: Clutter.ActorAlign.CENTER }));
-        inner.add_child(new St.Label({ text: net.ssid, style_class: 'nook-wifi-net-name',
-            x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
-        // The connected network is just a normal row marked "Connected" (no
-        // percentage readout); other rows are clickable to switch to them.
-        if (net.connected)
-            inner.add_child(new St.Label({ text: 'Connected',
-                style_class: 'nook-wifi-net-sub', y_align: Clutter.ActorAlign.CENTER }));
-        row.set_child(inner);
-        if (!net.connected) {
-            row.connect('clicked', () => {
-                row.reactive = false;
-                this._system.activateSavedWifi(net.uuid, (ok, err) => {
-                    if (!ok) {
-                        row.reactive = true;
-                        Main.notify('NotchNux Wi-Fi',
-                            err === 'not in range'
-                                ? `${net.ssid} is not in range`
-                                : `Could not connect to ${net.ssid}` + (err ? `: ${err}` : ''));
-                    }
-                    this._scheduleTrayReRender();
+                this._system.setBluetoothConnected(d.dbusPath, want, () => {
+                    this._queueTrayCardsRefresh();
                 });
             });
         }
@@ -2935,7 +3188,7 @@ export const NotchNux = GObject.registerClass({
             x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
         let closeBtn = new St.Button({ style_class: 'nook-scan-close', reactive: true, can_focus: true });
         closeBtn.set_child(new St.Icon({ icon_name: 'window-close-symbolic', icon_size: 14 }));
-        closeBtn.connect('clicked', () => this._closeScanOverlay());
+        closeBtn.connect('clicked', () => this._closeScanOverlay(true));
         header.add_child(closeBtn);
         card.add_child(header);
 
@@ -2952,12 +3205,22 @@ export const NotchNux = GObject.registerClass({
         overlay.add_child(card);
         // A click on the scrim (outside the card) closes; clicks on the card are
         // swallowed so they don't bubble up to the scrim handler.
-        overlay.connect('button-press-event', () => { this._closeScanOverlay(); return Clutter.EVENT_STOP; });
+        //
+        // NOTE: never return EVENT_STOP from a press handler on an ancestor of
+        // St.Buttons — on GNOME 50 St.Button is driven by a ClutterClickGesture
+        // and a stopped press cancels it, so the close (X) and every row went
+        // dead. Decide by the event source instead and let presses inside the
+        // card propagate untouched.
         card.reactive = true;
-        card.connect('button-press-event', () => Clutter.EVENT_STOP);
+        overlay.connect('button-press-event', (a, ev) => {
+            if (this._isDescendantOf(global.stage.get_event_actor(ev), card))
+                return Clutter.EVENT_PROPAGATE;
+            this._closeScanOverlay(true);
+            return Clutter.EVENT_STOP;
+        });
         // Escape closes the overlay.
         overlay.connect('key-press-event', (a, ev) => {
-            if (ev.get_key_symbol() === Clutter.KEY_Escape) { this._closeScanOverlay(); return Clutter.EVENT_STOP; }
+            if (ev.get_key_symbol() === Clutter.KEY_Escape) { this._closeScanOverlay(true); return Clutter.EVENT_STOP; }
             return Clutter.EVENT_PROPAGATE;
         });
 
@@ -2966,6 +3229,17 @@ export const NotchNux = GObject.registerClass({
         // below it as another vertical box row.
         this.add_child(overlay);
         overlay.grab_key_focus();
+        // Materialize: the scrim fades in while the sheet drops a few px from
+        // the header and settles — it reads as coming out of the notch.
+        if (St.Settings.get().enable_animations) {
+            overlay.opacity = 0;
+            card.set_pivot_point(0.5, 0);
+            card.translation_y = -10;
+            card.scale_x = card.scale_y = 0.97;
+            overlay.ease({ opacity: 255, duration: 160, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            card.ease({ translation_y: 0, scale_x: 1, scale_y: 1, duration: 260,
+                mode: Clutter.AnimationMode.EASE_OUT_EXPO });
+        }
 
         this._scanOverlay = { overlay, body, onClose, timerId: 0,
             setStatus: (text) => {
@@ -2977,28 +3251,31 @@ export const NotchNux = GObject.registerClass({
 
     // Tear down the current scan overlay, running its onClose (stop discovery /
     // scan timers) and removing the actor. Safe to call when none is open.
-    _closeScanOverlay() {
+    _closeScanOverlay(animate = false) {
         let ov = this._scanOverlay;
         if (!ov) return;
         this._scanOverlay = null;
         if (ov.timerId) { GLib.Source.remove(ov.timerId); ov.timerId = 0; }
         try { if (ov.onClose) ov.onClose(); } catch (e) { /* ignore */ }
-        try { ov.overlay.destroy(); } catch (e) { /* ignore */ }
-        // If state changed while the overlay was up, a re-render was deferred;
-        // run it now so the Tray card reflects the new WiFi/BT state. Guard on
-        // still being on the Tray tab (a tab switch already re-rendered).
-        if (this._trayReRenderPending) {
-            this._trayReRenderPending = false;
-            if (this.isExpanded && this._activeTab === 'system')
-                this._scheduleTrayReRender();
+        // A user dismissal fades out quickly (exit faster than enter); a
+        // teardown (tab re-render, collapse) removes it at once.
+        if (animate && St.Settings.get().enable_animations) {
+            ov.overlay.reactive = false;
+            ov.overlay.ease({ opacity: 0, duration: 120, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onStopped: () => ov.overlay.destroy() });
+        } else {
+            try { ov.overlay.destroy(); } catch (e) { /* ignore */ }
         }
+        // Pick up any Wi-Fi / Bluetooth change made from the overlay.
+        if (!this._destroyed)
+            this._queueTrayCardsRefresh();
     }
 
     // Bluetooth: power the radio on (if needed), start discovery, and list
     // nearby devices, refreshing on a timer. Tapping a device pairs+connects it.
     _openBluetoothScanOverlay() {
         let ov = this._openScanOverlay({
-            title: 'Add Bluetooth Device',
+            title: 'Bluetooth',
             onClose: () => this._system.stopBluetoothDiscovery(),
         });
         ov.setStatus('Scanning…');
@@ -3012,9 +3289,15 @@ export const NotchNux = GObject.registerClass({
         // don't get rebuilt out from under the user mid-pair.
         let pairing = new Set();
 
+        // Rows are only rebuilt when the list actually changed, so hover and
+        // focus survive the periodic refresh.
+        let lastSig = null;
         let refresh = () => {
             if (this._scanOverlay !== ov) return; // closed since scheduled
             let devices = this._system.getDiscoveredBluetoothDevices();
+            let sig = JSON.stringify([devices.map(d => [d.dbusPath, d.name, d.paired, d.connected]), [...pairing]]);
+            if (sig === lastSig) return;
+            lastSig = sig;
             ov.body.destroy_all_children();
             if (devices.length === 0) {
                 ov.body.add_child(new St.Label({ text: 'Searching for nearby devices…',
@@ -3067,7 +3350,7 @@ export const NotchNux = GObject.registerClass({
     // timer. Secure APs reveal an inline password field; open APs connect on
     // tap. A saved profile for the SSID is reused rather than duplicated.
     _openWifiScanOverlay() {
-        let ov = this._openScanOverlay({ title: 'Add Wi-Fi Network' });
+        let ov = this._openScanOverlay({ title: 'Wi-Fi' });
         ov.setStatus('Scanning…');
         this._system.requestWifiScan(() => {});
 
@@ -3076,9 +3359,17 @@ export const NotchNux = GObject.registerClass({
         let expanded = null;
         let connecting = new Set();
 
-        let refresh = () => {
+        // The periodic refresh skips unchanged lists and never rebuilds while
+        // a password field is open (that used to wipe what you were typing).
+        let lastSig = null;
+        let refresh = (force = true) => {
             if (this._scanOverlay !== ov) return;
+            if (!force && expanded) return;
             let aps = this._system.getWifiAccessPoints();
+            let sig = JSON.stringify([aps.map(a => [a.ssid, a.active, a.secure, a.signal >= 75 ? 3 : a.signal >= 50 ? 2 : a.signal >= 25 ? 1 : 0]),
+                expanded, [...connecting]]);
+            if (!force && sig === lastSig) return;
+            lastSig = sig;
             ov.body.destroy_all_children();
             if (aps.length === 0) {
                 ov.body.add_child(new St.Label({ text: 'Looking for networks…',
@@ -3142,6 +3433,7 @@ export const NotchNux = GObject.registerClass({
                     let entry = new St.Entry({ style_class: 'nook-scan-entry',
                         hint_text: 'Password', can_focus: true, x_expand: true });
                     entry.clutter_text.set_password_char('●');
+                    this._makeTypable(entry);
                     entry.clutter_text.connect('activate', () => connect(entry.get_text()));
                     let go = new St.Button({ style_class: 'nook-scan-connect', reactive: true, can_focus: true });
                     go.set_child(new St.Label({ text: 'Connect' }));
@@ -3149,7 +3441,8 @@ export const NotchNux = GObject.registerClass({
                     pwRow.add_child(entry);
                     pwRow.add_child(go);
                     ov.body.add_child(pwRow);
-                    entry.grab_key_focus();
+                    entry.clutter_text.grab_key_focus();
+                    this._grabKeyboard(entry.clutter_text);
                 }
             }
         };
@@ -3159,7 +3452,7 @@ export const NotchNux = GObject.registerClass({
         ov.timerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
             if (this._scanOverlay !== ov) return GLib.SOURCE_REMOVE;
             this._system.requestWifiScan(() => {});
-            refresh();
+            refresh(false);
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -3167,17 +3460,16 @@ export const NotchNux = GObject.registerClass({
     // Re-render the Tray tab after a short delay, so NetworkManager state
     // (WiFi enable, hotspot activation) has time to settle before we read it
     // back. Coalesces multiple calls into one pending timeout.
+    // After a Wi-Fi / Bluetooth action, refresh the Tray cards once
+    // NetworkManager / BlueZ have had a moment to settle. Only the cards are
+    // rebuilt (the scan overlay floats above them and survives).
     _scheduleTrayReRender() {
+        if (this._destroyed) return;
         if (this._trayReRenderId)
             GLib.Source.remove(this._trayReRenderId);
         this._trayReRenderId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 700, () => {
             this._trayReRenderId = 0;
-            // A full re-render destroys the tab content, which would close an
-            // open scan overlay. Defer it while one is up — _closeScanOverlay
-            // re-renders once the overlay is dismissed so the card catches up.
-            if (this._scanOverlay) { this._trayReRenderPending = true; return GLib.SOURCE_REMOVE; }
-            if (this.isExpanded && this._activeTab === 'system')
-                this._renderActiveTab();
+            this._queueTrayCardsRefresh();
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -3190,9 +3482,23 @@ export const NotchNux = GObject.registerClass({
         let statusArea = Main.panel?.statusArea;
         if (!statusArea) return null;
 
-        let card = new St.BoxLayout({ style_class: 'nook-tray-mirror', vertical: true, x_expand: true });
-        card.add_child(new St.Label({ text: 'TOP BAR', style_class: 'nook-card-eyebrow' }));
-        let iconRow = new St.BoxLayout({ style_class: 'nook-tray-mirror-row', vertical: false, x_expand: true });
+        // One strip: "TOP BAR" then the icons, wrapping only when there are
+        // more than fit on a line.
+        let card = new St.BoxLayout({ style_class: 'nook-tray-mirror nn-cc-mirror', vertical: false, x_expand: true });
+        let mirrorLabel = new St.Label({ text: 'TOP BAR', style_class: 'nook-card-eyebrow nn-cc-mirror-label',
+            y_align: Clutter.ActorAlign.CENTER });
+        mirrorLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+        card.add_child(mirrorLabel);
+        const PER_ROW = 11;
+        let iconRow = new St.BoxLayout({ style_class: 'nook-tray-mirror-grid', vertical: true, x_expand: true });
+        let addIcon = btn => {
+            let line = iconRow.get_last_child();
+            if (!line || line.get_n_children() >= PER_ROW) {
+                line = new St.BoxLayout({ style_class: 'nook-tray-mirror-row', x_align: Clutter.ActorAlign.START });
+                iconRow.add_child(line);
+            }
+            line.add_child(btn);
+        };
 
         // Every indicator we *can* mirror is collected here as { id, label }
         // (whether or not the user has it enabled) so we can publish the catalog
@@ -3227,7 +3533,7 @@ export const NotchNux = GObject.registerClass({
             // reparenting never steals the real one out of the panel.
             let btn = this._mkTrayMirrorButton(indicator, name);
             if (!btn) continue;
-            iconRow.add_child(btn);
+            addIcon(btn);
             shown++;
         }
 
@@ -3236,7 +3542,7 @@ export const NotchNux = GObject.registerClass({
         // aggregate quickSettings menu's _indicators box, each exposing a
         // QuickMenuToggle in `.quickSettingsItems`. Mirror those individually so
         // the notch can toggle them directly instead of opening the whole panel.
-        shown += this._buildQuickSettingsMirror(statusArea.quickSettings, iconRow, catalog);
+        shown += this._buildQuickSettingsMirror(statusArea.quickSettings, addIcon, catalog);
 
         // Publish the discovered catalog so the prefs window can offer a picker
         // for these (it runs in a separate process and can't read statusArea).
@@ -3270,7 +3576,7 @@ export const NotchNux = GObject.registerClass({
     }
 
     // Mirror the Quick Settings *extension* toggles (Caffeine, GSConnect, …) as
-    // individual buttons in `iconRow`. Returns how many were added.
+    // individual buttons via `addIcon`. Returns how many were added.
     //
     // These live in `quickSettings._indicators` as SystemIndicator actors, each
     // with a `.quickSettingsItems` array of QuickMenuToggles and (usually) a
@@ -3279,7 +3585,7 @@ export const NotchNux = GObject.registerClass({
     // mode, …) — those already have first-class treatment in the shell and would
     // just clutter the row with duplicates, so we skip them by their well-known
     // Shell toggle class names and only surface third-party extension toggles.
-    _buildQuickSettingsMirror(quickSettings, iconRow, catalog) {
+    _buildQuickSettingsMirror(quickSettings, addIcon, catalog) {
         let box = quickSettings?._indicators;
         let children = box?.get_children?.() ?? [];
         let added = 0;
@@ -3303,7 +3609,7 @@ export const NotchNux = GObject.registerClass({
             if (!this._config.isTrayMirrorEnabled(id)) continue;
             let btn = this._mkTrayMirrorButton(ind, clsName);
             if (!btn) continue;
-            iconRow.add_child(btn);
+            addIcon(btn);
             added++;
         }
         return added;
@@ -3475,7 +3781,9 @@ export const NotchNux = GObject.registerClass({
     // Attach a lightweight hover tooltip to a tray-mirror button. The tooltip is
     // a floating label parented to the shell's uiGroup (so it draws above the
     // dashboard), shown after a short hover delay and hidden on leave/destroy.
-    _attachTrayTooltip(btn, text) {
+    // `shouldShow()` (optional) can veto the tooltip, e.g. for the active tab
+    // whose label is already visible.
+    _attachTrayTooltip(btn, text, shouldShow = null) {
         if (!text) return;
         btn.track_hover = true;
         let tip = null;
@@ -3501,7 +3809,7 @@ export const NotchNux = GObject.registerClass({
         };
 
         btn.connect('notify::hover', () => {
-            if (btn.hover) {
+            if (btn.hover && (!shouldShow || shouldShow())) {
                 if (!showId && !tip)
                     showId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
                         showId = 0; show(); return GLib.SOURCE_REMOVE;
@@ -3592,10 +3900,10 @@ export const NotchNux = GObject.registerClass({
         clockCol.add_child(clock);
         let now = new Date();
         clockCol.add_child(new St.Label({
-            text: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            text: fmt(now, { hour: 'numeric', minute: '2-digit' }),
             style_class: 'nook-clock-digital' }));
         clockCol.add_child(new St.Label({
-            text: now.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }),
+            text: fmt(now, { weekday: 'short', month: 'short', day: 'numeric' }),
             style_class: 'nook-clock-date' }));
         top.add_child(clockCol);
 
@@ -3635,7 +3943,25 @@ export const NotchNux = GObject.registerClass({
         top.add_child(cond);
         panel.add_child(top);
 
-        this._contentContainer.add_child(panel);
+        // Next hours: the forecast was always fetched but never shown.
+        if (w.hourly?.length) {
+            let strip = new St.BoxLayout({ style_class: 'nook-wx-hourly', x_expand: true });
+            for (let [i, h] of w.hourly.entries()) {
+                let col = new St.BoxLayout({ style_class: 'nook-wx-hour' + (i === 0 ? ' nook-wx-hour-now' : ''),
+                    vertical: true, x_expand: true });
+                if (i === 0)
+                    col.set_style(`background-color: rgba(${accentRgbStr()}, 0.14); border-color: rgba(${accentRgbStr()}, 0.32);`);
+                col.add_child(new St.Label({ text: h.label, style_class: 'nook-wx-hour-label', x_align: Clutter.ActorAlign.CENTER }));
+                col.add_child(new St.Icon({ icon_name: h.icon, icon_size: 18, style_class: 'nook-wx-hour-icon', x_align: Clutter.ActorAlign.CENTER }));
+                col.add_child(new St.Label({ text: h.temp, style_class: 'nook-wx-hour-temp', x_align: Clutter.ActorAlign.CENTER }));
+                strip.add_child(col);
+            }
+            panel.add_child(strip);
+        }
+        if (w.stale)
+            panel.add_child(new St.Label({ text: 'Offline — showing the last forecast', style_class: 'nook-card-meta' }));
+
+        this._mount(panel);
     }
 
     // ============================================================
@@ -3656,7 +3982,7 @@ export const NotchNux = GObject.registerClass({
             panel.add_child(new St.Label({
                 text: 'GStreamer is unavailable — camera/mic capture can’t start.',
                 style_class: 'nook-studio-error' }));
-            this._contentContainer.add_child(panel);
+            this._mount(panel);
             return;
         }
 
@@ -3726,7 +4052,7 @@ export const NotchNux = GObject.registerClass({
         row.add_child(audCol);
 
         panel.add_child(row);
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
 
         // Wire live frames into the camera view and start the preview.
         this._media.onFrame = (bytes, w, h, stride) => {
@@ -3908,12 +4234,12 @@ export const NotchNux = GObject.registerClass({
 
         let text = new St.BoxLayout({ vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         this._calSummaryDay = new St.Label({
-            text: selected.toLocaleDateString([], { weekday: 'long' }),
+            text: fmt(selected, { weekday: 'long' }),
             style_class: 'nook-calendar-summary-day'
         });
         text.add_child(this._calSummaryDay);
         this._calSummaryDate = new St.Label({
-            text: selected.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' }),
+            text: fmt(selected, { month: 'long', day: 'numeric', year: 'numeric' }),
             style_class: 'nook-calendar-summary-date'
         });
         text.add_child(this._calSummaryDate);
@@ -3933,7 +4259,7 @@ export const NotchNux = GObject.registerClass({
         });
         panel.add_child(this._calAgenda);
 
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
     }
 
     // Swap just the agenda list for the currently-selected date, leaving the
@@ -3975,6 +4301,7 @@ export const NotchNux = GObject.registerClass({
                 this._updateClock();
                 break;
             case 'showPrivacy':
+                this._system.setPrivacyPolling(on);
                 this._updatePrivacyIndicators();
                 break;
             case 'pillMarquee':
@@ -3982,8 +4309,8 @@ export const NotchNux = GObject.registerClass({
                 this._refreshLive();
                 break;
             case 'showPowerButton':
-                if (this._powerButton)
-                    this._powerButton.visible = on;
+                if (this._moreButton)
+                    this._buildMoreMenu();
                 break;
             case 'hidePanel':
                 this._applyPanelVisibility();
@@ -3992,14 +4319,15 @@ export const NotchNux = GObject.registerClass({
                 this._applyPanelVisibility();
                 break;
             case 'mirrorTray':
-                // The mirror lives in the Tray tab; re-render so it appears or
-                // disappears if that tab is currently on screen.
-                if (this.isExpanded)
+                // The mirror lives in the Tray tab.
+                if (this._invalidateTab('system'))
                     this._renderActiveTab();
                 break;
             case 'topScroll':
                 this._applyTopScroll();
                 break;
+            default:
+                this._onLedgeFeatureToggled(id, on);
         }
     }
 
@@ -4013,13 +4341,13 @@ export const NotchNux = GObject.registerClass({
                     if (ev?.id)
                         this._calendarServerEvents.set(ev.id, ev);
                 }
-                this._refreshLive();
+                this._onCalendarEventsChanged();
             };
             let onRemoved = (connection, sender, path, iface, signal, params) => {
                 let ids = params.deep_unpack()?.[0] ?? [];
                 for (let id of ids)
                     this._calendarServerEvents.delete(id);
-                this._refreshLive();
+                this._onCalendarEventsChanged();
             };
             this._calendarServerSignalIds.push(conn.signal_subscribe(
                 'org.gnome.Shell.CalendarServer',
@@ -4219,7 +4547,7 @@ export const NotchNux = GObject.registerClass({
             else if (distance > 1) classes += ' nook-date-pill-far';
             pill.btn.set_style_class_name(classes);
 
-            pill.weekday.set_text(date.toLocaleDateString([], { weekday: 'narrow' }).toUpperCase());
+            pill.weekday.set_text(fmt(date, { weekday: 'narrow' }).toUpperCase());
             pill.number.set_text(String(date.getDate()));
 
             // The CSS hardcodes today's colour to blue; override with the accent.
@@ -4239,9 +4567,9 @@ export const NotchNux = GObject.registerClass({
         if (this._calDateStripRow)
             this._populateDateStripRow(this._calDateStripRow, selected);
         if (this._calSummaryDay)
-            this._calSummaryDay.set_text(selected.toLocaleDateString([], { weekday: 'long' }));
+            this._calSummaryDay.set_text(fmt(selected, { weekday: 'long' }));
         if (this._calSummaryDate)
-            this._calSummaryDate.set_text(selected.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' }));
+            this._calSummaryDate.set_text(fmt(selected, { month: 'long', day: 'numeric', year: 'numeric' }));
     }
 
     _onCalendarDateScroll(event) {
@@ -4299,6 +4627,8 @@ export const NotchNux = GObject.registerClass({
             GLib.source_remove(this._calendarScrollFlushId);
         this._calendarScrollFlushId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 280, () => {
             this._calendarScrollFlushId = 0;
+            if (this._activeTab !== 'calendar')
+                return GLib.SOURCE_REMOVE;
             this._requestCalendarServerRange(45, false);
             // Rebuild only the agenda list for the new day; the summary + strip
             // are already updated in place. Fall back to a full render if the
@@ -4331,7 +4661,7 @@ export const NotchNux = GObject.registerClass({
         let header = new St.BoxLayout({ style_class: 'nook-calendar-header', vertical: false, x_expand: true });
         header.add_child(new St.Label({ text: title, style_class: 'nook-calendar-title', x_expand: true, y_align: Clutter.ActorAlign.CENTER }));
         header.add_child(new St.Label({
-            text: selectedDate.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }),
+            text: fmt(selectedDate, { weekday: 'short', month: 'short', day: 'numeric' }),
             style_class: 'nook-calendar-date',
             y_align: Clutter.ActorAlign.CENTER }));
         outer.add_child(header);
@@ -4385,32 +4715,11 @@ export const NotchNux = GObject.registerClass({
         dayEnd.setDate(dayEnd.getDate() + 1);
         let end = new Date(todayStart);
         end.setDate(end.getDate() + days);
+        // Events come from our own CalendarServer subscription. (Reading the
+        // shell's dateMenu event source as well was a duplicate of the same
+        // data, and its requestRange() makes the shell re-render its hidden
+        // calendar synchronously — 17–35 ms per call, on every render.)
         let out = Array.from(this._calendarServerEvents.values());
-
-        try {
-            let source = Main.panel.statusArea.dateMenu?._calendar?._eventSource ??
-                Main.panel.statusArea.dateMenu?._eventSource;
-            if (source?.requestRange)
-                source.requestRange(rangeStart, selectedDate ? dayEnd : end);
-            let raw = source?.getEvents ? source.getEvents(rangeStart, selectedDate ? dayEnd : end) : [];
-            for (let ev of raw || []) {
-                let evStart = this._eventDate(ev.date ?? ev.start ?? ev.startDate ?? ev.begin ?? null);
-                let evEnd = this._eventDate(ev.end ?? ev.endDate ?? ev.endTime ?? evStart);
-                if (!evStart)
-                    continue;
-                if (!evEnd || Number.isNaN(evEnd.getTime()))
-                    evEnd = evStart;
-                out.push({
-                    title: String(ev.summary ?? ev.title ?? ev.name ?? 'Untitled event'),
-                    location: String(ev.location ?? ''),
-                    start: evStart,
-                    end: evEnd,
-                    allDay: Boolean(ev.allDay ?? ev.isAllDay)
-                });
-            }
-        } catch (e) {
-            console.error('NotchNux: Failed to read calendar events.', e);
-        }
 
         let seen = new Set();
         return out
@@ -4433,18 +4742,6 @@ export const NotchNux = GObject.registerClass({
             })
             .sort((a, b) => a.start - b.start)
             .slice(0, 30);
-    }
-
-    _eventDate(value) {
-        if (!value)
-            return null;
-        if (value instanceof Date)
-            return value;
-        if (value instanceof GLib.DateTime)
-            return new Date(value.to_unix() * 1000);
-        if (typeof value.toJSDate === 'function')
-            return value.toJSDate();
-        return new Date(value);
     }
 
     _eventOverlapsDay(ev, start, end) {
@@ -4473,7 +4770,7 @@ export const NotchNux = GObject.registerClass({
             if (!group) {
                 let label = key === todayKey ? 'Today' :
                     key === tomorrowKey ? 'Tomorrow' :
-                    ev.start.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+                    fmt(ev.start, { weekday: 'short', month: 'short', day: 'numeric' });
                 group = { key, label, events: [] };
                 groups.push(group);
             }
@@ -4489,7 +4786,7 @@ export const NotchNux = GObject.registerClass({
     _fmtEventTime(date) {
         if (!(date instanceof Date) || Number.isNaN(date.getTime()))
             return '--:--';
-        return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+        return fmt(date, { hour: 'numeric', minute: '2-digit' });
     }
 
     _ellipsize(text, max) {
@@ -4549,7 +4846,7 @@ export const NotchNux = GObject.registerClass({
             panel.add_child(empty);
         }
 
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
     }
 
     // A cheap fingerprint of the notification queue: count plus each title/body.
@@ -4562,6 +4859,7 @@ export const NotchNux = GObject.registerClass({
     // count to avoid a re-poll, or omit it to collect the current total. The
     // badge hides itself at zero so the tab reads clean when nothing's pending.
     _updateTabCountBadge(count = null) {
+        if (this._destroyed) return;
         if (!this._tabCountBadge) return;
         if (count === null) {
             try { count = this._collectNotifications().length; }
@@ -4745,21 +5043,32 @@ export const NotchNux = GObject.registerClass({
         try {
             this._origShowNotification = tray._showNotification;
             tray._showNotification = function (...args) {
-                // Fall through to the real banner when we shouldn't suppress.
-                if (!self._shouldSuppressShellBanner()) {
+                // Fall through to the real banner when we shouldn't suppress —
+                // and always for critical alerts (low battery, etc.), which
+                // must get the shell's own sticky banner.
+                let next = this._notificationQueue?.[0];
+                if (!self._shouldSuppressShellBanner() ||
+                    next?.urgency === MessageTray.Urgency.CRITICAL) {
                     return self._origShowNotification.apply(this, args);
                 }
-                // Suppress: end the show cycle without a banner. Pull the queued
-                // notification (our `notification-added` handler already fired
-                // and drove the peek) and let the state machine settle.
+                // Suppress: the pill peek (driven by `notification-added`) is
+                // showing this notification instead. Take it off the queue and
+                // finish the show cycle right away — state back to HIDDEN, as
+                // GNOME does after a banner hides. (Marking it SHOWN without a
+                // banner, as this used to, left the tray waiting forever for a
+                // banner that never expired: every later shell banner,
+                // including critical ones, was stuck behind it.)
                 try {
-                    let n = this._notificationQueue.shift() || null;
-                    this._notification = n;
-                    // MessageTray.State.SHOWN === 2 on GNOME 45–50.
-                    this._notificationState = 2;
-                    this._notificationTimeoutId = 0;
-                    if (typeof this._showNotificationCompleted === 'function')
-                        this._showNotificationCompleted();
+                    this._notificationQueue.shift();
+                    this._notification = null;
+                    this._notificationState = MessageTray.State.HIDDEN;
+                    this.emit('queue-changed');
+                    // _updateState() is mid-run (re-entrancy guarded): let the
+                    // rest of the queue flow on the next idle.
+                    GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                        this._updateState();
+                        return GLib.SOURCE_REMOVE;
+                    });
                 } catch (e) {
                     // If our short-circuit ever fails, don't wedge the tray —
                     // fall back to the real implementation.
@@ -4787,16 +5096,33 @@ export const NotchNux = GObject.registerClass({
     _shouldSuppressShellBanner() {
         try {
             if (!this._config.isFeatureEnabled('notifPeek')) return false;
-            if (!this._dndSettings)
-                this._dndSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
             // If the user has DND on, we don't peek — and we also shouldn't eat
             // the shell's banner (which respects DND itself). Return false so the
             // real path runs and honours DND.
-            if (!this._dndSettings.get_boolean('show-banners')) return false;
+            if (!this._notificationSettings().get_boolean('show-banners')) return false;
             return true;
         } catch (e) {
             return false;
         }
+    }
+
+    // A notification that is shown once and not kept in the history — used for
+    // secrets like the hotspot password. Falls back to Main.notify on shells
+    // without the GNOME 46+ notification constructor.
+    _notifyTransient(title, body) {
+        try {
+            let source = MessageTray.getSystemSource();
+            let n = new MessageTray.Notification({ source, title, body, isTransient: true });
+            source.addNotification(n);
+        } catch (e) {
+            Main.notify(title, body);
+        }
+    }
+
+    // org.gnome.desktop.notifications, created once (show-banners = DND off).
+    _notificationSettings() {
+        this._dndSettings ??= new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
+        return this._dndSettings;
     }
 
     _watchNotifSource(source) {
@@ -4822,9 +5148,7 @@ export const NotchNux = GObject.registerClass({
             if (!this._config.isFeatureEnabled('notifPeek')) return;
             // Respect the user's Do-Not-Disturb: if banners are off system-wide,
             // stay quiet too. (Settings object cached — one per shell session.)
-            if (!this._dndSettings)
-                this._dndSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
-            if (!this._dndSettings.get_boolean('show-banners')) return;
+            if (!this._notificationSettings().get_boolean('show-banners')) return;
             // Don't hijack the pill while the full dashboard is open — that's an
             // intentional interaction and the notification is already in the tab.
             if (this.isExpanded) return;
@@ -4848,6 +5172,7 @@ export const NotchNux = GObject.registerClass({
     // already showing, just swap its content and restart the timer (so a burst
     // of notifications keeps the banner up and current rather than flickering).
     _showNotificationPeek(title, body, gicon, notification = null, actions = []) {
+        if (this._destroyed) return;
         if (!this._notifBanner) return;
 
         this._peekNotification = notification;
@@ -4862,6 +5187,10 @@ export const NotchNux = GObject.registerClass({
         }
         this._renderPeekActions(actions);
 
+        if (!this._peekActive) {
+            this._suspendAlert();
+            this._untuckForExpand();
+        }
         if (this._peekActive) {
             // Already peeking — refresh content and restart the dismiss timer.
             this._armPeekDismissTimer();
@@ -4878,34 +5207,25 @@ export const NotchNux = GObject.registerClass({
         // like one family and the pill's info never blinks out.
         this._surface.add_style_class_name('notchnux-island-peek');
         this._notifBanner.opacity = 0;
+        this._notifBanner.translation_y = -8;
         this._notifBanner.visible = true;
 
-        // Set the final width BEFORE measuring height (mirrors expand()). Height
-        // measured at the wrong width, or while the actor still carries no
-        // allocation, makes Clutter log "needs an allocation" when the ensuing
-        // ease tries to update stage views. Fixing the width first gives the
-        // banner a real allocation to measure against.
-        this.set_width(PEEK_WIDTH);
         let targetHeight = this._measurePeekHeight();
         let targetX = monitor.x + Math.floor((monitor.width - PEEK_WIDTH) / 2);
 
-        this._surface.set_pivot_point(0.5, 0.0);
-        this._surface.scale_y = 0.9;
-        this._surface.scale_x = 0.985;
-        this._surface.opacity = 255;
         this._surface.ease({
-            scale_x: 1.0, scale_y: 1.0,
-            duration: PEEK_ENTER_MS, mode: Clutter.AnimationMode.EASE_OUT_QUINT });
+            scale_x: 1.0, scale_y: 1.0, duration: 200,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD });
 
-        // Pill stays put — only the banner fades in beneath it.
+        // Pill stays put — only the banner fades and slides in beneath it.
         this._pill.remove_all_transitions();
         this._pill.visible = true;
         this._pill.opacity = 255;
         this._notifBanner.ease({
-            opacity: 255, duration: PEEK_ENTER_MS, mode: Clutter.AnimationMode.EASE_OUT_QUINT });
-        this.ease({
-            x: targetX, y: monitor.y, width: PEEK_WIDTH, height: targetHeight,
-            duration: PEEK_ENTER_MS, mode: Clutter.AnimationMode.EASE_OUT_QUINT });
+            opacity: 255, translation_y: 0,
+            delay: 60, duration: PEEK_ENTER_MS, mode: Clutter.AnimationMode.EASE_OUT_QUINT });
+        springTo(this, { x: targetX, y: monitor.y, width: PEEK_WIDTH, height: targetHeight },
+            { duration: 520, damping: 0.78 });
 
         this._armPeekDismissTimer();
     }
@@ -4932,9 +5252,8 @@ export const NotchNux = GObject.registerClass({
         if (!monitor) return;
         let targetHeight = this._measurePeekHeight();
         let targetX = monitor.x + Math.floor((monitor.width - PEEK_WIDTH) / 2);
-        this.ease({
-            x: targetX, width: PEEK_WIDTH, height: targetHeight,
-            duration: 180, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+        springTo(this, { x: targetX, width: PEEK_WIDTH, height: targetHeight },
+            { duration: 360, damping: 0.9 });
     }
 
     // Collapse the banner back to the pill. `immediate` skips the timer clear
@@ -4942,6 +5261,12 @@ export const NotchNux = GObject.registerClass({
     _hideNotificationPeek(immediate = false) {
         if (!this._peekActive) return;
         this._peekActive = false;
+        // The shell expires transient notifications when their banner hides;
+        // the peek replaced that banner, so do the same here.
+        let shown = this._peekNotification;
+        if (shown?.isTransient && !immediate) {
+            try { shown.destroy(MessageTray.NotificationDestroyedReason.EXPIRED); } catch (e) {}
+        }
         this._peekNotification = null;
         this._clearPeekDismissTimer();
 
@@ -4959,8 +5284,6 @@ export const NotchNux = GObject.registerClass({
 
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return;
-        let pillW = this._pillWidth();
-        let targetX = monitor.x + Math.floor((monitor.width - pillW) / 2);
 
         // Pill stayed visible the whole peek — nothing to fade in, just keep it
         // opaque while the banner shrinks away beneath it.
@@ -4969,23 +5292,25 @@ export const NotchNux = GObject.registerClass({
         this._pill.opacity = 255;
 
         this._surface.set_pivot_point(0.5, 0.0);
-        this._surface.ease({
-            scale_y: 0.9, scale_x: 0.985,
-            duration: PEEK_LEAVE_MS, mode: Clutter.AnimationMode.EASE_IN_OUT_QUINT,
-            onComplete: () => {
-                this._surface.scale_x = 1.0;
-                this._surface.scale_y = 1.0;
-            } });
+        this._surface.remove_all_transitions();
+        this._surface.scale_x = 1.0;
+        this._surface.scale_y = 1.0;
 
         this._notifBanner.ease({
-            opacity: 0, duration: 120, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            opacity: 0, translation_y: -6, duration: 140, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => {
                 this._notifBanner.visible = false;
+                this._notifBanner.translation_y = 0;
                 this._surface.remove_style_class_name('notchnux-island-peek');
             } });
-        this.ease({
-            x: targetX, y: monitor.y, width: pillW, height: PILL_HEIGHT,
-            duration: PEEK_LEAVE_MS, mode: Clutter.AnimationMode.EASE_IN_OUT_QUINT });
+        springTo(this, this._restGeometry(), { duration: 400, damping: 1 });
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 360, () => {
+            if (!this._destroyed && !this._peekActive && !this.isExpanded) {
+                this._promoteAlert();
+                this._updateTuck();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _armPeekDismissTimer() {
@@ -5138,9 +5463,11 @@ export const NotchNux = GObject.registerClass({
         }
         panel.add_child(header);
 
-        // Cache the paired/connected devices once per render so every file row
-        // shares the same list without re-hitting D-Bus.
-        let devices = this._shelf.getShareDevices();
+        // Paired GSConnect devices: render from the last snapshot and refresh
+        // it asynchronously, so a slow GSConnect never stalls the render. A
+        // changed snapshot re-renders the tab once.
+        let devices = this._shareDevices;
+        this._refreshShareDevices();
 
         if (files.length > 0) {
             let scroll = new St.ScrollView({ style_class: 'nook-shelf-scroll', x_expand: true, y_expand: true });
@@ -5159,7 +5486,23 @@ export const NotchNux = GObject.registerClass({
 
         panel.add_child(this._buildQuickShareBox(devices));
 
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
+    }
+
+    _refreshShareDevices() {
+        if (this._shareRefreshing)
+            return;
+        this._shareRefreshing = true;
+        this._shelf.getShareDevicesAsync(({ available, devices }) => {
+            this._shareRefreshing = false;
+            let sig = JSON.stringify([available, devices.map(d => `${d.path}|${d.name}`)]);
+            let changed = sig !== this._shareSig;
+            this._shareSig = sig;
+            this._shareDevices = devices;
+            this._shareAvailable = available;
+            if (changed && this.isExpanded && this._activeTab === 'shelf')
+                this._renderActiveTab();
+        });
     }
 
     // The click-to-add / paste-from-clipboard drop zone. `spacious` gives it
@@ -5174,10 +5517,16 @@ export const NotchNux = GObject.registerClass({
         inner.add_child(new St.Icon({ icon_name: 'document-send-symbolic',
             icon_size: spacious ? 30 : 22, style_class: 'nook-shelf-drop-icon',
             x_align: Clutter.ActorAlign.CENTER }));
-        inner.add_child(new St.Label({ text: 'Drop files here',
-            style_class: 'nook-shelf-drop-title', x_align: Clutter.ActorAlign.CENTER }));
-        inner.add_child(new St.Label({ text: 'Click to browse · or paste a copied file',
+        let title = new St.Label({ text: 'Drop files here',
+            style_class: 'nook-shelf-drop-title', x_align: Clutter.ActorAlign.CENTER });
+        inner.add_child(title);
+        inner.add_child(new St.Label({ text: 'Drag from Files · click to browse · or paste',
             style_class: 'nook-shelf-drop-sub', x_align: Clutter.ActorAlign.CENTER }));
+        this._shelfDropZone = { zone, title };
+        zone.connect('destroy', () => {
+            if (this._shelfDropZone?.zone === zone)
+                this._shelfDropZone = null;
+        });
 
         // A small "Paste" affordance inside the zone. Its own click must not
         // also trigger the zone's browse click, so it swallows the event.
@@ -5199,6 +5548,7 @@ export const NotchNux = GObject.registerClass({
         inner.add_child(pasteBtn);
 
         zone.set_child(inner);
+        this._syncDropZoneState();
         zone.connect('clicked', () => {
             this._shelf.pickFilesIntoShelf((added) => {
                 if (added > 0 && this._activeTab === 'shelf')
@@ -5208,10 +5558,149 @@ export const NotchNux = GObject.registerClass({
         return zone;
     }
 
+    // ------------------------------------------------------------ file drag & drop
+    // See helpers/filedrop.js for why this needs a helper window on Wayland.
+    _initFileDrop() {
+        try {
+            this._fileDrop = new FileDropBridge({
+                hitTest: (x, y) => this._fileDragHits(x, y),
+                onArm: () => this._onFileDragArm(),
+                targetRect: () => this._fileDropRect(),
+                setPassThrough: on => this._setDropPassThrough(on),
+                onOver: inside => this._setDropHover(inside),
+                onFiles: uris => this._onFilesDropped(uris),
+                onDragEnd: dropped => this._onFileDragEnd(dropped),
+            });
+        } catch (e) {
+            console.error('NotchNux: file drag & drop unavailable', e);
+            this._fileDrop = null;
+        }
+    }
+
+    // A drag "reaches" the notch when it comes within a short distance of its
+    // current box (the pill, or the open dashboard).
+    _fileDragHits(x, y) {
+        if (this._destroyed || !this._tabs.shelf || !this.mapped || Main.overview.visible)
+            return false;
+        const MARGIN = 28;
+        let [ax, ay] = this.get_transformed_position();
+        let w = this.get_width();
+        let h = this.get_height();
+        return x >= ax - MARGIN && x <= ax + w + MARGIN &&
+               y >= ay - MARGIN && y <= ay + h + MARGIN;
+    }
+
+    _onFileDragArm() {
+        this._dropHold = true;
+        this._dropUi = { armed: true, over: false };
+        this._clearHoverTimers();
+        if (this._activeTab !== 'shelf')
+            this._switchTab('shelf');
+        if (!this.isExpanded) {
+            this._untuckForExpand();
+            this.expand();
+        }
+        this._syncDropZoneState();
+    }
+
+    // Where the open dashboard will sit once its spring settles.
+    _fileDropRect() {
+        let monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return null;
+        let height = this.isExpanded ? this._measureDashboardHeight() : this.get_height();
+        return {
+            x: monitor.x + Math.floor((monitor.width - DASHBOARD_WIDTH) / 2),
+            y: monitor.y,
+            width: DASHBOARD_WIDTH,
+            height: Math.max(height, PILL_HEIGHT),
+        };
+    }
+
+    _setDropPassThrough(on) {
+        if (this._destroyed || on === !!this._dropPassThrough)
+            return;
+        this._dropPassThrough = on;
+        this._walkDropPassThrough(on);
+    }
+
+    // Toggle reactivity of our whole subtree. Actors we switched off are
+    // marked, so restoring touches only those still alive in the tree.
+    _walkDropPassThrough(off) {
+        let stack = [this];
+        while (stack.length) {
+            let a = stack.pop();
+            if (off) {
+                if (a.reactive) {
+                    a._nnDropRestore = true;
+                    a.reactive = false;
+                }
+            } else if (a._nnDropRestore) {
+                delete a._nnDropRestore;
+                a.reactive = true;
+            }
+            for (let c of a.get_children())
+                stack.push(c);
+        }
+    }
+
+    _setDropHover(inside) {
+        if (!this._dropUi)
+            return;
+        this._dropUi.over = inside;
+        this._syncDropZoneState();
+    }
+
+    _syncDropZoneState() {
+        let dz = this._shelfDropZone;
+        if (!dz)
+            return;
+        let armed = !!this._dropUi?.armed;
+        let over = armed && !!this._dropUi?.over;
+        dz.zone[armed ? 'add_style_class_name' : 'remove_style_class_name']('nook-shelf-drop-armed');
+        dz.zone[over ? 'add_style_class_name' : 'remove_style_class_name']('nook-shelf-drop-over');
+        dz.zone.set_style(armed ? `border-color: ${accentHex()};` : null);
+        dz.title.text = over ? 'Release to add' : 'Drop files here';
+    }
+
+    _onFilesDropped(uris) {
+        this._shelf.addFilesAsync(uris, added => {
+            if (this._destroyed)
+                return;
+            if (added > 0 && this.isExpanded && this._activeTab === 'shelf')
+                this._renderActiveTab();
+            if (added > 0)
+                this._flashShareStatus(added === 1 ? 'Added 1 file' : `Added ${added} files`);
+            else
+                this._flashShareStatus('Only local files can be added');
+        });
+    }
+
+    _onFileDragEnd(dropped) {
+        this._dropHold = false;
+        this._dropUi = null;
+        this._syncDropZoneState();
+        if (!this.isExpanded)
+            return;
+        this._pointerInside = this._pointerIsOverWidget();
+        if (this._pointerInside || this._collapseTimeoutId)
+            return;
+        // Linger a little after a drop so the new file is seen landing.
+        this._collapseTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, dropped ? 1600 : 400, () => {
+            this._collapseTimeoutId = null;
+            if (!this._pointerInside && this.isExpanded && !this._anyOwnedMenuOpen() && !this._dropHold && !this._kbGrab)
+                this.collapse();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     // One file row: icon + name/size, then Send / Copy / Open / Reveal / Remove.
     _buildShelfRow(f, devices) {
         let row = new St.BoxLayout({ style_class: 'nook-shelf-row', vertical: false, x_expand: true });
-        row.add_child(new St.Icon({ icon_name: f.icon, icon_size: 20, style_class: 'nook-shelf-row-icon', y_align: Clutter.ActorAlign.CENTER }));
+        let rowIcon = new St.Icon({ icon_size: 20, style_class: 'nook-shelf-row-icon', y_align: Clutter.ActorAlign.CENTER });
+        if (f.gicon) rowIcon.gicon = f.gicon;
+        else rowIcon.icon_name = 'text-x-generic-symbolic';
+        row.add_child(rowIcon);
 
         let meta = new St.BoxLayout({ vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         let name = new St.Label({ text: f.name, style_class: 'nook-shelf-row-name' });
@@ -5274,10 +5763,13 @@ export const NotchNux = GObject.registerClass({
 
         // Right-hand hint reflects device state at a glance.
         let hintText;
-        if (devices.length === 1) hintText = devices[0].name;
-        else if (devices.length > 1) hintText = `${devices.length} devices`;
-        else if (this._shelf.isShareServiceAvailable()) hintText = 'No device connected';
-        else hintText = 'GSConnect not running';
+        let serviceAvailable = this._shareAvailable;
+        if (devices.length === 1)
+            hintText = devices[0].name;
+        else if (devices.length > 1)
+            hintText = `${devices.length} devices`;
+        else
+            hintText = serviceAvailable ? 'No device connected' : 'GSConnect not running';
         let hint = new St.Label({ text: hintText, style_class: 'nook-share-devlabel', y_align: Clutter.ActorAlign.CENTER });
         head.add_child(hint);
         box.add_child(head);
@@ -5285,7 +5777,7 @@ export const NotchNux = GObject.registerClass({
         // Subline: how to get a device when there isn't one.
         if (devices.length === 0) {
             let sub = new St.Label({
-                text: this._shelf.isShareServiceAvailable()
+                text: serviceAvailable
                     ? 'Pair & connect a device in GSConnect to send files.'
                     : 'Install/enable the GSConnect extension to send files to your phone.',
                 style_class: 'nook-share-sub', x_expand: true });
@@ -5373,7 +5865,7 @@ export const NotchNux = GObject.registerClass({
                 'preferences-desktop-wallpaper-symbolic',
                 'No wallpaper folder set',
                 'Choose a folder in settings to rotate through your images.'));
-            this._contentContainer.add_child(panel);
+            this._mount(panel);
             return;
         }
         if (items.length === 0) {
@@ -5381,7 +5873,7 @@ export const NotchNux = GObject.registerClass({
                 'image-missing-symbolic',
                 'No images in this folder',
                 'Add JPG, PNG or WebP images to the folder you picked.'));
-            this._contentContainer.add_child(panel);
+            this._mount(panel);
             return;
         }
 
@@ -5393,10 +5885,27 @@ export const NotchNux = GObject.registerClass({
 
         this._wpThumbs = [];
         this._wpActivePath = currentItem ? currentItem.path : null;
+        // Thumbnails come from an on-disk cache; missing ones are generated
+        // by the out-of-process image worker and pop in as each batch lands.
+        let missing = [];
+        let thumbBySrc = new Map();
         for (let it of items) {
             let cell = this._buildWallpaperThumb(it);
             this._wpThumbs.push(cell);
             strip.add_child(cell);
+            if (!cell._wpHasThumb) {
+                missing.push(it);
+                thumbBySrc.set(it.path, cell._wpThumb);
+            }
+        }
+        if (missing.length) {
+            let alive = true;
+            strip.connect('destroy', () => { alive = false; });
+            this._wallpaper.requestThumbs(missing, (src, thumbPath) => {
+                let thumb = thumbBySrc.get(src);
+                if (alive && thumb)
+                    this._setWallpaperThumbImage(thumb, thumbPath);
+            });
         }
         scroll.set_child(strip);
         this._wpScroll = scroll;
@@ -5423,7 +5932,7 @@ export const NotchNux = GObject.registerClass({
         // Bring the current thumbnail into view after layout settles.
         this._scrollWallpaperIntoView();
 
-        this._contentContainer.add_child(panel);
+        this._mount(panel);
     }
 
     // One thumbnail cell: a preview of the image with its name under it. The
@@ -5436,15 +5945,15 @@ export const NotchNux = GObject.registerClass({
         cell._wpPath = item.path;
         let box = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER });
 
-        // Fill a landscape frame with the image using a CSS background (cover),
-        // rather than an St.Icon — an icon's fixed square icon_size letterboxes
-        // the picture and ignores the landscape thumb box. The preview path is
-        // the landscape-rotated copy when auto-landscape is on, so portrait
-        // images show turned exactly as they'll be applied.
-        let previewPath = this._wallpaper.previewPathFor(item.path);
-        let previewUri = Gio.File.new_for_path(previewPath).get_uri();
-        let thumb = new St.Widget({ style_class: 'nook-wp-thumb' });
-        thumb.set_style(`background-image: url("${previewUri}"); background-size: cover; background-position: center;`);
+        // Fill a landscape frame with the cached thumbnail (already cropped to
+        // the cell's aspect, and landscape-rotated when auto-landscape is on,
+        // so portrait images show turned exactly as they'll be applied).
+        let thumb = new St.Widget({ style_class: 'nook-wp-thumb nook-wp-thumb-loading' });
+        let thumbPath = this._wallpaper.thumbFor(item);
+        if (thumbPath)
+            this._setWallpaperThumbImage(thumb, thumbPath);
+        cell._wpThumb = thumb;
+        cell._wpHasThumb = !!thumbPath;
         box.add_child(thumb);
 
         let name = new St.Label({ text: item.name, style_class: 'nook-wp-name' });
@@ -5456,6 +5965,14 @@ export const NotchNux = GObject.registerClass({
 
         cell.connect('clicked', () => this._applyWallpaper(item.path));
         return cell;
+    }
+
+    // Thumbnail paths are sha256-named files in our own cache dir, so they're
+    // safe to place inside a CSS url("…") (no quotes or parens to escape).
+    _setWallpaperThumbImage(thumb, path) {
+        let uri = Gio.File.new_for_path(path).get_uri();
+        thumb.remove_style_class_name('nook-wp-thumb-loading');
+        thumb.set_style(`background-image: url("${uri}"); background-size: cover;`);
     }
 
     _buildWallpaperEmpty(icon, title, sub) {
@@ -5514,13 +6031,21 @@ export const NotchNux = GObject.registerClass({
         let active = this._wpThumbs.find(c => c._wpPath === this._wpActivePath);
         if (!active)
             return;
-        let adj = this._wpScroll.get_hadjustment();
+        let scroll = this._wpScroll;
+        let adj = scroll.get_hadjustment();
         if (!adj)
             return;
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+        if (this._wpScrollIdleId)
+            GLib.Source.remove(this._wpScrollIdleId);
+        this._wpScrollIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._wpScrollIdleId = 0;
+            // The tab may have been switched (and these actors freed) while
+            // this idle waited behind the expand animation.
+            if (this._wpScroll !== scroll || !this._wpThumbs?.includes(active))
+                return GLib.SOURCE_REMOVE;
             try {
                 let [x, ] = active.get_transformed_position();
-                let [px, ] = this._wpScroll.get_transformed_position();
+                let [px, ] = scroll.get_transformed_position();
                 let rel = x - px + adj.value;
                 let w = active.width;
                 let maxScroll = Math.max(0, adj.upper - adj.page_size);
@@ -5531,6 +6056,91 @@ export const NotchNux = GObject.registerClass({
             } catch (e) {}
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    // ============================================================
+    // Typing into the notch
+    // ============================================================
+    // Chrome actors never get key events on their own — the focused window
+    // does. While one of our text fields has focus we take a modal grab on the
+    // whole notch (so its buttons keep working) and hand focus straight back
+    // to the field. The grab is released as soon as focus leaves our fields,
+    // on Escape, on tab switch, collapse and teardown.
+    _makeTypable(entry) {
+        let text = entry.clutter_text;
+        // Focus changes are followed on the stage's key-focus property (see
+        // _onStageKeyFocus); ClutterText no longer emits key-focus-in/out.
+        this._typables ??= new Set();
+        this._typables.add(text);
+        text.connect('destroy', () => this._typables?.delete(text));
+        entry.connect('button-press-event', () => {
+            text.grab_key_focus();
+            this._grabKeyboard(text);
+            return Clutter.EVENT_PROPAGATE;
+        });
+        text.connect('key-press-event', (a, ev) => {
+            if (ev.get_key_symbol() !== Clutter.KEY_Escape)
+                return Clutter.EVENT_PROPAGATE;
+            this._releaseKeyboard();
+            return Clutter.EVENT_STOP;
+        });
+    }
+
+    // Key focus moved somewhere on the stage: grab when it lands in one of our
+    // text fields, release once it has left them all.
+    _onStageKeyFocus() {
+        let focus = global.stage.get_key_focus();
+        if (focus && this._typables?.has(focus))
+            this._grabKeyboard(focus);
+        else
+            this._queueKeyboardRelease();
+    }
+
+    _grabKeyboard(focusTarget = null) {
+        if (this._destroyed)
+            return;
+        if (!this._kbGrab) {
+            this._grabbingKeyboard = true;
+            try {
+                this._kbGrab = Main.pushModal(this, { actionMode: Shell.ActionMode.POPUP });
+            } catch (e) {
+                console.error('NotchNux: could not take keyboard focus', e);
+                this._kbGrab = null;
+            }
+            this._grabbingKeyboard = false;
+        }
+        // pushModal moves key focus to the notch itself; give it back.
+        if (focusTarget && global.stage.get_key_focus() !== focusTarget)
+            focusTarget.grab_key_focus();
+    }
+
+    _queueKeyboardRelease() {
+        if (!this._kbGrab || this._grabbingKeyboard || this._kbReleaseId)
+            return;
+        this._kbReleaseId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._kbReleaseId = 0;
+            let focus = global.stage.get_key_focus();
+            if (!focus || !this._typables?.has(focus))
+                this._releaseKeyboard();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _releaseKeyboard() {
+        if (this._kbReleaseId) {
+            GLib.Source.remove(this._kbReleaseId);
+            this._kbReleaseId = 0;
+        }
+        if (!this._kbGrab)
+            return;
+        let grab = this._kbGrab;
+        this._kbGrab = null;
+        try {
+            Main.popModal(grab);
+        } catch (e) {
+            console.error('NotchNux: failed to release keyboard', e);
+        }
+        global.stage.set_key_focus(null);
     }
 
     // ============================================================
@@ -5554,6 +6164,20 @@ export const NotchNux = GObject.registerClass({
 
         this._pointerInside = entering;
 
+        // Tucked away: resting on the top-centre strip reveals the pill; a
+        // click (or another hover once it's out) opens it.
+        if (!this.isExpanded && this._tuckCrossing(entering))
+            return Clutter.EVENT_PROPAGATE;
+
+        // A gentle swell on hover says "this opens" before it does.
+        if (!this.isExpanded && !this._peekActive && !this._tucked) {
+            this._surface.set_pivot_point(0.5, 0.0);
+            this._surface.ease({
+                scale_x: entering ? 1.03 : 1.0, scale_y: entering ? 1.06 : 1.0,
+                duration: entering ? 220 : 260,
+                mode: entering ? Clutter.AnimationMode.EASE_OUT_QUINT : Clutter.AnimationMode.EASE_OUT_QUAD });
+        }
+
         if (entering) {
             // Cancel any pending collapse and (if collapsed) schedule expand.
             if (this._collapseTimeoutId) {
@@ -5563,7 +6187,7 @@ export const NotchNux = GObject.registerClass({
             if (!this.isExpanded && !this._expandTimeoutId) {
                 this._expandTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 180, () => {
                     this._expandTimeoutId = null;
-                    if (this._pointerInside && !this.isExpanded)
+                    if (this._pointerInside && !this.isExpanded && !this._anyOwnedMenuOpen())
                         this.expand();
                     return GLib.SOURCE_REMOVE;
                 });
@@ -5579,10 +6203,13 @@ export const NotchNux = GObject.registerClass({
             // has merely moved onto the menu (which lives in Main.uiGroup, not
             // our subtree, so it reads as "left"). The menu's own click handling
             // or a click-outside will close things.
-            if (this.isExpanded && !this._collapseTimeoutId && !this._anyOwnedMenuOpen()) {
+            // Typing in one of our fields: only an outside click (or Escape)
+            // closes the notch, never a stray pointer move.
+            // Mid file-drag the notch stays open until the drag ends.
+            if (this.isExpanded && !this._collapseTimeoutId && !this._anyOwnedMenuOpen() && !this._kbGrab && !this._dropHold) {
                 this._collapseTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
                     this._collapseTimeoutId = null;
-                    if (!this._pointerInside && this.isExpanded && !this._anyOwnedMenuOpen())
+                    if (!this._pointerInside && this.isExpanded && !this._anyOwnedMenuOpen() && !this._dropHold)
                         this.collapse();
                     return GLib.SOURCE_REMOVE;
                 });
@@ -5595,8 +6222,15 @@ export const NotchNux = GObject.registerClass({
         // Clicking the collapsed pill opens it. Clicks inside the expanded
         // dashboard are always left to propagate to their controls — the
         // dashboard never collapses from an internal click.
-        if (event.get_button() === 1 && !this.isExpanded)
+        if (event.get_button() === 3 &&
+            (!this.isExpanded || this._isDescendantOf(global.stage.get_event_actor(event), this._compactStack))) {
+            this._openPillMenu();
+            return Clutter.EVENT_STOP;
+        }
+        if (event.get_button() === 1 && !this.isExpanded && !this._anyOwnedMenuOpen()) {
+            this._untuckForExpand();
             this.expand();
+        }
         return Clutter.EVENT_PROPAGATE;
     }
 
@@ -5614,9 +6248,9 @@ export const NotchNux = GObject.registerClass({
         // Main.uiGroup, outside our box and not descendants of ours. Clicking one
         // of their items must NOT collapse the dashboard — treat a click in any
         // owned menu as "inside" so selection works.
-        if (!inside && this._clickInOwnedMenu(event.get_source(), ex, ey))
+        if (!inside && this._clickInOwnedMenu(global.stage.get_event_actor(event), ex, ey))
             inside = true;
-        if (!inside && !this._isDescendant(event.get_source()))
+        if (!inside && !this._isDescendant(global.stage.get_event_actor(event)))
             this._collapseImmediately();
         return Clutter.EVENT_PROPAGATE;
     }
@@ -5625,8 +6259,10 @@ export const NotchNux = GObject.registerClass({
     // device pickers plus the header power menu. Used by the click-outside guard.
     _ownedMenus() {
         let menus = (this._studioMenus ?? []).slice();
-        if (this._powerMenu)
-            menus.push(this._powerMenu);
+        if (this._moreMenu)
+            menus.push(this._moreMenu);
+        if (this._pillMenu)
+            menus.push(this._pillMenu);
         return menus;
     }
 
@@ -5664,7 +6300,7 @@ export const NotchNux = GObject.registerClass({
     }
 
     _collapseImmediately() {
-        this._clearTimers();
+        this._clearHoverTimers();
         this._pointerInside = false;
         this.collapse();
     }
@@ -5678,6 +6314,8 @@ export const NotchNux = GObject.registerClass({
         // dashboard supersedes it. Tear its state/timer down (immediate, so it
         // doesn't animate back to the pill and fight this expand).
         if (this._peekActive) this._hideNotificationPeek(true);
+        this._suspendAlert();
+        this._untuckForExpand();
         this.isExpanded = true;
         this._isExpanding = true;
         this._surface.add_style_class_name('notchnux-island-expanded');
@@ -5688,7 +6326,7 @@ export const NotchNux = GObject.registerClass({
         // stops opening on hover. Roll the state back and re-raise so the
         // failure is still logged.
         try {
-            this._renderActiveTab();
+            this._showActiveTab();
         } catch (e) {
             this._isExpanding = false;
             this.isExpanded = false;
@@ -5708,117 +6346,108 @@ export const NotchNux = GObject.registerClass({
         let targetX = monitor.x + Math.floor((monitor.width - DASHBOARD_WIDTH) / 2);
         let targetY = monitor.y;
 
+        this._dashboard.remove_all_transitions();
         this._dashboard.opacity = 0;
+        this._dashboard.translation_y = -10;
         this._dashboard.visible = true;
 
-        // Set width first so height measurement uses the final width, then
-        // measure the freshly-rendered tab to get its natural height.
-        this.set_width(DASHBOARD_WIDTH);
+        // Measure natural height of the active tab at dashboard width.
         let targetHeight = this._measureDashboardHeight();
 
-        // The whole open is one motion at one duration and one curve. Everything
-        // (the box growing, the surface unfolding, the content fading in) shares
-        // EASE_OUT_QUINT so nothing arrives early or fights another timeline —
-        // that mismatch is what read as "not smooth". No BACK/overshoot, no
-        // opacity dip on the surface: it stays fully opaque and simply grows
-        // from the top-center pivot where the pill sits.
-        const DURATION = 340;
-        const CURVE = Clutter.AnimationMode.EASE_OUT_QUINT;
-
-        // Deepen the backdrop blur toward the expanded strength alongside the
-        // unfold (no-op when blur is disabled).
+        // Blur deepens alongside the unfold (no-op when blur is disabled).
         if (this._blurActive)
-            this._animateBlurRadius(this._blurCfg.expandedRadius, DURATION);
+            this._animateBlurRadius(this._blurCfg.expandedRadius);
 
-        this._surface.set_pivot_point(0.5, 0.0);
-        this._surface.scale_y = 0.9;
-        this._surface.scale_x = 0.985;
-        this._surface.opacity = 255;
+        // Settle any hover swell; the bloom itself is the size change.
         this._surface.ease({
-            scale_x: 1.0, scale_y: 1.0,
-            duration: DURATION, mode: CURVE });
+            scale_x: 1.0, scale_y: 1.0, duration: 200,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD });
 
-        // The pill stays pinned at the top of the surface (it never fades out) —
-        // the dashboard simply unfolds below it as the box grows, so the pill's
-        // time/battery/mic/cam info is continuous through the whole expand and
-        // there's no jarring swap. Only the dashboard fades in.
+        // Pill stays pinned at the top; the dashboard fades in just behind
+        // the box's growth so it never pokes outside the surface.
         this._pill.remove_all_transitions();
         this._pill.visible = true;
         this._pill.opacity = 255;
         this._dashboard.ease({
-            opacity: 255, duration: DURATION, mode: CURVE });
-        this.ease({
-            x: targetX, y: targetY, width: DASHBOARD_WIDTH, height: targetHeight,
-            duration: DURATION, mode: CURVE });
+            opacity: 255, translation_y: 0,
+            delay: 70, duration: 340, mode: Clutter.AnimationMode.EASE_OUT_QUINT });
+        // One spring from wherever the box is now (pill, peek, or a collapse
+        // still in flight) to the dashboard: a quick bloom with ~2.5 % give.
+        springTo(this, { x: targetX, y: targetY, width: DASHBOARD_WIDTH, height: targetHeight },
+            { duration: 560, damping: 0.76 });
 
-        // The tab strip isn't allocated until this open lays out, so defer the
-        // scroll: once sizes are real, slide the active pill into view. Without
-        // this, opening straight onto a tab near the right edge (e.g. Alerts)
-        // leaves its pill scrolled off-screen behind the settings button.
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            if (this.isExpanded)
-                this._scrollActiveTabIntoView();
-            return GLib.SOURCE_REMOVE;
-        });
+        if (!this._railPlaced)
+            this._queueRailPlacement();
     }
 
     collapse() {
         if (!this.isExpanded) return;
         this.isExpanded = false;
         this._closeScanOverlay();
-        this._stopMediaAnimations();
+        this._pauseMediaAnimations();
+        this._leaveTab(this._activeTab);
         this._stopSystemRefresh();
         this._surface.remove_style_class_name('notchnux-island-expanded');
 
         let monitor = Main.layoutManager.primaryMonitor;
         if (!monitor) return;
-        let pillW = this._pillWidth();
-        let targetX = monitor.x + Math.floor((monitor.width - pillW) / 2);
-        let targetY = monitor.y;
 
-        // The pill stayed visible the whole time it was expanded, so there's
-        // nothing to fade back in — just make sure it's fully opaque.
         this._pill.remove_all_transitions();
         this._pill.visible = true;
         this._pill.opacity = 255;
 
-        // Collapse mirrors expand: one duration, one curve, everything settling
-        // together. Retract the surface back toward the pill from the same
-        // top-center pivot while the box shrinks underneath it.
-        const DURATION = 280;
-        const CURVE = Clutter.AnimationMode.EASE_IN_OUT_QUINT;
-
-        // Ease the backdrop blur back down to the collapsed strength.
         if (this._blurActive)
-            this._animateBlurRadius(this._blurCfg.collapsedRadius, DURATION);
+            this._animateBlurRadius(this._blurCfg.collapsedRadius);
 
         this._surface.set_pivot_point(0.5, 0.0);
-        this._surface.ease({
-            scale_y: 0.9, scale_x: 0.985,
-            duration: DURATION, mode: CURVE,
-            onComplete: () => {
-                // Reset transform so the collapsed pill renders at full size.
-                this._surface.scale_x = 1.0;
-                this._surface.scale_y = 1.0;
-            } });
+        this._surface.remove_all_transitions();
+        this._surface.scale_x = 1.0;
+        this._surface.scale_y = 1.0;
 
+        // Content leaves first and fast; the box then folds back into the
+        // pill on a critically damped spring (no bounce on close).
         this._dashboard.ease({
-            opacity: 0, duration: 140, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => { this._dashboard.visible = false; } });
-        this.ease({
-            x: targetX, y: targetY, width: pillW, height: PILL_HEIGHT,
-            duration: DURATION, mode: CURVE });
+            opacity: 0, translation_y: -6, duration: 120, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => {
+                this._dashboard.visible = false;
+                this._dashboard.translation_y = 0;
+            } });
+        // Always fold back into the visible pill: idle-hide tucks it away only
+        // after it has sat untouched for a while (see _updateTuck), never the
+        // moment the pointer drifts off the dashboard.
+        this._tucked = false;
+        springTo(this, this._restGeometry(), { duration: 420, damping: 1 });
+        if (this._afterCollapseId) GLib.Source.remove(this._afterCollapseId);
+        this._afterCollapseId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 380, () => {
+            this._afterCollapseId = 0;
+            if (!this.isExpanded) {
+                this._promoteAlert();
+                this._updateTuck();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     // ============================================================
     // Clock / battery poll
     // ============================================================
+    // The pill shows minutes, so wake once per minute, just after the minute
+    // turns (re-aligned every tick so it never drifts), instead of every
+    // second. Battery changes arrive as UPower notifications in between.
     _startClock() {
+        this._stopClock();
         this._updateClock();
-        this._clockTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
-            this._updateClock();
-            return GLib.SOURCE_CONTINUE;
-        });
+        let schedule = () => {
+            let now = new Date();
+            let ms = (60 - now.getSeconds()) * 1000 - now.getMilliseconds() + 50;
+            this._clockTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+                this._clockTimeoutId = null;
+                this._updateClock();
+                schedule();
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+        schedule();
     }
 
     _stopClock() {
@@ -5854,12 +6483,11 @@ export const NotchNux = GObject.registerClass({
                 // so a notification arriving while the dashboard is open is
                 // reflected immediately.
                 this._updateTabCountBadge();
-                // Rebuild the on-screen tab when its data changes out from under
-                // it. The Tray meters/devices refresh every tick; the Alerts
-                // list only rebuilds when the queue actually changed, so an open
-                // scroll/expanded card isn't reset out from under the user.
+                // Rebuild on-screen tab only when data changes structurally.
+                // The Tray meters are updated in-place without destroying actors;
+                // the Alerts list only rebuilds when the queue actually changed.
                 if (this._activeTab === 'system') {
-                    this._renderActiveTab();
+                    this._updateSystemTabMeters();
                 } else if (this._activeTab === 'notifications') {
                     let sig = this._notificationsSignature(this._collectNotifications());
                     if (sig !== this._notifSignature)
@@ -5878,7 +6506,9 @@ export const NotchNux = GObject.registerClass({
     }
 
     _updateClock() {
+        if (this._destroyed) return;
         let date = new Date();
+        this._checkEventHeadsUp?.();
         this._pillClock.set_text(pillClockText(date));
 
         let showBattery = this._config.isFeatureEnabled('showBattery');
@@ -5905,6 +6535,8 @@ export const NotchNux = GObject.registerClass({
     // the current width (e.g. clock text or battery % changed). Cheap no-op when
     // nothing moved. Always keeps the clock centred via _applyPillWidth.
     _syncPillWidth() {
+        if (!this.get_stage()) return;
+        if (this._alertShowing || this._tucked || this._peekActive) return;
         let target = this._pillWidth();
         if (Math.abs(this.get_width() - target) > 1)
             this._applyPillWidth();
@@ -5912,3 +6544,7 @@ export const NotchNux = GObject.registerClass({
             this._balancePillClock();
     }
 });
+
+installProductivity(NotchNux.prototype);
+installLedge(NotchNux.prototype);
+installTray(NotchNux.prototype);

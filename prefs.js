@@ -165,8 +165,8 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
     // config.setBlur(); the shell watches the file and re-applies live.
     _addBlurGroup(page, config) {
         const group = new Adw.PreferencesGroup({
-            title: 'Glass & Blur',
-            description: 'Frost the backdrop behind the notch. Apple/Samsung-style glass presets, with separate blur strength for the collapsed pill and the open dashboard.',
+            title: 'Glass &amp; Blur',
+            description: 'Off: a solid black island that blends into the top edge of the screen. On: a frosted, translucent island, with separate blur strengths for the collapsed pill and the open dashboard.',
         });
         page.add(group);
 
@@ -174,7 +174,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         // the user can see what they'll get.
         const enableRow = new Adw.SwitchRow({
             title: 'Enable blur',
-            subtitle: 'Composite a live gaussian blur of the wallpaper/windows behind the panel.',
+            subtitle: 'Blur the wallpaper and windows behind the notch.',
             active: config.blur.enabled,
         });
         group.add(enableRow);
@@ -255,7 +255,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         // off. Wrapped in the same guard so the slider/combo moves don't each
         // re-write config on top of the batched reset.
         const resetRow = new Adw.ActionRow({
-            title: 'Reset glass & blur',
+            title: 'Reset glass &amp; blur',
             subtitle: 'Restore the default style and blur strengths.',
         });
         const resetBtn = new Gtk.Button({
@@ -715,7 +715,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             const owner = bus.call_sync(
                 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
                 'NameHasOwner', new GLib.Variant('(s)', [GSC_NAME]),
-                new GLib.VariantType('(b)'), Gio.DBusCallFlags.NONE, -1, null);
+                new GLib.VariantType('(b)'), Gio.DBusCallFlags.NONE, 2000, null);
             serviceUp = owner.deepUnpack()[0];
 
             if (serviceUp) {
@@ -723,7 +723,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                     GSC_NAME, GSC_BASE, 'org.freedesktop.DBus.ObjectManager',
                     'GetManagedObjects', null,
                     new GLib.VariantType('(a{oa{sa{sv}}})'),
-                    Gio.DBusCallFlags.NONE, -1, null);
+                    Gio.DBusCallFlags.NONE, 2000, null);
                 const [objects] = reply.deepUnpack();
                 for (const path in objects) {
                     const dev = objects[path]['org.gnome.Shell.Extensions.GSConnect.Device'];
@@ -746,7 +746,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             subtitle: serviceUp ? 'Running' : 'Not detected',
         });
         statusRow.add_prefix(new Gtk.Image({
-            icon_name: serviceUp ? 'emblem-ok-symbolic' : 'dialog-warning-symbolic',
+            icon_name: serviceUp ? 'object-select-symbolic' : 'dialog-warning-symbolic',
             valign: Gtk.Align.CENTER,
         }));
         group.add(statusRow);
@@ -770,7 +770,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                     });
                     row.add_prefix(new Gtk.Image({ icon_name: iconFor(d.type), valign: Gtk.Align.CENTER }));
                     if (ready) {
-                        row.add_suffix(new Gtk.Image({ icon_name: 'emblem-ok-symbolic', valign: Gtk.Align.CENTER }));
+                        row.add_suffix(new Gtk.Image({ icon_name: 'object-select-symbolic', valign: Gtk.Align.CENTER }));
                     }
                     group.add(row);
                 }
@@ -778,7 +778,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         } else {
             const helpRow = new Adw.ActionRow({
                 title: 'GSConnect is not running',
-                subtitle: 'Install & enable the GSConnect extension to send Shelf files to your devices.',
+                subtitle: 'Install &amp; enable the GSConnect extension to send Shelf files to your devices.',
             });
             group.add(helpRow);
         }
