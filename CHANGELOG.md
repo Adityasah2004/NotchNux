@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-01
+
+### Fixed — text fields trapping the notch open
+- Clicking into a text field (Add a task, notes, search…) and then clicking
+  outside no longer leaves the field focused with the notch stuck open. While
+  a field has the keyboard, the notch holds a modal grab that routes every
+  click to itself, so the outside-click check now goes by click position:
+  outside the notch closes it, inside but off the field just drops focus so
+  hover-out closes it again.
+
 ## [1.6.0] - 2026-11-01
 
 ### Changed — Wallpaper tab is a slit deck

@@ -6156,6 +6156,12 @@ export const NotchNux = GObject.registerClass({
     }
 
     _onClicked(event) {
+        // While a text field holds the keyboard we have a modal grab, so every
+        // click — even one over a window or the desktop — is delivered to us.
+        // Sort those out first: outside our box closes the notch, inside but
+        // off the field just drops focus.
+        if (this._kbGrab && this._handleClickWhileTyping(event))
+            return Clutter.EVENT_STOP;
         // Clicking the collapsed pill opens it. Clicks inside the expanded
         // dashboard are always left to propagate to their controls — the
         // dashboard never collapses from an internal click.
@@ -6173,14 +6179,16 @@ export const NotchNux = GObject.registerClass({
 
     _onStageClicked(event) {
         if (!this.isExpanded) return Clutter.EVENT_PROPAGATE;
+        if (this._kbGrab) {
+            this._handleClickWhileTyping(event);
+            return Clutter.EVENT_PROPAGATE;
+        }
         // Only collapse for clicks that are genuinely outside us. Check both
         // the event source's ancestry AND the click coordinates against our
         // box — re-rendering a tab can destroy the clicked actor before this
         // handler runs, so the actor test alone is unreliable.
         let [ex, ey] = event.get_coords();
-        let [ax, ay] = this.get_transformed_position();
-        let inside = ex >= ax && ex <= ax + this.get_width() &&
-                     ey >= ay && ey <= ay + this.get_height();
+        let inside = this._clickInsideBox(event);
         // Our PopupMenus (Studio device pickers, the power menu) live in
         // Main.uiGroup, outside our box and not descendants of ours. Clicking one
         // of their items must NOT collapse the dashboard — treat a click in any
@@ -6190,6 +6198,35 @@ export const NotchNux = GObject.registerClass({
         if (!inside && !this._isDescendant(global.stage.get_event_actor(event)))
             this._collapseImmediately();
         return Clutter.EVENT_PROPAGATE;
+    }
+
+    _clickInsideBox(event) {
+        let [ex, ey] = event.get_coords();
+        let [ax, ay] = this.get_transformed_position();
+        return ex >= ax && ex <= ax + this.get_width() &&
+               ey >= ay && ey <= ay + this.get_height();
+    }
+
+    // A click arrived while one of our fields holds the keyboard grab. The
+    // grab reroutes outside clicks to us, so judge by coordinates, not by
+    // the event actor. Returns true when the click was consumed (outside).
+    _handleClickWhileTyping(event) {
+        let [ex, ey] = event.get_coords();
+        let source = global.stage.get_event_actor(event);
+        if (!this._clickInsideBox(event) && !this._clickInOwnedMenu(source, ex, ey)) {
+            this._releaseKeyboard();
+            if (this.isExpanded)
+                this._collapseImmediately();
+            return true;
+        }
+        // Inside, but not on a text field: drop the field's focus so the
+        // notch can close normally again (hover-out / outside click).
+        let onField = false;
+        for (let a = source; a && !onField; a = a.get_parent())
+            onField = this._typables?.has(a) || this._typables?.has(a.clutter_text);
+        if (!onField)
+            this._releaseKeyboard();
+        return false;
     }
 
     // All PopupMenus this widget owns and mounts in Main.uiGroup — the Studio
