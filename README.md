@@ -9,7 +9,7 @@ A pill that lives at the top of your screen, morphs to show what you're doing, a
 ![NotchNux collapsed pill](assets/pill-collapsed.png)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-7aa2ff.svg)](LICENSE)
-![GNOME Shell 45–51](https://img.shields.io/badge/GNOME%20Shell-45%20→%2051-4a90d9.svg)
+![GNOME Shell 50](https://img.shields.io/badge/GNOME%20Shell-50-4a90d9.svg)
 ![Wayland & X11](https://img.shields.io/badge/Wayland%20%26%20X11-supported-32b76c.svg)
 
 </div>
@@ -101,7 +101,7 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 ## 📦 Installation
 
 ### Requirements
-- **GNOME Shell 45 – 51** (Wayland or X11)
+- **GNOME Shell 50** (Wayland)
 - `gnome-shell-extensions` (for the `gnome-extensions` CLI)
 - **Optional:** GStreamer 1.0 (`gstreamer1-plugins-*` / `gstreamer1.0-plugins-*`) for the Studio webcam & recording tab
 

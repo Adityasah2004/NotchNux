@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU, network, RAM and backlight readings, the lyrics cache and the live
   config reload are async too. (The prefs window, a separate process, still
   reads the config synchronously before each save.)
-- `shell-version` no longer claims GNOME 51, which has not been tested.
+- `shell-version` is now just GNOME 50, the only version it has been tested on.
 - Added `pack.sh` to build the upload zip.
 
 ### Fixed
