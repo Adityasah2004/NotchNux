@@ -18,6 +18,7 @@ import Pango from 'gi://Pango';
 import PangoCairo from 'gi://PangoCairo';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
+import { logError } from './log.js';
 
 // Shared palette — mirrors the concept's tokens (--acc / --acc2 etc.).
 // ACCENT / ACCENT2 are intentionally mutable arrays, not frozen constants:
@@ -195,7 +196,7 @@ class AlbumArtDisc extends St.Widget {
             this.set_style(`background-image: url("${uri}"); background-size: cover;`);
             this.visible = true;
         } catch (e) {
-            console.error('NotchNux: Failed to load circular album art', e);
+            logError('Failed to load circular album art', e);
             this.set_style('');
             this.visible = false;
         }
@@ -657,7 +658,7 @@ class CameraView extends St.Widget {
             this._round = new RoundedCornerEffect(size, 18);
             this._surface.add_effect(this._round);
         } catch (e) {
-            console.error('NotchNux: rounded camera mask unavailable', e);
+            logError('rounded camera mask unavailable', e);
         }
         this.set_clip_to_allocation(true);
 
@@ -693,7 +694,7 @@ class CameraView extends St.Widget {
                 width, height, stride);
             if (this._placeholder.visible) this._placeholder.visible = false;
         } catch (e) {
-            console.error('NotchNux: camera setFrame failed', e);
+            logError('camera setFrame failed', e);
         }
     }
 

@@ -329,7 +329,7 @@ const TrayFeatures = {
         if (this._nightLight === undefined) {
             let src = Gio.SettingsSchemaSource.get_default();
             this._nightLight = src?.lookup(NIGHT_LIGHT_SCHEMA, true)
-                ? new Gio.Settings({ schema_id: NIGHT_LIGHT_SCHEMA }) : null;
+                ? Gio.Settings.new(NIGHT_LIGHT_SCHEMA) : null;
         }
         return this._nightLight;
     },

@@ -10,7 +10,9 @@
 // unlock, so nothing here may live only in memory: the focus timer is stored as
 // a wall-clock end time and simply keeps running across a lock.
 
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import { logError } from './log.js';
 
 export const DATA_DIR = GLib.build_filenamev([GLib.get_user_data_dir(), 'notchnux']);
 const TASKS_PATH = GLib.build_filenamev([DATA_DIR, 'tasks.json']);
@@ -25,13 +27,21 @@ const MAX_TASK_LEN = 200;
 const MAX_TASKS = 500;
 const MAX_NOTES = 64 * 1024;
 
-export function readText(path) {
-    try {
-        let [ok, bytes] = GLib.file_get_contents(path);
-        return ok ? new TextDecoder().decode(bytes) : null;
-    } catch (e) {
-        return null;
-    }
+// Read a small data file without blocking the shell. Calls back with its
+// text, or null if it doesn't exist / can't be read; not at all if
+// `cancellable` was cancelled (the owner is being destroyed).
+export function readTextAsync(path, cancellable, cb) {
+    Gio.File.new_for_path(path).load_contents_async(cancellable, (f, res) => {
+        let text = null;
+        try {
+            let [, bytes] = f.load_contents_finish(res);
+            text = new TextDecoder().decode(bytes);
+        } catch (e) {
+            if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                return;
+        }
+        cb(text);
+    });
 }
 
 export function writeText(path, text) {
@@ -41,7 +51,7 @@ export function writeText(path, text) {
             GLib.FileSetContentsFlags.CONSISTENT, 0o600);
         GLib.chmod(path, 0o600);
     } catch (e) {
-        console.error(`NotchNux: failed to save ${path}`, e);
+        logError(`failed to save ${path}`, e);
     }
 }
 
@@ -53,13 +63,46 @@ export class ProductivityStore {
     constructor() {
         this._saveIds = {};
         this._listeners = new Set();
-        this._tasks = this._loadTasks();
-        this._notes = readText(NOTES_PATH) ?? '';
-        this._focus = this._loadFocus();
+        this._cancellable = new Gio.Cancellable();
+        // Empty until the files are read (async, a few ms after enable). A
+        // file is never written before it has been read, so the defaults
+        // can't overwrite saved data.
+        this._loaded = { tasks: false, notes: false, focus: false };
+        this._tasks = [];
+        this._notes = '';
+        this._focus = this._parseFocus(null);
         this._tickId = 0;
         this._swTickId = 0;
-        this._syncTicker();
-        this._syncSwTicker();
+        this._load();
+    }
+
+    get loaded() {
+        return this._loaded.tasks && this._loaded.notes && this._loaded.focus;
+    }
+
+    _load() {
+        let finish = () => {
+            if (!this.loaded)
+                return;
+            this._syncTicker();
+            this._syncSwTicker();
+            this._emit('loaded');
+        };
+        readTextAsync(TASKS_PATH, this._cancellable, text => {
+            this._tasks = this._parseTasks(text);
+            this._loaded.tasks = true;
+            finish();
+        });
+        readTextAsync(NOTES_PATH, this._cancellable, text => {
+            this._notes = text ?? '';
+            this._loaded.notes = true;
+            finish();
+        });
+        readTextAsync(FOCUS_PATH, this._cancellable, text => {
+            this._focus = this._parseFocus(text);
+            this._loaded.focus = true;
+            finish();
+        });
     }
 
     destroy() {
@@ -69,6 +112,7 @@ export class ProductivityStore {
             this._write(what);
         }
         this._saveIds = {};
+        this._cancellable.cancel();
         if (this._tickId) {
             GLib.Source.remove(this._tickId);
             this._tickId = 0;
@@ -92,7 +136,7 @@ export class ProductivityStore {
             try {
                 cb(kind);
             } catch (e) {
-                console.error('NotchNux: productivity listener failed', e);
+                logError('productivity listener failed', e);
             }
         }
     }
@@ -110,6 +154,8 @@ export class ProductivityStore {
     }
 
     _write(what) {
+        if (!this._loaded[what])
+            return;
         if (what === 'tasks')
             writeText(TASKS_PATH, JSON.stringify(this._tasks, null, 1));
         else if (what === 'notes')
@@ -186,9 +232,9 @@ export class ProductivityStore {
 
     // ---------------------------------------------------------------- tasks
 
-    _loadTasks() {
+    _parseTasks(text) {
         try {
-            let list = JSON.parse(readText(TASKS_PATH) ?? '[]');
+            let list = JSON.parse(text ?? '[]');
             if (!Array.isArray(list))
                 return [];
             return list
@@ -205,7 +251,7 @@ export class ProductivityStore {
         } catch (e) {
             // Keep the unreadable file for recovery instead of letting the
             // next save overwrite it.
-            console.error('NotchNux: tasks.json is unreadable; moved to tasks.json.bak', e);
+            logError('tasks.json is unreadable; moved to tasks.json.bak', e);
             GLib.rename(TASKS_PATH, `${TASKS_PATH}.bak`);
             return [];
         }
@@ -308,14 +354,14 @@ export class ProductivityStore {
     // while running), remainingMs (while paused), durationMs, presetMin,
     // silence, day, sessionsToday, focusMsToday, cycle }
 
-    _loadFocus() {
+    _parseFocus(text) {
         let base = {
             phase: 'idle', running: false, endsAt: 0, remainingMs: 0, durationMs: 25 * 60000,
             presetMin: 25, silence: true, day: todayKey(), sessionsToday: 0, focusMsToday: 0, cycle: 0,
         };
         let f;
         try {
-            f = { ...base, ...JSON.parse(readText(FOCUS_PATH) ?? '{}') };
+            f = { ...base, ...JSON.parse(text ?? '{}') };
         } catch (e) {
             f = base;
         }

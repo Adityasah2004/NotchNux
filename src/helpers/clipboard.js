@@ -11,12 +11,14 @@
 //     disk (~/.local/share/notchnux/clips.json, 0600) so they survive a
 //     restart.
 
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
-import { DATA_DIR, readText, writeText } from './productivity.js';
+import { DATA_DIR, readTextAsync, writeText } from './productivity.js';
+import { logError } from './log.js';
 
 const CLIPS_PATH = GLib.build_filenamev([DATA_DIR, 'clips.json']);
 const MAX_RECENT = 20;
@@ -33,6 +35,8 @@ export class ClipboardHistory {
         this._selection = null;
         this._ownerId = 0;
         this._readId = 0;
+        this._cancellable = new Gio.Cancellable();
+        this._pinnedLoaded = false;
         this._loadPinned();
     }
 
@@ -70,6 +74,7 @@ export class ClipboardHistory {
     }
 
     destroy() {
+        this._cancellable.cancel();
         this.stop();
         this.onChanged = null;
     }
@@ -152,19 +157,28 @@ export class ClipboardHistory {
         this._emit();
     }
 
+    // Pinned clips are read asynchronously and appended after anything
+    // copied in the meantime.
     _loadPinned() {
-        try {
-            let list = JSON.parse(readText(CLIPS_PATH) ?? '[]');
-            for (let p of Array.isArray(list) ? list.slice(0, MAX_PINNED) : []) {
-                if (typeof p?.text === 'string' && p.text)
-                    this._items.push({ id: ++this._seq, text: p.text.slice(0, MAX_TEXT), app: String(p.app ?? ''), at: Number(p.at) || 0, pinned: true });
+        readTextAsync(CLIPS_PATH, this._cancellable, text => {
+            try {
+                let list = JSON.parse(text ?? '[]');
+                for (let p of Array.isArray(list) ? list.slice(0, MAX_PINNED) : []) {
+                    if (typeof p?.text === 'string' && p.text)
+                        this._items.push({ id: ++this._seq, text: p.text.slice(0, MAX_TEXT), app: String(p.app ?? ''), at: Number(p.at) || 0, pinned: true });
+                }
+            } catch (e) {
+                // A corrupt file just means no pinned clips.
             }
-        } catch (e) {
-            // A corrupt file just means no pinned clips.
-        }
+            this._pinnedLoaded = true;
+            this._emit();
+        });
     }
 
     _savePinned() {
+        // Don't replace the saved pins before they have been read.
+        if (!this._pinnedLoaded)
+            return;
         let pinned = this._items.filter(i => i.pinned).map(({ text, app, at }) => ({ text, app, at }));
         writeText(CLIPS_PATH, JSON.stringify(pinned));
     }
@@ -173,7 +187,7 @@ export class ClipboardHistory {
         try {
             this.onChanged?.();
         } catch (e) {
-            console.error('NotchNux: clipboard listener failed', e);
+            logError('clipboard listener failed', e);
         }
     }
 }

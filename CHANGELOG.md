@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — extensions.gnome.org readiness
+- Clipboard history is now opt-in for new installs (Preferences → Tabs);
+  the metadata description declares clipboard and network use.
+- Logging goes through one helper: each distinct error is logged once per
+  session (a failing poll can't flood the journal) and diagnostic messages
+  only appear with `NOTCHNUX_DEBUG=1`. No more enable/disable log lines.
+- No synchronous file IO left in the shell: the config, tasks, notes, focus
+  state, pinned clips and weather cache load asynchronously at enable, and
+  CPU, network, RAM and backlight readings, the lyrics cache and the live
+  config reload are async too. (The prefs window, a separate process, still
+  reads the config synchronously before each save.)
+- `shell-version` no longer claims GNOME 51, which has not been tested.
+- Added `pack.sh` to build the upload zip.
+
+### Fixed
+- The wallpaper thumbnail worker is killed when the extension is disabled
+  instead of being left to finish on its own.
+
 ## [1.6.1] - 2026-11-01
 
 ### Fixed — text fields trapping the notch open

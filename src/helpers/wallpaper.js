@@ -24,6 +24,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import { WallpaperTransition } from './wptransition.js';
+import { logError, logDebug } from './log.js';
 
 const BG_SCHEMA = 'org.gnome.desktop.background';
 
@@ -76,13 +77,13 @@ function pruneDir(dir, keep) {
             try { d.get_child(name).delete(null); } catch (e) {}
         }
     } catch (e) {
-        console.warn('NotchNux: wallpaper cache prune failed', e.message);
+        logDebug('wallpaper cache prune failed', e.message);
     }
 }
 
 export class WallpaperHelper {
     constructor() {
-        this._bg = new Gio.Settings({ schema_id: BG_SCHEMA });
+        this._bg = Gio.Settings.new(BG_SCHEMA);
         this._transition = new WallpaperTransition();
         this._cancellable = new Gio.Cancellable();
 
@@ -154,6 +155,10 @@ export class WallpaperHelper {
         this._cancellable.cancel();
         this._applyProc?.force_exit();
         this._applyProc = null;
+        // Cancelling only stops reading the worker's output; kill it too so
+        // no gjs process outlives the extension.
+        this._thumbProc?.force_exit();
+        this._thumbProc = null;
         this._thumbQueue = [];
         this._thumbWaiters.clear();
         this._unwatchFolder();
@@ -264,7 +269,7 @@ export class WallpaperHelper {
             }
             enumerator.close(null);
         } catch (e) {
-            console.error('NotchNux: Failed to enumerate wallpaper folder', e);
+            logError('Failed to enumerate wallpaper folder', e);
         }
         list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
         return list;
@@ -313,7 +318,7 @@ export class WallpaperHelper {
             proc = Gio.Subprocess.new(argv,
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
         } catch (e) {
-            console.error('NotchNux: cannot start image worker', e);
+            logError('cannot start image worker', e);
             done(null);
             return null;
         }
@@ -326,7 +331,7 @@ export class WallpaperHelper {
                 return;
             }
             if (stderr?.trim())
-                console.warn(`NotchNux: image worker: ${stderr.trim().slice(0, 300)}`);
+                logDebug(`image worker: ${stderr.trim().slice(0, 300)}`);
             if (!p.get_successful()) {
                 done(null);
                 return;
@@ -398,10 +403,11 @@ export class WallpaperHelper {
             return;
         this._thumbBusy = true;
         let batch = this._thumbQueue.splice(0, THUMB_BATCH);
-        this._spawnWorker('thumbs', {
+        this._thumbProc = this._spawnWorker('thumbs', {
             items: batch, landscape: this._autoLandscape, w: THUMB_W, h: THUMB_H,
         }, result => {
             this._thumbBusy = false;
+            this._thumbProc = null;
             let ok = new Set(result?.done ?? []);
             for (let item of batch) {
                 let waiters = this._thumbWaiters.get(item.src) ?? [];
@@ -409,7 +415,7 @@ export class WallpaperHelper {
                 if (!ok.has(item.src))
                     continue;
                 for (let cb of waiters) {
-                    try { cb(item.src, item.out); } catch (e) { console.error(e); }
+                    try { cb(item.src, item.out); } catch (e) { logError('wallpaper thumbnail callback failed', e); }
                 }
             }
             if (!this._cancellable.is_cancelled())

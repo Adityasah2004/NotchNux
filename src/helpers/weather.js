@@ -1,6 +1,7 @@
 import Soup from 'gi://Soup';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import { logError, logDebug } from './log.js';
 
 const GEOCLUE = 'org.freedesktop.GeoClue2';
 // GClueAccuracyLevel.CITY — plenty for weather, and it doesn't ask GeoClue for
@@ -20,7 +21,11 @@ export class WeatherHelper {
         this._cancellable = new Gio.Cancellable();
         this._configDir = GLib.build_filenamev([GLib.get_user_config_dir(), 'notchnux']);
         this._configPath = GLib.build_filenamev([this._configDir, 'settings.json']);
-        this._settings = this._loadSettings();
+        // Filled in by _loadSettings() (async). Until then nothing is
+        // fetched or saved, so the empty defaults never overwrite the file.
+        this._settings = {};
+        this._settingsLoaded = false;
+        this._pendingUpdate = false;
         this._geo = null;   // in-flight GeoClue session, see _fetchGeoClueLocation
         this.weatherData = {
             temp: '--',
@@ -38,13 +43,34 @@ export class WeatherHelper {
             manualLocation: this._settings.locationQuery || '',
             loaded: false,
         };
-        // Restore the last good forecast so the UI has real numbers right away.
-        let cached = this._settings.lastWeather;
-        if (cached?.data?.loaded && typeof cached.at === 'number')
-            this.weatherData = { ...this.weatherData, ...cached.data, hourly: cached.data.hourly ?? [] };
-
         this.onWeatherUpdated = null;
         this._timeFmt = new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit' });
+        this._loadSettings();
+    }
+
+    _loadSettings() {
+        Gio.File.new_for_path(this._configPath).load_contents_async(this._cancellable, (f, res) => {
+            let parsed = {};
+            try {
+                let [, bytes] = f.load_contents_finish(res);
+                parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+            }
+            this._settings = parsed && typeof parsed === 'object' ? parsed : {};
+            this._settingsLoaded = true;
+            // Restore the last good forecast so the UI has real numbers right away.
+            let cached = this._settings.lastWeather;
+            if (cached?.data?.loaded && typeof cached.at === 'number')
+                this.weatherData = { ...this.weatherData, ...cached.data, hourly: cached.data.hourly ?? [] };
+            this.weatherData.manualLocation = this._settings.locationQuery || '';
+            this._notify();
+            if (this._pendingUpdate) {
+                this._pendingUpdate = false;
+                this.updateWeather();
+            }
+        });
     }
 
     destroy() {
@@ -71,6 +97,10 @@ export class WeatherHelper {
 
     // --- Main Entry ---
     updateWeather() {
+        if (!this._settingsLoaded) {
+            this._pendingUpdate = true;
+            return;
+        }
         if (this._settings.locationQuery) {
             this.updateWeatherForLocation(this._settings.locationQuery);
             return;
@@ -134,19 +164,9 @@ export class WeatherHelper {
         });
     }
 
-    _loadSettings() {
-        try {
-            let [ok, bytes] = GLib.file_get_contents(this._configPath);
-            if (!ok || !bytes)
-                return {};
-            let parsed = JSON.parse(new TextDecoder('utf-8').decode(bytes));
-            return parsed && typeof parsed === 'object' ? parsed : {};
-        } catch (e) {
-            return {};
-        }
-    }
-
     _saveSettings() {
+        if (!this._settingsLoaded)
+            return;
         try {
             GLib.mkdir_with_parents(this._configDir, 0o700);
             GLib.file_set_contents_full(this._configPath,
@@ -154,7 +174,7 @@ export class WeatherHelper {
                 GLib.FileSetContentsFlags.CONSISTENT, 0o600);
             GLib.chmod(this._configPath, 0o600);
         } catch (e) {
-            console.error('NotchNux: Failed to save weather settings.', e);
+            logError('Failed to save weather settings.', e);
         }
     }
 
@@ -173,7 +193,7 @@ export class WeatherHelper {
                 } catch (e) {
                     if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
                         return;
-                    console.warn(`NotchNux: weather request failed: ${e.message}`);
+                    logDebug(`weather request failed: ${e.message}`);
                 }
                 done(json);
             });
@@ -217,7 +237,7 @@ export class WeatherHelper {
                     cb(c.call_finish(res));
                 } catch (e) {
                     if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                        console.warn(`NotchNux: GeoClue ${method} failed: ${e.message}`);
+                        logDebug(`GeoClue ${method} failed: ${e.message}`);
                     this._finishGeoClue(geo, null);
                 }
             });

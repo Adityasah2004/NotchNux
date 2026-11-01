@@ -1,6 +1,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import { logError } from './log.js';
 
 const DBUS_SERVICE = 'org.freedesktop.DBus';
 const DBUS_PATH = '/org/freedesktop/DBus';
@@ -167,7 +168,7 @@ export class MprisHelper {
                     proxy = Gio.DBusProxy.new_for_bus_finish(res);
                 } catch (e) {
                     if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                        console.error(`NotchNux: Error setting up MPRIS proxy for ${busName}`, e);
+                        logError(`Error setting up MPRIS proxy for ${busName}`, e);
                     return;
                 }
                 this._finishAddPlayer(busName, proxy);
@@ -208,7 +209,7 @@ export class MprisHelper {
                 this.onPlayersListChanged();
             }
         } catch (e) {
-            console.error(`NotchNux: Error setting up MPRIS proxy for ${busName}`, e);
+            logError(`Error setting up MPRIS proxy for ${busName}`, e);
         }
     }
 

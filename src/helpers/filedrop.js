@@ -19,6 +19,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import { logError } from './log.js';
 
 const CATCHER = Gio.File.new_for_uri(import.meta.url)
     .get_parent().get_parent().get_child('tools').get_child('drop-catcher.js').get_path();
@@ -202,7 +203,7 @@ export class FileDropBridge {
                 ['gjs', '-m', CATCHER]);
             this._proc = this._client.get_subprocess();
         } catch (e) {
-            console.error('NotchNux: drop helper failed to start', e);
+            logError('drop helper failed to start', e);
             this._client = null;
             this._proc = null;
             return;

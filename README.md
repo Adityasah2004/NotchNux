@@ -173,6 +173,10 @@ Everything is stored locally, readable only by you (`0600` files in `0700` folde
   ```bash
   journalctl -f -o cat /usr/bin/gnome-shell
   ```
+  NotchNux logs each distinct error once. For verbose diagnostics (WiFi,
+  Bluetooth, brightness, weather fallbacks), start GNOME Shell with
+  `NOTCHNUX_DEBUG=1` in its environment.
+- **Clipboard tab missing** → clipboard history is opt-in; enable it in Preferences → Tabs.
 
 ## 🤝 Contributing
 
@@ -181,6 +185,8 @@ This is a young project and **help is very welcome** — bug reports, feature id
 1. Fork the repo and create a branch.
 2. Make your change and test it in a nested session.
 3. Open a pull request describing what you changed and why.
+
+To build the zip for [extensions.gnome.org](https://extensions.gnome.org/upload/), run `./pack.sh`; it writes `dist/notchnux@adityasah.programs.shell-extension.zip` with only the runtime files.
 
 ## 📄 License
 

@@ -1,6 +1,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
+import { logError } from './log.js';
 
 // GNOME disables every extension while the screen is locked and re-enables it
 // on unlock, which reconstructs ShelfHelper each time. The shelf is meant to be
@@ -33,7 +34,7 @@ export class ShelfHelper {
             // 0700: shelf files are the user's private documents.
             GLib.mkdir_with_parents(this.shelfDir, 0o700);
         } catch (e) {
-            console.error('NotchNux: Error creating shelf directory', e);
+            logError('Error creating shelf directory', e);
         }
     }
 
@@ -71,7 +72,7 @@ export class ShelfHelper {
             }
             enumerator.close(null);
         } catch (e) {
-            console.error('NotchNux: Error enumerating shelf files', e);
+            logError('Error enumerating shelf files', e);
         }
         list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
         return list;
@@ -146,7 +147,7 @@ export class ShelfHelper {
                             finish(true);
                         } catch (e) {
                             if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                                console.error(`NotchNux: Failed to add ${sf.get_basename()} to shelf`, e);
+                                logError(`Failed to add ${sf.get_basename()} to shelf`, e);
                             finish(false);
                         }
                     });
@@ -176,7 +177,7 @@ export class ShelfHelper {
             file.delete(null);
             return true;
         } catch (e) {
-            console.error(`NotchNux: Failed to delete shelf file ${filePath}`, e);
+            logError(`Failed to delete shelf file ${filePath}`, e);
         }
         return false;
     }
@@ -200,7 +201,7 @@ export class ShelfHelper {
             }
             enumerator.close(null);
         } catch (e) {
-            console.error('NotchNux: Failed to clear shelf', e);
+            logError('Failed to clear shelf', e);
         }
     }
 
@@ -210,7 +211,7 @@ export class ShelfHelper {
             try {
                 Gio.AppInfo.launch_default_for_uri_finish(res);
             } catch (e) {
-                console.error(`NotchNux: Failed to open ${filePath}`, e);
+                logError(`Failed to open ${filePath}`, e);
             }
         });
     }
@@ -237,7 +238,7 @@ export class ShelfHelper {
                     try {
                         Gio.AppInfo.launch_default_for_uri(dirUri, null);
                     } catch (e2) {
-                        console.error('NotchNux: Failed to reveal shelf file', e2);
+                        logError('Failed to reveal shelf file', e2);
                     }
                 }
             });
@@ -248,7 +249,7 @@ export class ShelfHelper {
             let clipboard = St.Clipboard.get_default();
             clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
         } catch (e) {
-            console.error('NotchNux: Failed to set clipboard text', e);
+            logError('Failed to set clipboard text', e);
         }
     }
 
@@ -375,7 +376,7 @@ export class ShelfHelper {
                 try {
                     bus.call_finish(res);
                 } catch (e) {
-                    console.error('NotchNux: FileChooser portal call failed', e);
+                    logError('FileChooser portal call failed', e);
                     finish(0);
                 }
             }
@@ -457,12 +458,12 @@ export class ShelfHelper {
                 null,
                 (src, res) => {
                     try { src.call_finish(res); }
-                    catch (e) { console.error('NotchNux: shareFile dispatch failed', e); }
+                    catch (e) { logError('shareFile dispatch failed', e); }
                 }
             );
             return true;
         } catch (e) {
-            console.error(`NotchNux: Failed to send ${filePath} to ${devicePath}`, e);
+            logError(`Failed to send ${filePath} to ${devicePath}`, e);
             return false;
         }
     }

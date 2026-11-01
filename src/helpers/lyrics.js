@@ -86,12 +86,17 @@ export class LyricsService {
             cb(this._memo.get(key));
             return;
         }
-        let cached = this._readCache(key);
-        if (cached !== undefined) {
-            this._memo.set(key, cached);
-            cb(cached);
-            return;
-        }
+        this._readCache(key, cached => {
+            if (cached !== undefined) {
+                this._memo.set(key, cached);
+                cb(cached);
+                return;
+            }
+            this._lookupNetwork(key, track, allowNetwork, cb);
+        });
+    }
+
+    _lookupNetwork(key, track, allowNetwork, cb) {
         if (!allowNetwork) {
             cb(null);
             return;
@@ -189,19 +194,27 @@ export class LyricsService {
         });
     }
 
-    // undefined = not cached; null = cached miss (still fresh).
-    _readCache(key) {
-        try {
-            let [ok, bytes] = GLib.file_get_contents(GLib.build_filenamev([this._dir, `${key}.json`]));
-            if (!ok)
-                return undefined;
-            let entry = JSON.parse(new TextDecoder().decode(bytes));
+    // Calls back with undefined = not cached, null = cached miss (still
+    // fresh), or the cached result. The read is async; a cancelled read
+    // (destroy) never calls back.
+    _readCache(key, cb) {
+        let file = Gio.File.new_for_path(GLib.build_filenamev([this._dir, `${key}.json`]));
+        file.load_contents_async(this._cancellable, (f, res) => {
+            let entry;
+            try {
+                let [, bytes] = f.load_contents_finish(res);
+                entry = JSON.parse(new TextDecoder().decode(bytes));
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                cb(undefined);
+                return;
+            }
             if (!entry.result && Date.now() - (entry.at ?? 0) > MISS_TTL_MS)
-                return undefined;
-            return entry.result ?? null;
-        } catch (e) {
-            return undefined;
-        }
+                cb(undefined);
+            else
+                cb(entry.result ?? null);
+        });
     }
 
     _writeCache(key, result) {

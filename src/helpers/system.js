@@ -7,6 +7,7 @@ import NM from 'gi://NM';
 
 // We import Main to control screen brightness and check layout
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import { logError, logDebug } from './log.js';
 
 export class SystemHelper {
     constructor() {
@@ -29,6 +30,10 @@ export class SystemHelper {
         this._cancellable = new Gio.Cancellable();
         this._timeouts = new Set();
 
+        // Find the backlight device up front (async) so the first brightness
+        // read or logind write already knows its max_brightness.
+        this._probeBacklight();
+
         // UPower client, created asynchronously (the sync constructor blocks on
         // the system bus on every enable, i.e. every unlock). `onPowerReady`
         // fires once it's up. The display device and accessory list are cached:
@@ -43,7 +48,7 @@ export class SystemHelper {
                     this._upowerClient = UPower.Client.new_finish(res);
                 } catch (e) {
                     if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
-                        console.error('NotchNux: Failed to initialize UPower Client', e);
+                        logError('Failed to initialize UPower Client', e);
                     return;
                 }
                 // One-time lookup, cached: the display device's properties
@@ -52,7 +57,7 @@ export class SystemHelper {
                 this.onPowerReady?.();
             });
         } catch (e) {
-            console.error('NotchNux: Failed to initialize UPower Client', e);
+            logError('Failed to initialize UPower Client', e);
         }
 
         // NetworkManager client for WiFi state + hotspot control. Created async
@@ -77,18 +82,18 @@ export class SystemHelper {
                     }
                     this._emitWifiChanged();
                 } catch (e) {
-                    console.warn('NotchNux: NetworkManager unavailable', e.message);
+                    logDebug('NetworkManager unavailable', e.message);
                 }
             });
         } catch (e) {
-            console.warn('NotchNux: failed to start NetworkManager client', e.message);
+            logDebug('failed to start NetworkManager client', e.message);
         }
 
         // Initialize Gio Volume Monitor
         try {
             this._volumeMonitor = Gio.VolumeMonitor.get();
         } catch (e) {
-            console.error('NotchNux: Failed to initialize Gio Volume Monitor', e);
+            logError('Failed to initialize Gio Volume Monitor', e);
         }
 
         // Initialize Volume Controller (Gvc)
@@ -112,7 +117,7 @@ export class SystemHelper {
         try {
             this._initVolumeControl();
         } catch (e) {
-            console.error('NotchNux: Failed to initialize Gvc volume control', e);
+            logError('Failed to initialize Gvc volume control', e);
         }
 
         // System throughput/CPU polling is started on demand when the System tab is open
@@ -206,7 +211,7 @@ export class SystemHelper {
                 try {
                     onRecord(record);
                 } catch (e) {
-                    console.warn(`NotchNux: privacy monitor ${name}: ${e.message}`);
+                    logDebug(`privacy monitor ${name}: ${e.message}`);
                 }
             }
             read();
@@ -223,13 +228,33 @@ export class SystemHelper {
         entry.proc?.force_exit();
     }
 
+    // Read a small file (/proc, /sys) without blocking the compositor, then
+    // run onText(text). onError() runs if the read fails (not when cancelled
+    // by destroy()).
+    _readFileAsync(path, onText, onError = null) {
+        Gio.File.new_for_path(path).load_contents_async(this._cancellable, (f, res) => {
+            let text;
+            try {
+                let [, contents] = f.load_contents_finish(res);
+                text = ByteArrayToString(contents);
+            } catch (e) {
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    onError?.(e);
+                return;
+            }
+            onText(text);
+        });
+    }
+
     startSysPolling() {
         if (this._sysPollingTimeout) return;
         this._updateCpuUsage();
         this._updateNetUsage();
+        this._readMeminfo();
         this._sysPollingTimeout = GLib.timeout_add(GLib.PRIORITY_LOW, 2500, () => {
             this._updateCpuUsage();
             this._updateNetUsage();
+            this._readMeminfo();
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -301,13 +326,14 @@ export class SystemHelper {
     }
 
     // --- CPU Usage ---
+    // Kicks off an async read; getCpuUsage() returns the latest sample.
     _updateCpuUsage() {
-        try {
-            let file = Gio.File.new_for_path('/proc/stat');
-            let [success, contents] = file.load_contents(null);
-            if (!success) return;
+        this._readFileAsync('/proc/stat', text => this._parseCpuUsage(text));
+    }
 
-            let lines = ByteArrayToString(contents).split('\n');
+    _parseCpuUsage(text) {
+        try {
+            let lines = text.split('\n');
             let cpuLine = lines.find(line => line.startsWith('cpu '));
             if (!cpuLine) return;
 
@@ -327,7 +353,7 @@ export class SystemHelper {
             this._lastCpuTotal = total;
             this._lastCpuIdle = idle;
         } catch (e) {
-            console.error('NotchNux: Error updating CPU usage', e);
+            logError('Error updating CPU usage', e);
         }
     }
 
@@ -340,12 +366,12 @@ export class SystemHelper {
     // bridges/veth) from /proc/net/dev, then divide the delta by elapsed time
     // to get a live rate. First sample only seeds the counters.
     _updateNetUsage() {
-        try {
-            let file = Gio.File.new_for_path('/proc/net/dev');
-            let [success, contents] = file.load_contents(null);
-            if (!success) return;
+        this._readFileAsync('/proc/net/dev', text => this._parseNetUsage(text));
+    }
 
-            let lines = ByteArrayToString(contents).split('\n');
+    _parseNetUsage(text) {
+        try {
+            let lines = text.split('\n');
             let rx = 0, tx = 0;
             for (let line of lines) {
                 let idx = line.indexOf(':');
@@ -374,7 +400,7 @@ export class SystemHelper {
             this._lastNetTx = tx;
             this._lastNetStamp = now;
         } catch (e) {
-            console.error('NotchNux: Error updating network usage', e);
+            logError('Error updating network usage', e);
         }
     }
 
@@ -407,20 +433,25 @@ export class SystemHelper {
     }
 
     // --- RAM and Swap Usage ---
+    // Returns the last sample at once and refreshes it in the background when
+    // it is older than 1.5 s, so callers never wait on file IO.
     _readMeminfo() {
         let now = GLib.get_monotonic_time();
-        if (this._meminfoCache && (now - (this._meminfoStamp || 0)) < 1500000) {
-            return this._meminfoCache;
+        if (!this._meminfoBusy && (now - (this._meminfoStamp || 0)) >= 1500000) {
+            this._meminfoBusy = true;
+            this._readFileAsync('/proc/meminfo', text => {
+                this._meminfoBusy = false;
+                this._parseMeminfo(text);
+            }, () => { this._meminfoBusy = false; });
         }
-        let cache = { ram: 0, swap: 0 };
-        try {
-            let file = Gio.File.new_for_path('/proc/meminfo');
-            let [success, contents] = file.load_contents(null);
-            if (!success) return cache;
+        return this._meminfoCache ?? { ram: 0, swap: 0 };
+    }
 
-            let lines = ByteArrayToString(contents).split('\n');
+    _parseMeminfo(text) {
+        try {
+            let cache = { ram: 0, swap: 0 };
             let memTotal = 0, memAvailable = 0, swapTotal = 0, swapFree = 0;
-            for (let line of lines) {
+            for (let line of text.split('\n')) {
                 if (line.startsWith('MemTotal:')) memTotal = Number(line.replace(/\D/g, ''));
                 else if (line.startsWith('MemAvailable:')) memAvailable = Number(line.replace(/\D/g, ''));
                 else if (line.startsWith('SwapTotal:')) swapTotal = Number(line.replace(/\D/g, ''));
@@ -429,11 +460,10 @@ export class SystemHelper {
             if (memTotal > 0) cache.ram = Math.round(((memTotal - memAvailable) / memTotal) * 100);
             if (swapTotal > 0) cache.swap = Math.round(((swapTotal - swapFree) / swapTotal) * 100);
             this._meminfoCache = cache;
-            this._meminfoStamp = now;
+            this._meminfoStamp = GLib.get_monotonic_time();
         } catch (e) {
-            console.error('NotchNux: Error reading meminfo', e);
+            logError('Error reading meminfo', e);
         }
-        return cache;
     }
 
     getRamUsage() {
@@ -454,7 +484,7 @@ export class SystemHelper {
             if (size > 0)
                 return Math.round((used / size) * 100);
         } catch (e) {
-            console.error('NotchNux: Error reading disk usage', e);
+            logError('Error reading disk usage', e);
         }
         return 0;
     }
@@ -472,7 +502,7 @@ export class SystemHelper {
                 };
             }
         } catch (e) {
-            console.error('NotchNux: Error reading battery', e);
+            logError('Error reading battery', e);
         }
         return { percentage: 100, isCharging: false };
     }
@@ -623,7 +653,7 @@ export class SystemHelper {
         try {
             this.onOutputChanged?.({ name, port, bluetooth, headphones });
         } catch (e) {
-            console.error('NotchNux: output change handler failed', e);
+            logError('output change handler failed', e);
         }
     }
 
@@ -668,24 +698,22 @@ export class SystemHelper {
                 if (!Number.isNaN(scale)) return Math.round(scale * 100);
             }
         } catch (e) {
-            console.error('NotchNux: Error getting brightness from brightnessManager', e);
+            logError('Error getting brightness from brightnessManager', e);
         }
         // Read the real backlight level from sysfs (world-readable), so the
         // knob reflects changes made via logind on shells without a gsd Screen
         // proxy. This is authoritative when it works.
-        try {
-            let dev = this._backlightDevice();
-            if (dev) {
-                let [ok, contents] = Gio.File.new_for_path(
-                    `/sys/class/backlight/${dev.name}/brightness`).load_contents(null);
-                if (ok) {
-                    let raw = Number(ByteArrayToString(contents).trim());
-                    if (Number.isFinite(raw) && dev.max > 0)
-                        return Math.round((raw / dev.max) * 100);
-                }
-            }
-        } catch (e) {
-            // fall through
+        // The value is read asynchronously, so this returns the previous
+        // sample and refreshes it for the next call.
+        let dev = this._backlightDevice();
+        if (dev) {
+            this._readFileAsync(`/sys/class/backlight/${dev.name}/brightness`, text => {
+                let raw = Number(text.trim());
+                if (Number.isFinite(raw) && dev.max > 0)
+                    this._sysBrightness = Math.round((raw / dev.max) * 100);
+            });
+            if (this._sysBrightness !== undefined)
+                return this._sysBrightness;
         }
         // Fallback: gsd Power brightness proxy (0..100, -1 when unsupported).
         let b = this._getGsdBrightness();
@@ -745,7 +773,7 @@ export class SystemHelper {
                 try {
                     c.call_finish(res);
                 } catch (e) {
-                    console.warn('NotchNux: airplane-mode control unavailable', e.message);
+                    logDebug('airplane-mode control unavailable', e.message);
                 }
                 cb?.();
             });
@@ -842,7 +870,7 @@ export class SystemHelper {
         try {
             this._nmClient.wireless_set_enabled(!!on);
         } catch (e) {
-            console.warn('NotchNux: WiFi toggle failed', e.message);
+            logDebug('WiFi toggle failed', e.message);
         }
     }
 
@@ -865,11 +893,11 @@ export class SystemHelper {
                 if (active)
                     this._nmClient.deactivate_connection_async(active, null, (c, res) => {
                         try { c.deactivate_connection_finish(res); done(true); }
-                        catch (e) { console.warn('NotchNux: hotspot off failed', e.message); done(false); }
+                        catch (e) { logDebug('hotspot off failed', e.message); done(false); }
                     });
                 else
                     done(true);
-            } catch (e) { console.warn('NotchNux: hotspot off failed', e.message); done(false); }
+            } catch (e) { logDebug('hotspot off failed', e.message); done(false); }
             return;
         }
 
@@ -909,7 +937,7 @@ export class SystemHelper {
             let activateExisting = () => {
                 this._nmClient.activate_connection_async(existing, dev, null, null, (c, res) => {
                     try { c.activate_connection_finish(res); done(true, { concurrent }); }
-                    catch (e) { console.warn('NotchNux: hotspot activate failed', e.message); done(false); }
+                    catch (e) { logDebug('hotspot activate failed', e.message); done(false); }
                 });
             };
             try {
@@ -943,7 +971,7 @@ export class SystemHelper {
                 c.add_and_activate_connection_finish(res);
                 done(true, { ssid, password, concurrent });
             } catch (e) {
-                console.warn('NotchNux: hotspot create failed', e.message);
+                logDebug('hotspot create failed', e.message);
                 done(false);
             }
         });
@@ -985,7 +1013,7 @@ export class SystemHelper {
             connection.add_setting(new NM.SettingIP6Config({ method: 'ignore' }));
             return connection;
         } catch (e) {
-            console.warn('NotchNux: could not build hotspot connection', e.message);
+            logDebug('could not build hotspot connection', e.message);
             return null;
         }
     }
@@ -1133,9 +1161,9 @@ export class SystemHelper {
             try {
                 this._nmClient.activate_connection_async(conn, dev, null, null, (c, res) => {
                     try { c.activate_connection_finish(res); done(true); }
-                    catch (e) { console.warn('NotchNux: WiFi activate failed', e.message); done(false, e.message); }
+                    catch (e) { logDebug('WiFi activate failed', e.message); done(false, e.message); }
                 });
-            } catch (e) { console.warn('NotchNux: WiFi activate failed', e.message); done(false, e.message); }
+            } catch (e) { logDebug('WiFi activate failed', e.message); done(false, e.message); }
         };
         if (!ssid) { activate(); return; } // no SSID to gate on — proceed
         this._ensureWifiSsidInRange(ssid, (inRange) => {
@@ -1181,9 +1209,9 @@ export class SystemHelper {
                     try {
                         this._nmClient.activate_connection_async(c, dev, null, null, (cl, res) => {
                             try { cl.activate_connection_finish(res); done(true); }
-                            catch (e) { console.warn('NotchNux: WiFi activate failed', e.message); done(false, e.message); }
+                            catch (e) { logDebug('WiFi activate failed', e.message); done(false, e.message); }
                         });
-                    } catch (e) { console.warn('NotchNux: WiFi activate failed', e.message); done(false, e.message); }
+                    } catch (e) { logDebug('WiFi activate failed', e.message); done(false, e.message); }
                     return;
                 }
             }
@@ -1208,15 +1236,15 @@ export class SystemHelper {
                 }));
             }
         } catch (e) {
-            console.warn('NotchNux: could not build WiFi connection', e.message);
+            logDebug('could not build WiFi connection', e.message);
             done(false, e.message); return;
         }
         try {
             this._nmClient.add_and_activate_connection_async(connection, dev, null, null, (c, res) => {
                 try { c.add_and_activate_connection_finish(res); done(true); }
-                catch (e) { console.warn('NotchNux: WiFi connect failed', e.message); done(false, e.message); }
+                catch (e) { logDebug('WiFi connect failed', e.message); done(false, e.message); }
             });
-        } catch (e) { console.warn('NotchNux: WiFi connect failed', e.message); done(false, e.message); }
+        } catch (e) { logDebug('WiFi connect failed', e.message); done(false, e.message); }
     }
 
     setBrightness(value) {
@@ -1230,7 +1258,7 @@ export class SystemHelper {
                 }
             } catch (e) {
                 this._brightnessWriteUnsupported = true;
-                console.warn('NotchNux: brightnessManager write unavailable; using logind', e.message);
+                logDebug('brightnessManager write unavailable; using logind', e.message);
             }
         }
         // Fallback: systemd-logind Session.SetBrightness. Unlike the gsd Power
@@ -1250,37 +1278,67 @@ export class SystemHelper {
                 null, Gio.DBusCallFlags.NONE, 1000, null,
                 (conn, res) => {
                     try { conn.call_finish(res); }
-                    catch (e) { console.warn('NotchNux: logind SetBrightness failed', e.message); }
+                    catch (e) { logDebug('logind SetBrightness failed', e.message); }
                 }));
         } catch (e) {
-            console.warn('NotchNux: brightness control unavailable on this shell', e.message);
+            logDebug('brightness control unavailable on this shell', e.message);
         }
     }
 
     // Locate a backlight device under /sys/class/backlight (first one found)
     // and cache its name + max_brightness. Returns null when none exists.
     _backlightDevice() {
-        if (this._backlight !== undefined) return this._backlight;
-        this._backlight = null;
-        try {
-            let dir = Gio.File.new_for_path('/sys/class/backlight');
-            let en = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
-            let info;
-            while ((info = en.next_file(null)) !== null) {
-                let name = info.get_name();
+        if (this._backlight === undefined)
+            this._probeBacklight();
+        return this._backlight ?? null;
+    }
+
+    // Find the first device under /sys/class/backlight with a usable
+    // max_brightness, asynchronously. Until it finishes _backlight stays
+    // undefined; afterwards it is { name, max } or null (none found).
+    _probeBacklight() {
+        if (this._backlightProbing)
+            return;
+        this._backlightProbing = true;
+        let finish = dev => {
+            this._backlightProbing = false;
+            this._backlight = dev;
+            if (dev)
+                this.getBrightness();       // prime the cached level
+            else
+                logDebug('no backlight device found');
+        };
+        let dir = Gio.File.new_for_path('/sys/class/backlight');
+        dir.enumerate_children_async('standard::name', Gio.FileQueryInfoFlags.NONE,
+            GLib.PRIORITY_LOW, this._cancellable, (d, res) => {
+                let names = [];
                 try {
-                    let [ok, contents] = Gio.File.new_for_path(
-                        `/sys/class/backlight/${name}/max_brightness`).load_contents(null);
-                    if (ok) {
-                        let max = Number(ByteArrayToString(contents).trim());
-                        if (max > 0) { this._backlight = { name, max }; break; }
+                    let en = d.enumerate_children_finish(res);
+                    let info;
+                    while ((info = en.next_file(null)) !== null)
+                        names.push(info.get_name());
+                    en.close(null);
+                } catch (e) {
+                    if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                        finish(null);
+                    return;
+                }
+                let tryNext = () => {
+                    let name = names.shift();
+                    if (name === undefined) {
+                        finish(null);
+                        return;
                     }
-                } catch (e) { /* try next */ }
-            }
-        } catch (e) {
-            console.warn('NotchNux: no backlight device found', e.message);
-        }
-        return this._backlight;
+                    this._readFileAsync(`/sys/class/backlight/${name}/max_brightness`, text => {
+                        let max = Number(text.trim());
+                        if (max > 0)
+                            finish({ name, max });
+                        else
+                            tryNext();
+                    }, tryNext);
+                };
+                tryNext();
+            });
     }
 
     // Resolve the graphical logind session object path asynchronously, then
@@ -1301,7 +1359,7 @@ export class SystemHelper {
             });
         let done = path => {
             if (!path) {
-                console.warn('NotchNux: could not resolve logind session');
+                logDebug('could not resolve logind session');
                 return;
             }
             this._logindPath = path;
@@ -1326,17 +1384,13 @@ export class SystemHelper {
             });
     }
 
-    // Best-effort uid lookup (gjs lacks a direct getuid binding). We read it
-    // from the process's own /proc status, which is always our own uid.
+    // Our own uid, for the logind user lookup.
     _selfUid() {
         try {
-            let [ok, contents] = Gio.File.new_for_path('/proc/self/status').load_contents(null);
-            if (ok) {
-                let m = ByteArrayToString(contents).match(/^Uid:\s*(\d+)/m);
-                if (m) return Number(m[1]);
-            }
-        } catch (e) { /* ignore */ }
-        return 1000;
+            return new Gio.Credentials().get_unix_user();
+        } catch (e) {
+            return 1000;
+        }
     }
 
     // --- Connected Devices (Bluetooth & Battery) ---
@@ -1374,7 +1428,7 @@ export class SystemHelper {
             for (let d of bluezDevices)
                 addDevice(d);
         } catch (e) {
-            console.error('NotchNux: Error listing BlueZ devices', e);
+            logError('Error listing BlueZ devices', e);
         }
 
         // Wireless accessories UPower knows a battery for (mice, keyboards,
@@ -1570,7 +1624,7 @@ export class SystemHelper {
                     conn.call_finish(res);
                     if (onDone) onDone(true, null);
                 } catch (e) {
-                    console.error(`NotchNux: Bluetooth ${connect ? 'connect' : 'disconnect'} failed`, e);
+                    logError(`Bluetooth ${connect ? 'connect' : 'disconnect'} failed`, e);
                     if (onDone) onDone(false, e.message || String(e));
                 }
             });
@@ -1629,7 +1683,7 @@ export class SystemHelper {
                 null, Gio.DBusCallFlags.NONE, 5000, this._cancellable,
                 (conn, res) => {
                     try { conn.call_finish(res); this._btPowered = !!on; done(true); }
-                    catch (e) { console.warn('NotchNux: BT power toggle failed', e.message); done(false); }
+                    catch (e) { logDebug('BT power toggle failed', e.message); done(false); }
                 });
         });
     }
@@ -1704,7 +1758,7 @@ export class SystemHelper {
                 null, null, Gio.DBusCallFlags.NONE, 20000, null,
                 (conn, res) => {
                     try { conn.call_finish(res); done(true); }
-                    catch (e) { console.warn('NotchNux: BT connect failed', e.message); done(false, e.message); }
+                    catch (e) { logDebug('BT connect failed', e.message); done(false, e.message); }
                 });
         };
         // Pair first; if already paired BlueZ returns AlreadyExists — treat that
@@ -1716,7 +1770,7 @@ export class SystemHelper {
                 try { conn.call_finish(res); connect(); }
                 catch (e) {
                     if (/AlreadyExists|Already Exists/.test(e.message)) { connect(); return; }
-                    console.warn('NotchNux: BT pair failed', e.message);
+                    logDebug('BT pair failed', e.message);
                     done(false, e.message);
                 }
             });
@@ -1764,7 +1818,7 @@ export class SystemHelper {
                 });
             }
         } catch (e) {
-            console.error('NotchNux: Error listing mounted volumes', e);
+            logError('Error listing mounted volumes', e);
         }
         return list;
     }
@@ -1776,11 +1830,11 @@ export class SystemHelper {
                 try {
                     mount.eject_with_operation_finish(res);
                 } catch (err) {
-                    console.error('NotchNux: Failed to complete eject operation', err);
+                    logError('Failed to complete eject operation', err);
                 }
             });
         } catch (e) {
-            console.error('NotchNux: Error ejecting drive', e);
+            logError('Error ejecting drive', e);
         }
     }
 }

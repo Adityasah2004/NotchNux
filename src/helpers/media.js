@@ -15,6 +15,7 @@ import Gst from 'gi://Gst';
 import GstApp from 'gi://GstApp';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import { logError, logDebug } from './log.js';
 
 let _gstReady = false;
 function ensureGst() {
@@ -23,7 +24,7 @@ function ensureGst() {
         Gst.init(null);
         _gstReady = true;
     } catch (e) {
-        console.error('NotchNux: Gst.init failed', e);
+        logError('Gst.init failed', e);
     }
     return _gstReady;
 }
@@ -53,7 +54,7 @@ class MediaDevice {
             let el = this._dev.create_element(null);
             if (el) return el;
         } catch (e) {
-            console.warn(`NotchNux: ${this.name} cannot create its own source`, e.message);
+            logDebug(`${this.name} cannot create its own source`, e.message);
         }
         if (this.kind === 'video' && this.v4l2Path) {
             let el = Gst.ElementFactory.make('v4l2src', null);
@@ -151,7 +152,7 @@ export class MediaHelper {
             this._preview = pipeline;
             this._previewSink = els[els.length - 1];
         } catch (e) {
-            console.error('NotchNux: preview pipeline failed', e);
+            logError('preview pipeline failed', e);
             this._preview = null;
             return;
         }
@@ -245,7 +246,7 @@ export class MediaHelper {
             build(pipeline);
             this._recorder = pipeline;
         } catch (e) {
-            console.error('NotchNux: recorder pipeline failed', e);
+            logError('recorder pipeline failed', e);
             this._recorder = null;
             return null;
         }
@@ -257,7 +258,7 @@ export class MediaHelper {
         this._busId = bus.connect('message', (_b, msg) => {
             if (msg.type === Gst.MessageType.ERROR) {
                 let [err] = msg.parse_error();
-                console.error('NotchNux: recording error', err ? err.message : msg);
+                logError('recording error', err ? err.message : msg);
                 this.stopRecording();
             } else if (msg.type === Gst.MessageType.EOS) {
                 this._finalizeStop();

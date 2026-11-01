@@ -23,9 +23,22 @@ import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
 
+// The prefs window runs in its own process, so it reads the config file
+// synchronously: it must see the shell's latest write (keep-awake, tab
+// order, pins) before each change it saves.
+function readConfigFile(path) {
+    try {
+        return Gio.File.new_for_path(path).load_contents(null)[1];
+    } catch (e) {
+        if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+            console.error('NotchNux: failed to read config', e);
+        return null;
+    }
+}
+
 export default class NotchNuxPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
-        const config = new ConfigStore();
+        const config = new ConfigStore({ readFile: readConfigFile });
 
         const page = new Adw.PreferencesPage({
             title: 'NotchNux',

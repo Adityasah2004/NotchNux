@@ -103,7 +103,8 @@ function easeOutQuart(t) {
 
 export class WallpaperTransition {
     constructor() {
-        this._bgSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.background' });
+        // GNOME's own wallpaper schema (always installed), not one of ours.
+        this._bgSettings = Gio.Settings.new('org.gnome.desktop.background');
         this._style = 'grow';
         this._run = null;
         this._fading = new Set();

@@ -101,6 +101,17 @@ export const ProductivityTabs = {
         case 'sw-tick':
             this._onStopwatchChanged(kind);
             break;
+        case 'loaded': {
+            // Saved tasks/notes/focus arrived (read async after enable).
+            this._syncPillFocus();
+            this._syncFocusDnd();
+            let tabs = ['home', 'tasks', 'focus', 'notes'];
+            for (let tab of tabs)
+                this._markTabDirty(tab);
+            if (this.isExpanded && tabs.includes(this._activeTab))
+                this._showActiveTab();
+            break;
+        }
         case 'tasks':
             if (this._invalidateTab('tasks', 'home')) {
                 if (this._activeTab === 'tasks') this._tasksUi?.fill();

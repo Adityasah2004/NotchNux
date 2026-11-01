@@ -23,13 +23,14 @@ import { FileDropBridge } from './helpers/filedrop.js';
 import { WallpaperHelper } from './helpers/wallpaper.js';
 import { SlitDeck } from './helpers/slitdeck.js';
 import { Vinyl, AlbumArtDisc, Knob, AnalogClock, EqBars, CameraView, ACCENT, setAccent, accentHex, accentRgbStr } from './helpers/widgets.js';
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS, blurPreset } from './helpers/config.js';
+import { TAB_DEFS, FEATURE_DEFS, blurPreset } from './helpers/config.js';
 import { fmt } from './helpers/format.js';
 import { GlassBackdrop, createShoulder, SHOULDER_SIZE, PILL_HEIGHT } from './helpers/island.js';
 import { springTo, stopSpring, addPressFeedback } from './helpers/motion.js';
 import { installProductivity } from './tabs/productivity.js';
 import { installLedge, swapContent } from './tabs/ledge.js';
 import { installTray } from './tabs/tray.js';
+import { logError } from './helpers/log.js';
 
 // Configuration constants
 // Minimum idle width. _pillWidth() measures the actual content (clock + battery
@@ -68,7 +69,7 @@ const PEEK_LEAVE_MS = 280;
 
 export const NotchNux = GObject.registerClass({
     GTypeName: 'NotchNux' }, class NotchNux extends St.Widget {
-    _init(extension) {
+    _init(extension, config) {
         // Outer widget is a transparent positioning shell. All visible
         // surface (background/border/rounded corners) lives on the inner
         // `_surface` box, so nothing bleeds into the rectangular corners.
@@ -80,7 +81,7 @@ export const NotchNux = GObject.registerClass({
         this.extension = extension;
         // Load persisted preferences and apply the accent colour before any
         // Cairo widget draws, so the very first render uses the user's colour.
-        this._config = new ConfigStore();
+        this._config = config;
         setAccent(this._config.accentRgb);
         this.isExpanded = false;
         this._isExpanding = false;
@@ -228,13 +229,14 @@ export const NotchNux = GObject.registerClass({
         // GNOME re-enables us on every unlock; a forecast fetched a few minutes
         // ago is restored from cache, so only hit GeoClue + the network when it
         // is actually stale — and not in the middle of the unlock animation.
-        if (!this._weather.isFresh) {
-            this._weatherKickId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 3, () => {
-                this._weatherKickId = 0;
+        // (The cache is read asynchronously, so freshness is checked when the
+        // timer fires, by which time it has loaded.)
+        this._weatherKickId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 3, () => {
+            this._weatherKickId = 0;
+            if (!this._weather.isFresh)
                 this._weather.updateWeather();
-                return GLib.SOURCE_REMOVE;
-            });
-        }
+            return GLib.SOURCE_REMOVE;
+        });
         // Reflect any already-playing media in the pill right away, rather
         // than waiting for the next MPRIS property-change callback.
         this._refreshLive();
@@ -402,7 +404,7 @@ export const NotchNux = GObject.registerClass({
                 });
             });
         } catch (e) {
-            console.error('NotchNux: Failed to watch config file.', e);
+            logError('Failed to watch config file.', e);
         }
     }
 
@@ -411,8 +413,15 @@ export const NotchNux = GObject.registerClass({
     // the whole dashboard, and a tab toggle doesn't repaint unrelated chrome.
     _onConfigFileChanged() {
         if (this._destroyed) return;
+        this._configCancellable ??= new Gio.Cancellable();
+        this._config.reloadAsync(this._configCancellable, () => {
+            if (!this._destroyed)
+                this._applyConfigChange();
+        });
+    }
+
+    _applyConfigChange() {
         let prev = this._configState;
-        this._config.reload();
         let next = this._configSnapshot();
         this._configState = next;
 
@@ -521,6 +530,8 @@ export const NotchNux = GObject.registerClass({
             this._destroyMoreMenu();
             this._restorePanel();
         }
+        this._configCancellable?.cancel();
+        this._configCancellable = null;
         if (this._configMonitor) {
             if (this._configMonitorId)
                 this._configMonitor.disconnect(this._configMonitorId);
@@ -950,7 +961,7 @@ export const NotchNux = GObject.registerClass({
                 activated = true;
             }
         } catch (e) {
-            console.error('NotchNux: notification activate failed', e);
+            logError('notification activate failed', e);
         }
         // Activating a notification normally raises its app; only fall back to
         // our own tab if there was nothing to activate.
@@ -985,7 +996,7 @@ export const NotchNux = GObject.registerClass({
                 try {
                     if (typeof action.callback === 'function') action.callback();
                 } catch (e) {
-                    console.error('NotchNux: notification action failed', e);
+                    logError('notification action failed', e);
                 }
                 this._hideNotificationPeek(true);
             });
@@ -1207,7 +1218,7 @@ export const NotchNux = GObject.registerClass({
             try {
                 this.extension.openPreferences();
             } catch (e) {
-                console.error('NotchNux: Failed to open preferences.', e);
+                logError('Failed to open preferences.', e);
             }
         });
         this._moreMenu.addMenuItem(settings);
@@ -1223,7 +1234,7 @@ export const NotchNux = GObject.registerClass({
                 try {
                     this._systemActions.activateAction(actionName);
                 } catch (e) {
-                    console.error(`NotchNux: system action '${actionName}' failed.`, e);
+                    logError(`system action '${actionName}' failed.`, e);
                 }
             });
             this._moreMenu.addMenuItem(item);
@@ -1299,7 +1310,7 @@ export const NotchNux = GObject.registerClass({
                     lm._queueUpdateRegions();
             }
         } catch (e) {
-            console.error('NotchNux: Failed to adjust panel struts.', e);
+            logError('Failed to adjust panel struts.', e);
         }
 
         // Unredirection: with reclaimSpace on, the panel no longer reserves the
@@ -1344,7 +1355,7 @@ export const NotchNux = GObject.registerClass({
                 this._wmSizeChangeId = wm.connect('size-change',
                     () => this._queueUnredirectUpdate());
         } catch (e) {
-            console.error('NotchNux: Failed to start unredirect watch.', e);
+            logError('Failed to start unredirect watch.', e);
         }
     }
 
@@ -1463,7 +1474,7 @@ export const NotchNux = GObject.registerClass({
                 this._unredirectInhibited = true;
             }
         } catch (e) {
-            console.error('NotchNux: Failed to inhibit unredirect.', e);
+            logError('Failed to inhibit unredirect.', e);
         }
     }
 
@@ -1477,7 +1488,7 @@ export const NotchNux = GObject.registerClass({
             if (compositor && typeof compositor.enable_unredirect === 'function')
                 compositor.enable_unredirect();
         } catch (e) {
-            console.error('NotchNux: Failed to release unredirect inhibit.', e);
+            logError('Failed to release unredirect inhibit.', e);
         } finally {
             // Clear the flag even if the call threw, so we don't get wedged
             // permanently inhibited.
@@ -1516,7 +1527,7 @@ export const NotchNux = GObject.registerClass({
                     lm._queueUpdateRegions();
             }
         } catch (e) {
-            console.error('NotchNux: Failed to restore panel struts.', e);
+            logError('Failed to restore panel struts.', e);
         }
     }
 
@@ -2208,7 +2219,7 @@ export const NotchNux = GObject.registerClass({
                     art.visible = true;
                 }
             } catch (e) {
-                console.error('NotchNux: Failed to apply album art', e);
+                logError('Failed to apply album art', e);
             }
         });
     }
@@ -3732,7 +3743,7 @@ export const NotchNux = GObject.registerClass({
                 });
                 return;
             } catch (e) {
-                console.error('NotchNux: failed to activate quick-settings toggle', e);
+                logError('failed to activate quick-settings toggle', e);
                 // fall through to the menu path below
             }
         }
@@ -3879,7 +3890,7 @@ export const NotchNux = GObject.registerClass({
                 menu.disconnect(closeId);
             });
         } catch (e) {
-            console.error(`NotchNux: failed to open mirrored menu for tray item.`, e);
+            logError(`failed to open mirrored menu for tray item.`, e);
             try { menu.toggle(); } catch (e2) {}
         }
     }
@@ -4368,7 +4379,7 @@ export const NotchNux = GObject.registerClass({
                 onRemoved));
             this._requestCalendarServerRange(45, true);
         } catch (e) {
-            console.error('NotchNux: Failed to initialize calendar server.', e);
+            logError('Failed to initialize calendar server.', e);
         }
     }
 
@@ -4431,11 +4442,11 @@ export const NotchNux = GObject.registerClass({
                     try {
                         conn.call_finish(res);
                     } catch (e) {
-                        console.error('NotchNux: Failed to request calendar range.', e);
+                        logError('Failed to request calendar range.', e);
                     }
                 });
         } catch (e) {
-            console.error('NotchNux: Failed to request calendar range.', e);
+            logError('Failed to request calendar range.', e);
         }
     }
 
@@ -4454,7 +4465,7 @@ export const NotchNux = GObject.registerClass({
                 allDay: Boolean(meta['all-day'] ?? meta.allDay ?? meta.isAllDay)
             };
         } catch (e) {
-            console.error('NotchNux: Failed to parse calendar server event.', e);
+            logError('Failed to parse calendar server event.', e);
             return null;
         }
     }
@@ -4646,7 +4657,7 @@ export const NotchNux = GObject.registerClass({
         try {
             Gio.Subprocess.new(['gnome-control-center', ...args], Gio.SubprocessFlags.NONE);
         } catch (e) {
-            console.error('NotchNux: Failed to open GNOME Settings.', e);
+            logError('Failed to open GNOME Settings.', e);
         }
     }
 
@@ -5023,7 +5034,7 @@ export const NotchNux = GObject.registerClass({
             let sources = tray.getSources ? tray.getSources() : (tray._sources ?? []);
             for (let source of sources) this._watchNotifSource(source);
         } catch (e) {
-            console.error('NotchNux: notification watch init failed', e);
+            logError('notification watch init failed', e);
         }
         this._installBannerSuppression();
     }
@@ -5077,7 +5088,7 @@ export const NotchNux = GObject.registerClass({
                 }
             };
         } catch (e) {
-            console.error('NotchNux: banner suppression install failed', e);
+            logError('banner suppression install failed', e);
             this._origShowNotification = null;
         }
     }
@@ -5122,7 +5133,7 @@ export const NotchNux = GObject.registerClass({
 
     // org.gnome.desktop.notifications, created once (show-banners = DND off).
     _notificationSettings() {
-        this._dndSettings ??= new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
+        this._dndSettings ??= Gio.Settings.new('org.gnome.desktop.notifications');
         return this._dndSettings;
     }
 
@@ -5165,7 +5176,7 @@ export const NotchNux = GObject.registerClass({
             let actions = Array.isArray(notification?.actions) ? notification.actions : [];
             this._showNotificationPeek(title, body, gicon, notification, actions);
         } catch (e) {
-            console.error('NotchNux: notification peek error', e);
+            logError('notification peek error', e);
         }
     }
 
@@ -5573,7 +5584,7 @@ export const NotchNux = GObject.registerClass({
                 onDragEnd: dropped => this._onFileDragEnd(dropped),
             });
         } catch (e) {
-            console.error('NotchNux: file drag & drop unavailable', e);
+            logError('file drag & drop unavailable', e);
             this._fileDrop = null;
         }
     }
@@ -6041,7 +6052,7 @@ export const NotchNux = GObject.registerClass({
             try {
                 this._kbGrab = Main.pushModal(this, { actionMode: Shell.ActionMode.POPUP });
             } catch (e) {
-                console.error('NotchNux: could not take keyboard focus', e);
+                logError('could not take keyboard focus', e);
                 this._kbGrab = null;
             }
             this._grabbingKeyboard = false;
@@ -6075,7 +6086,7 @@ export const NotchNux = GObject.registerClass({
         try {
             Main.popModal(grab);
         } catch (e) {
-            console.error('NotchNux: failed to release keyboard', e);
+            logError('failed to release keyboard', e);
         }
         global.stage.set_key_focus(null);
     }

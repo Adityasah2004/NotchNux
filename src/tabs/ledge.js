@@ -31,6 +31,7 @@ import { MAX_PINNED } from '../helpers/config.js';
 import { PILL_HEIGHT } from '../helpers/island.js';
 import { fmtCountdown } from '../helpers/productivity.js';
 import { accentHex, accentRgbStr } from '../helpers/widgets.js';
+import { logError, logDebug } from '../helpers/log.js';
 
 // Dark-mode system colours: the surface is always black.
 export const SYS = {
@@ -456,7 +457,7 @@ export const LedgeFeatures = {
                 if (self._osdToNotch(monitorIndex, icon, label, level, maxLevel))
                     return undefined;
             } catch (e) {
-                console.error('NotchNux: OSD redirect failed', e);
+                logError('OSD redirect failed', e);
             }
             return self._origShowOsd.call(this, monitorIndex, icon, label, level, maxLevel);
         };
@@ -861,7 +862,7 @@ export const LedgeFeatures = {
                     try {
                         [cookie] = c.call_finish(res).deep_unpack();
                     } catch (e) {
-                        console.warn('NotchNux: Keep Awake inhibit failed', e.message);
+                        logDebug('Keep Awake inhibit failed', e.message);
                         this._keepAwakeOn = false;
                         this._syncAwakeUi();
                         return;
@@ -1016,7 +1017,7 @@ export const LedgeFeatures = {
             try {
                 this.extension.openPreferences();
             } catch (e) {
-                console.error('NotchNux: Failed to open preferences.', e);
+                logError('Failed to open preferences.', e);
             }
         });
         menu.open();

@@ -19,6 +19,7 @@
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import { logError } from './log.js';
 
 // The canonical set of dashboard tabs and their default order. The settings
 // UI reconciles the stored order/enabled maps against this list so tabs added
@@ -208,11 +209,40 @@ export function hexToRgb01(hex) {
     return [((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255];
 }
 
+function configDir() {
+    return GLib.build_filenamev([GLib.get_user_config_dir(), 'notchnux']);
+}
+
 export class ConfigStore {
-    constructor() {
-        this._dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'notchnux']);
+    // `contents`: the file's bytes, already read (or null for defaults).
+    // `readFile(path)`: a synchronous reader returning bytes or null. Only the
+    // prefs window passes one (it re-reads before every write, see
+    // _refresh()); the shell never does file IO here except through
+    // loadAsync()/reloadAsync().
+    constructor({ contents = null, readFile = null } = {}) {
+        this._dir = configDir();
         this._path = GLib.build_filenamev([this._dir, 'config.json']);
-        this._data = this._load();
+        this._readFile = readFile;
+        this._data = this._parse(contents ?? readFile?.(this._path) ?? null);
+    }
+
+    // Read the config without blocking and call back with a new store. A
+    // missing or unreadable file gives the defaults; a cancelled read never
+    // calls back.
+    static loadAsync(cancellable, cb) {
+        let path = GLib.build_filenamev([configDir(), 'config.json']);
+        Gio.File.new_for_path(path).load_contents_async(cancellable, (f, res) => {
+            let contents = null;
+            try {
+                [, contents] = f.load_contents_finish(res);
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                    logError('Failed to read config, using defaults.', e);
+            }
+            cb(new ConfigStore({ contents }));
+        });
     }
 
     // Absolute path of the backing JSON file. The shell watches this so edits
@@ -231,6 +261,9 @@ export class ConfigStore {
         let tabs = {};
         for (let t of TAB_DEFS)
             tabs[t.id] = true;
+        // Clipboard history reads everything the user copies, so it is
+        // opt-in: off until enabled in Preferences → Tabs.
+        tabs.clipboard = false;
         let features = {};
         for (let f of FEATURE_DEFS)
             features[f.id] = f.default;
@@ -260,12 +293,36 @@ export class ConfigStore {
         };
     }
 
+    // Async counterpart of reload() for the shell, so a settings change made
+    // in Preferences never blocks the compositor on file IO. Calls back
+    // after the new values are in place; not at all if cancelled.
+    reloadAsync(cancellable, cb) {
+        Gio.File.new_for_path(this._path).load_contents_async(cancellable, (f, res) => {
+            let contents = null;
+            try {
+                [, contents] = f.load_contents_finish(res);
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                    logError('Failed to read config, using defaults.', e);
+            }
+            this._data = this._parse(contents);
+            cb();
+        });
+    }
+
+    // Fresh data from disk when a synchronous reader was given (prefs);
+    // otherwise the in-memory copy, which the shell keeps current through
+    // its file monitor + reloadAsync().
     _load() {
+        return this._readFile ? this._parse(this._readFile(this._path)) : this._data;
+    }
+
+    _parse(contents) {
         let data = this._defaults();
         try {
-            let file = Gio.File.new_for_path(this._path);
-            let [ok, contents] = file.load_contents(null);
-            if (ok) {
+            if (contents) {
                 let text = new TextDecoder().decode(contents);
                 let parsed = JSON.parse(text);
                 // Shallow-merge over defaults so a partial/older file keeps
@@ -287,10 +344,9 @@ export class ConfigStore {
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
-            // A missing file on first run is expected; anything else we log
-            // but still fall back to defaults so the extension keeps working.
-            if (!(e instanceof GLib.Error && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)))
-                console.error('NotchNux: Failed to load config, using defaults.', e);
+            // Corrupt JSON: log it but fall back to defaults so the extension
+            // keeps working.
+            logError('Failed to parse config, using defaults.', e);
             data.tabOrder = this._reconcileOrder(data.tabOrder);
         }
         return data;
@@ -346,7 +402,7 @@ export class ConfigStore {
             GLib.chmod(this._path, 0o600);
             GLib.chmod(this._dir, 0o700);
         } catch (e) {
-            console.error('NotchNux: Failed to save config.', e);
+            logError('Failed to save config.', e);
         }
     }
 
