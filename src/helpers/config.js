@@ -293,7 +293,10 @@ export class ConfigStore {
             // Keep Awake survives a lock/unlock (the extension is re-enabled).
             keepAwake: false,
             // Music tab shows synced lyrics in place of the vinyl + knob.
-            musicLyrics: false
+            musicLyrics: false,
+            // Set while "Approve from the notch" is connected in Preferences;
+            // Claude Code's hook sends it back with every request.
+            claudeHookToken: ''
         };
     }
 
@@ -345,6 +348,7 @@ export class ConfigStore {
                 data.pinnedTabs = this._cleanPinned(parsed.pinnedTabs ?? DEFAULT_PINNED);
                 data.keepAwake = !!parsed.keepAwake;
                 data.musicLyrics = !!parsed.musicLyrics;
+                data.claudeHookToken = typeof parsed.claudeHookToken === 'string' ? parsed.claudeHookToken : '';
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
@@ -484,6 +488,15 @@ export class ConfigStore {
     setMusicLyrics(on) {
         this._refresh();
         this._data.musicLyrics = !!on;
+        this._save();
+    }
+
+    get claudeHookToken() {
+        return this._data.claudeHookToken || '';
+    }
+    setClaudeHookToken(token) {
+        this._refresh();
+        this._data.claudeHookToken = typeof token === 'string' ? token : '';
         this._save();
     }
 

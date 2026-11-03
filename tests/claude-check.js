@@ -9,6 +9,7 @@ import {
     APPROVE_URL, passThrough, describeRequest, decisionBody,
     isApproveConnected, connectApproveHook, disconnectApproveHook,
 } from '../src/helpers/claude.js';
+import { ConfigStore } from '../src/helpers/config.js';
 
 let n = 0;
 function ok(cond, what) {
@@ -148,6 +149,12 @@ eq(text(disconnectApproveHook(JSON.parse(text(both)))), text(foreign), 'foreign 
 eq(disconnectApproveHook(foreign), foreign, 'disconnect without our hook is a no-op');
 eq(text(disconnectApproveHook(connectApproveHook(connectStatusLine(original), 't'))), text(connectStatusLine(original)),
     'status line wiring untouched');
+
+// ---- config: the hook token (read-only checks; never saves) ----
+const cfg = obj => new ConfigStore({ contents: new TextEncoder().encode(JSON.stringify(obj)) });
+eq(cfg({}).claudeHookToken, '', 'no token by default');
+eq(cfg({ claudeHookToken: 'tok-1' }).claudeHookToken, 'tok-1', 'token read');
+eq(cfg({ claudeHookToken: 42 }).claudeHookToken, '', 'non-string token dropped');
 
 // ---- run the wrapped command for real, in a scratch HOME ----
 let home = GLib.dir_make_tmp('nn-claude-XXXXXX');
