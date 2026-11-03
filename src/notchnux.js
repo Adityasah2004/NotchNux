@@ -5224,6 +5224,9 @@ export const NotchNux = GObject.registerClass({
     _showNotificationPeek(title, body, gicon, notification = null, actions = [], opts = {}) {
         if (this._destroyed) return;
         if (!this._notifBanner) return;
+        // Nowhere to show it (docking, hotplug): touch nothing, or a sticky
+        // flag would outlive a banner that never appeared.
+        if (!Main.layoutManager.primaryMonitor) return;
         // ponytail: while a sticky banner is up, other peeks (notifications,
         // the Focus timer) are skipped, not queued; notifications still land
         // in the Notifications tab. Queue them if that ever matters.
@@ -5263,7 +5266,6 @@ export const NotchNux = GObject.registerClass({
         this._peekActive = true;
 
         let monitor = Main.layoutManager.primaryMonitor;
-        if (!monitor) { this._peekActive = false; return; }
 
         // The pill stays pinned at the top; the banner grows in below it from the
         // same top-center pivot the expand animation uses, so the two motions feel
