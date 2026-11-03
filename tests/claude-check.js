@@ -9,6 +9,7 @@ import {
     fmtAge, wrapCommand, unwrapCommand, isConnected, connectStatusLine, disconnectStatusLine,
     SOCKET_NAME, approveSocketPath, approveCommand, passThrough, describeRequest, decisionBody,
     isApproveConnected, connectApproveHook, disconnectApproveHook,
+    HOOK_TIMEOUT_S, settingsLayout, formatSettings,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -158,6 +159,26 @@ eq(text(disconnectApproveHook(JSON.parse(text(both)))), text(foreign), 'foreign 
 eq(disconnectApproveHook(foreign), foreign, 'disconnect without our hook is a no-op');
 eq(text(disconnectApproveHook(connectApproveHook(connectStatusLine(original), sock))), text(connectStatusLine(original)),
     'status line wiring untouched');
+ok(HOOK_TIMEOUT_S === 600 && approveCommand(sock).includes(`--max-time ${HOOK_TIMEOUT_S} `), 'curl gives up with the hook');
+eq(hooked.hooks.PermissionRequest[0].hooks[0].timeout, HOOK_TIMEOUT_S, 'hook timeout');
+const emptyGroup = { hooks: { PermissionRequest: [{ matcher: 'X', hooks: [] }] } };
+eq(text(disconnectApproveHook(JSON.parse(text(connectApproveHook(emptyGroup, sock))))), text(emptyGroup),
+    'a foreign group that was already empty survives');
+
+// ---- settings.json layout survives Connect / Disconnect ----
+for (let [what, raw] of [
+    ['2 spaces', '{\n  "model": "opus",\n  "env": {\n    "A": "1"\n  }\n}\n'],
+    ['4 spaces', '{\n    "model": "opus",\n    "env": {\n        "A": "1"\n    }\n}\n'],
+    ['tabs', '{\n\t"model": "opus"\n}\n'],
+    ['one line', '{"model":"opus","env":{"A":"1"}}'],
+    ['no trailing newline', '{\n  "model": "opus"\n}'],
+]) {
+    let layout = settingsLayout(raw);
+    eq(formatSettings(JSON.parse(raw), layout), raw, `${what}: rewritten as is`);
+    let on = formatSettings(connectApproveHook(JSON.parse(raw), sock), layout);
+    eq(formatSettings(disconnectApproveHook(JSON.parse(on)), settingsLayout(on)), raw, `${what}: connect → disconnect exact`);
+}
+eq(formatSettings({ a: 1 }, settingsLayout(null)), '{\n  "a": 1\n}\n', 'no file yet → Claude Code\'s 2-space layout');
 
 // ---- config: approvals on/off (read-only checks; never saves) ----
 const cfg = obj => new ConfigStore({ contents: new TextEncoder().encode(JSON.stringify(obj)) });

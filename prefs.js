@@ -21,7 +21,7 @@ import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
 import {
     SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine,
-    isApproveConnected, connectApproveHook, disconnectApproveHook,
+    isApproveConnected, connectApproveHook, disconnectApproveHook, settingsLayout, formatSettings,
 } from './src/helpers/claude.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
@@ -40,7 +40,7 @@ function readConfigFile(path) {
     }
 }
 
-// Claude Code's settings.json → { path, settings } or { path, error }. A
+// Claude Code's settings.json → { path, settings, layout } or { path, error }. A
 // symlinked file (dotfile managers) is followed so the write lands on the
 // real file instead of replacing the link. Never guesses: anything that
 // isn't a readable JSON object is an error and nothing gets written.
@@ -50,22 +50,23 @@ function readClaudeSettings() {
         if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK))
             path = GLib.canonicalize_filename(GLib.file_read_link(path), GLib.path_get_dirname(path));
         let [, bytes] = Gio.File.new_for_path(path).load_contents(null);
-        let settings = JSON.parse(new TextDecoder().decode(bytes));
+        let text = new TextDecoder().decode(bytes);
+        let settings = JSON.parse(text);
         if (!settings || typeof settings !== 'object' || Array.isArray(settings))
             throw new Error('not a JSON object');
-        return { path, settings };
+        return { path, settings, layout: settingsLayout(text) };
     } catch (e) {
         if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
-            return { path, settings: {} };
+            return { path, settings: {}, layout: settingsLayout(null) };
         return { path, error: `Can’t read ${path} (${e.message}). Nothing was changed.` };
     }
 }
 
-// Same 2-space layout Claude Code writes; the previous file is kept as
-// settings.json~.
-function writeClaudeSettings(path, settings) {
+// In the file's own layout (helpers/claude.js settingsLayout); the previous
+// file is kept as settings.json~.
+function writeClaudeSettings(path, settings, layout) {
     GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
-    let bytes = new TextEncoder().encode(JSON.stringify(settings, null, 2) + '\n');
+    let bytes = new TextEncoder().encode(formatSettings(settings, layout));
     Gio.File.new_for_path(path).replace_contents(bytes, null, true, Gio.FileCreateFlags.NONE, null);
 }
 
@@ -743,7 +744,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                 }
                 const [next, done] = change(r.settings, isOn(r.settings));
                 try {
-                    writeClaudeSettings(r.path, next);
+                    writeClaudeSettings(r.path, next, r.layout);
                 } catch (e) {
                     refresh(`Couldn’t write ${r.path} (${e.message}).`);
                     return;

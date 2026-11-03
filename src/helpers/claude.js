@@ -222,12 +222,14 @@ export function disconnectStatusLine(settings) {
 export const APPROVE_PATH = '/claude/permission';
 export const SOCKET_NAME = 'notchnux-claude.sock';
 export const approveSocketPath = () => `${GLib.get_user_runtime_dir()}/${SOCKET_NAME}`;
+// How long Claude Code waits for the hook (and curl for the shell).
+export const HOOK_TIMEOUT_S = 600;
 
 // curl reads the hook input on stdin and prints the decision. `|| true`: a
 // failure (NotchNux off, curl missing, a 4xx) must exit 0 with no output —
 // no decision — because exit code 2 from a hook means deny.
 export function approveCommand(socketPath) {
-    return `curl -sf --max-time 600 --unix-socket ${GLib.shell_quote(socketPath)} ` +
+    return `curl -sf --max-time ${HOOK_TIMEOUT_S} --unix-socket ${GLib.shell_quote(socketPath)} ` +
         `-H 'Content-Type: application/json' --data-binary @- http://notchnux${APPROVE_PATH} || true`;
 }
 
@@ -316,9 +318,19 @@ export function isApproveConnected(settings) {
 export function disconnectApproveHook(settings) {
     if (!isApproveConnected(settings))
         return settings;
-    let kept = settings.hooks.PermissionRequest
-        .map(m => (Array.isArray(m?.hooks) ? { ...m, hooks: m.hooks.filter(h => !isOurHook(h)) } : m))
-        .filter(m => !Array.isArray(m?.hooks) || m.hooks.length > 0);
+    // Only groups holding our hook change; anything else stays as it was.
+    let kept = [];
+    for (let m of settings.hooks.PermissionRequest) {
+        if (!Array.isArray(m?.hooks) || !m.hooks.some(isOurHook)) {
+            kept.push(m);
+            continue;
+        }
+        let rest = m.hooks.filter(h => !isOurHook(h));
+        if (rest.length)
+            kept.push({ ...m, hooks: rest });
+    }
+    // ponytail: a `hooks: {}` / `PermissionRequest: []` that was already
+    // empty before Connect goes too — same meaning to Claude Code.
     let hooks = { ...settings.hooks };
     if (kept.length)
         hooks.PermissionRequest = kept;
@@ -337,6 +349,20 @@ export function connectApproveHook(settings, socketPath = approveSocketPath()) {
     let s = disconnectApproveHook(settings);
     let hooks = s.hooks ?? {};
     let list = Array.isArray(hooks.PermissionRequest) ? hooks.PermissionRequest : [];
-    let entry = { hooks: [{ type: 'command', command: approveCommand(socketPath), timeout: 600 }] };
+    let entry = { hooks: [{ type: 'command', command: approveCommand(socketPath), timeout: HOOK_TIMEOUT_S }] };
     return { ...s, hooks: { ...hooks, PermissionRequest: [...list, entry] } };
+}
+
+// How a settings file is laid out, so a rewrite changes only what we
+// changed: the first indented line's indent ('' for one-line JSON) and
+// whether it ends with a newline. No file yet → Claude Code's own layout.
+export function settingsLayout(text) {
+    if (typeof text !== 'string')
+        return { indent: '  ', eol: '\n' };
+    let m = /\n([ \t]+)\S/.exec(text);
+    return { indent: m ? m[1] : '', eol: text.endsWith('\n') ? '\n' : '' };
+}
+
+export function formatSettings(settings, { indent, eol }) {
+    return JSON.stringify(settings, null, indent) + eol;
 }
