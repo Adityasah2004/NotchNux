@@ -92,7 +92,7 @@ function ago(ms) {
     return `${Math.round(s / 86400)}d`;
 }
 
-function statColor(pct) {
+export function statColor(pct) {
     return pct < 70 ? SYS.green : pct < 90 ? SYS.yellow : SYS.red;
 }
 
@@ -590,6 +590,8 @@ export const LedgeFeatures = {
         if (this._pillMic?.visible || this._pillCam?.visible)
             return false;
         if (this._config.isFeatureEnabled('pillStats'))
+            return false;
+        if (this._claudeNeedsYou?.())
             return false;
         return true;
     },

@@ -40,6 +40,7 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 | 🏝️ | **Island alerts** | Volume, brightness, charging, low battery, headphones and a 5-minute event heads-up grow out of the pill for a moment, one at a time. |
 | 🫥 | **Hide when idle** | Optional: the notch tucks into the top edge until something is live, or you rest the pointer at the top centre. |
 | 🔲 | **Grid launcher** | Home plus up to five shortcuts in the header; everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
+| 🤖 | **Claude Code** | Opt-in: a tab listing your running Claude Code sessions (working, needs approval, has a question, done) with your 5-hour and weekly usage, plus a dot per session and the 5-hour % in the pill and a short alert when one finishes or needs you. Click a session to bring its terminal forward. *Connect* in Preferences to see usage. Everything stays on your machine. |
 | 📋 | **Clipboard** | The last 20 text clips with search and pins. Passwords are skipped; only pinned clips are saved. |
 | ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
 | 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |

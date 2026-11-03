@@ -30,6 +30,7 @@ import { springTo, stopSpring, addPressFeedback } from './helpers/motion.js';
 import { installProductivity } from './tabs/productivity.js';
 import { installLedge, swapContent } from './tabs/ledge.js';
 import { installTray } from './tabs/tray.js';
+import { installClaude } from './tabs/claude.js';
 import { logError } from './helpers/log.js';
 
 // Configuration constants
@@ -180,6 +181,8 @@ export const NotchNux = GObject.registerClass({
         this._initProductivity();
         // Alerts, hide-when-idle, launcher, clipboard, lyrics, keep awake…
         this._initLedge();
+        // Claude Code sessions + usage (the pill's dots and the Claude tab).
+        this._initClaude();
         // Recolour the active-state chrome to match the persisted accent.
         this._applyAccentStyles();
         // Shoulders + the (hidden unless enabled) glass backdrop.
@@ -490,6 +493,7 @@ export const NotchNux = GObject.registerClass({
         if (!shellGone)
             this._closeScanOverlay();
         this._destroyLedge();
+        this._destroyClaude();
         this._destroyProductivity();
         stopSpring(this);
         this._railTimeline?.stop();
@@ -1959,6 +1963,8 @@ export const NotchNux = GObject.registerClass({
         }
         if (tab === 'launcher')
             this._launcherEdit = false;
+        if (tab === 'claude')
+            this._leaveClaudeTab();
         this._releaseKeyboard?.();
     }
 
@@ -2006,6 +2012,7 @@ export const NotchNux = GObject.registerClass({
             case 'notifications': this._renderNotificationsTab(); break;
             case 'shelf': this._renderShelfTab(); break;
             case 'wallpaper': this._renderWallpaperTab(); break;
+            case 'claude': this._renderClaudeTab(); break;
             }
         } finally {
             this._mountTarget = null;
@@ -2067,6 +2074,9 @@ export const NotchNux = GObject.registerClass({
             break;
         case 'clipboard':
             this._clipUi?.fill();
+            break;
+        case 'claude':
+            this._claudeTabShown();
             break;
         case 'calendar':
         case 'weather':
@@ -2168,6 +2178,7 @@ export const NotchNux = GObject.registerClass({
             launcher: ['_launcherUi'],
             clipboard: ['_clipUi'],
             notes: ['_notesUi'],
+            claude: ['_claudeUi'],
         };
         for (let ref of REFS[tab] ?? [])
             this[ref] = null;
@@ -2544,6 +2555,8 @@ export const NotchNux = GObject.registerClass({
         if (this._pillMusicBox.visible)
             zones.push(this._pillMusicBox.get_preferred_width(-1)[1]);
         zones.push(this._pillClock.get_preferred_width(-1)[1]);
+        if (this._pillClaudeBox?.visible)
+            zones.push(this._pillClaudeBox.get_preferred_width(-1)[1]);
         if (this._pillBatteryBox && this._pillBatteryBox.visible)
             zones.push(this._pillBatteryBox.get_preferred_width(-1)[1]);
         if (this._pillNotifBox && this._pillNotifBox.visible)
@@ -4337,6 +4350,9 @@ export const NotchNux = GObject.registerClass({
                 break;
             case 'topScroll':
                 this._applyTopScroll();
+                break;
+            case 'claudeMonitor':
+                this._onClaudeFeatureToggled();
                 break;
             default:
                 this._onLedgeFeatureToggled(id, on);
@@ -6533,3 +6549,4 @@ export const NotchNux = GObject.registerClass({
 installProductivity(NotchNux.prototype);
 installLedge(NotchNux.prototype);
 installTray(NotchNux.prototype);
+installClaude(NotchNux.prototype);

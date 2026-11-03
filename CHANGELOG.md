@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Claude Code monitor (opt-in)
+- A **Claude** tab lists your running Claude Code sessions (working, needs
+  approval, has a question, done, and for how long) with your 5-hour and
+  weekly usage. Click a session to bring its terminal forward.
+- **Claude Code in the pill** (Features): one dot per session plus the
+  5-hour usage in the pill, and a short alert when a session finishes or
+  needs you.
+- Preferences → Claude Code → **Connect** adds a small step in front of your
+  status line in `~/.claude/settings.json` that saves the usage numbers to
+  `~/.cache/notchnux`; your status line keeps working, and **Disconnect**
+  restores the original. Sessions are read from `~/.claude/sessions`.
+  Nothing leaves your machine. Both are off by default.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.
