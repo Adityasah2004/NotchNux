@@ -393,17 +393,31 @@ export function connectApproveHook(settings, socketPath = approveSocketPath()) {
 }
 
 // How a settings file is laid out, so a rewrite changes only what we
-// changed: the first indented line's indent ('' for one-line JSON) and
-// whether it ends with a newline. No file yet → Claude Code's own layout.
+// changed: the first indented line's indent ('' for one-line JSON), its
+// line ending (CRLF stays CRLF), a trailing newline, a byte-order mark.
+// No file yet → Claude Code's own layout.
 export function settingsLayout(text) {
     if (typeof text !== 'string')
-        return { indent: '  ', eol: '\n' };
+        return { indent: '  ', eol: '\n', nl: '\n', bom: '' };
+    let nl = text.includes('\r\n') ? '\r\n' : '\n';
     let m = /\n([ \t]+)\S/.exec(text);
-    return { indent: m ? m[1] : '', eol: text.endsWith('\n') ? '\n' : '' };
+    return { indent: m ? m[1] : '', eol: text.endsWith('\n') ? nl : '', nl, bom: text.startsWith('\uFEFF') ? '\uFEFF' : '' };
 }
 
-export function formatSettings(settings, { indent, eol }) {
-    return JSON.stringify(settings, null, indent) + eol;
+export function formatSettings(settings, { indent, eol, nl = '\n', bom = '' }) {
+    // JSON strings can't hold a raw newline, so this only touches layout.
+    let json = JSON.stringify(settings, null, indent);
+    return bom + (nl === '\n' ? json : json.replace(/\n/g, nl)) + eol;
+}
+
+// A settings file's text → its object. A BOM is skipped and an empty file
+// means {}; anything that isn't a JSON object throws.
+export function parseSettings(text) {
+    let body = text.replace(/^\uFEFF/, '');
+    let settings = body.trim() ? JSON.parse(body) : {};
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings))
+        throw new Error('not a JSON object');
+    return settings;
 }
 
 // ---- MCP health ----
@@ -433,6 +447,18 @@ export function newAuthNames(prev, next) {
 }
 
 const MCP_STATUS = { '✔': 'ok', '!': 'auth', '✘': 'failed', '⏸': 'pending', '-': 'off' };
+
+// What a "Check now" run gives: { servers } to show, or { error }. A run
+// that timed out printed only the servers it got to, so it's not a check;
+// a non-zero exit with server lines still is (failing servers may cause it).
+export function mcpCheckOutcome(out, err, timedOut) {
+    if (timedOut)
+        return { error: `${err}, so some servers weren\u2019t checked` };
+    let servers = parseMcpList(out ?? '');
+    if (servers.length || /No MCP servers/.test(out ?? ''))
+        return { servers };
+    return { error: err ?? 'claude mcp list printed nothing' };
+}
 
 // `claude mcp list` text (it has no --json) → [{ name, status, detail }].
 // "name: target - <glyph> text": names can hold ':' (plugin:x:y) but not
@@ -557,10 +583,7 @@ function loadSettings(path, cancellable, resolve) {
             try {
                 let [, bytes] = f.load_contents_finish(res);
                 let text = new TextDecoder().decode(bytes);
-                let settings = JSON.parse(text);
-                if (!settings || typeof settings !== 'object' || Array.isArray(settings))
-                    throw new Error('not a JSON object');
-                resolve({ path, settings, layout: settingsLayout(text) });
+                resolve({ path, settings: parseSettings(text), layout: settingsLayout(text) });
             } catch (e) {
                 if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
                     resolve({ path, settings: {}, layout: settingsLayout(null) });
@@ -616,7 +639,7 @@ const unquote = v => v.replace(/^(["'])(.*)\1$/, '$2');
 // plain, quoted and folded (> |) values.
 export function parseSkillMeta(text) {
     let out = { name: '', description: '' };
-    let m = /^---\n([\s\S]*?)\n---/.exec(String(text));
+    let m = /^---\n([\s\S]*?)\n---/.exec(String(text).replace(/\r\n/g, '\n'));
     if (!m)
         return out;
     let lines = m[1].split('\n');
@@ -625,7 +648,7 @@ export function parseSkillMeta(text) {
         if (!kv)
             continue;
         let value = kv[2].trim();
-        if (value === '>' || value === '|') {
+        if (/^[>|][-+]?$/.test(value)) {
             let more = [];
             while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]))
                 more.push(lines[++i].trim());

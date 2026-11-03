@@ -42,6 +42,7 @@ import {
     MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
     SETTINGS_PATH, parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron,
+    mcpCheckOutcome,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -130,12 +131,12 @@ const ClaudeFeatures = {
             mcp: { auth: null, check: null, running: false, error: '' },
             // seq: newest load wins; key: the live folders a load covered.
             rules: { files: [], loaded: false, loading: false, seq: 0, key: null, error: '', armed: null },
-            extras: { plugins: null, skills: [], loaded: false, loading: false, seq: 0, key: null,
+            extras: { plugins: null, skills: [], loaded: false, loading: false, seq: 0, pseq: 0, key: null,
                 error: '', actionError: '', note: '', busy: new Set() },
             edits: Promise.resolve(),   // settings edits run one after another
             procs: new Map(),      // running `claude` commands → { id: timeout source, timedOut }
             requests: [],          // held approvals, FIFO; the head is the one on screen
-            server: null, socketPath: '', closing: null, listenLogged: false,
+            server: null, socketPath: '', closing: null, listenLogged: false, starting: false, startSeq: 0,
         };
         this._buildPillClaude();
         this._syncClaudeMonitor();
@@ -363,12 +364,40 @@ const ClaudeFeatures = {
 
     // ================================================================ approvals
 
+    // Asks first whether something already answers on the socket (another
+    // NotchNux of this user, e.g. a second login): if so it's left alone and
+    // retried with the next sessions read. A dead socket file is replaced.
     _startClaudeApprove() {
         let c = this._claude;
-        if (c.server)
+        if (c.server || c.starting)
             return;
         this._closeClaudeServer();   // a stop just before: let it go now
         let path = approveSocketPath();
+        let seq = ++c.startSeq;
+        c.starting = true;
+        new Gio.SocketClient().connect_async(Gio.UnixSocketAddress.new(path), null, (client, res) => {
+            let live = false;
+            try {
+                client.connect_finish(res).close(null);
+                live = true;
+            } catch (e) {
+                // nothing listening: stale or missing
+            }
+            c.starting = false;
+            if (this._destroyed || seq !== c.startSeq || !this._config.claudeApprove)
+                return;
+            if (live) {
+                if (!c.listenLogged)
+                    logError(`Claude approvals: ${path} is already in use, leaving it alone`);
+                c.listenLogged = true;
+                return;
+            }
+            this._listenClaudeApprove(path);
+        });
+    },
+
+    _listenClaudeApprove(path) {
+        let c = this._claude;
         let server = new Soup.Server();
         server.add_handler(APPROVE_PATH, (srv, msg) => this._onClaudeRequest(msg));
         try {
@@ -389,7 +418,10 @@ const ClaudeFeatures = {
     // Every held request gets "no decision", so the terminal dialogs carry on.
     _stopClaudeApprove() {
         let c = this._claude;
-        if (!c?.server)
+        if (!c)
+            return;
+        c.startSeq++;   // a start still asking about the socket gives up
+        if (!c.server)
             return;
         let pending = c.requests;
         c.requests = [];
@@ -928,22 +960,30 @@ const ClaudeFeatures = {
 
     // Personal skills follow the user's settings; a folder's own skills its
     // settings.local.json (not committed). Plugin skills follow their plugin.
-    async _loadClaudeExtras() {
+    // `plugins: false` re-reads only the skills (a skill toggle doesn't change
+    // the plugin list, and listing plugins spawns claude). Plugins and skills
+    // each keep their own newest-wins counter.
+    async _loadClaudeExtras({ plugins = true } = {}) {
         let x = this._claude.extras;
         let seq = ++x.seq;
+        let pseq = plugins ? ++x.pseq : 0;
         x.key = this._claudeFoldersKey();
         x.loading = true;
         try {
             let sources = skillSources(x.key ? x.key.split('\n') : []);
-            let [plugins, skills] = await Promise.all([
-                new Promise(resolve => this._runClaude(['plugin', 'list', '--json'], { timeoutS: 30 },
-                    (out, err) => resolve({ list: parsePluginList(out ?? ''), err }))),
+            let [listed, skills] = await Promise.all([
+                plugins ? new Promise(resolve => this._runClaude(['plugin', 'list', '--json'], { timeoutS: 30 },
+                    (out, err) => resolve({ list: parsePluginList(out ?? ''), err }))) : null,
                 Promise.all(sources.map(src => this._readSkills(src))).then(all => all.flat()),
             ]);
-            if (this._destroyed || seq !== x.seq)
+            if (this._destroyed)
                 return;
-            x.plugins = plugins.list;
-            x.error = plugins.list ? '' : (plugins.err ?? 'claude plugin list printed nothing');
+            if (listed && pseq === x.pseq) {
+                x.plugins = listed.list;
+                x.error = listed.list ? '' : (listed.err ?? 'claude plugin list printed nothing');
+            }
+            if (seq !== x.seq)
+                return;
             x.skills = skills;
         } catch (e) {
             x.error = `Couldn’t read plugins and skills (${e.message})`;
@@ -1073,7 +1113,7 @@ const ClaudeFeatures = {
         x.busy.delete(key);
         x.actionError = err;
         x.note = err ? '' : `${sk.name} ${off ? 'off' : 'on'} for new sessions`;
-        this._loadClaudeExtras();
+        this._loadClaudeExtras({ plugins: false });
     },
 
     // ---- MCP view: problems first, then counts ----
@@ -1150,18 +1190,18 @@ const ClaudeFeatures = {
         if (this._destroyed)
             return;
         let folder = newest?.folder || '~';
-        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, env, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err) => {
+        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, env, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err, timedOut) => {
             m.running = false;
-            let servers = parseMcpList(out ?? '');
-            if (servers.length || /No MCP servers/.test(out ?? ''))
-                m.check = { at: Date.now(), folder, servers };
+            let result = mcpCheckOutcome(out, err, timedOut);
+            if (result.servers)
+                m.check = { at: Date.now(), folder, servers: result.servers };
             else
-                m.error = err ?? 'claude mcp list printed nothing';
+                m.error = result.error;
             this._updateClaudeTab(false);
         });
     },
 
-    // Run `claude <args>`; done(stdout | null, error | null). `env` (a list
+    // Run `claude <args>`; done(stdout | null, error | null, timedOut). `env` (a list
     // of NAME=value) replaces the environment when given. After timeoutS
     // it gets SIGTERM (claude stops the servers it started), SIGKILL 5 s
     // later; disable() kills at once.
@@ -1209,7 +1249,7 @@ const ClaudeFeatures = {
             if (this._destroyed)
                 return;
             done(out, entry.timedOut ? `claude ${args.join(' ')} took too long`
-                : (p.get_successful() ? null : `claude ${args.join(' ')} failed`));
+                : (p.get_successful() ? null : `claude ${args.join(' ')} failed`), entry.timedOut);
         });
     },
 

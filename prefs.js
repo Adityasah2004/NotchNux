@@ -21,7 +21,7 @@ import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
 import {
     SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine,
-    isApproveConnected, connectApproveHook, disconnectApproveHook, settingsLayout, formatSettings,
+    isApproveConnected, connectApproveHook, disconnectApproveHook, settingsLayout, formatSettings, parseSettings,
 } from './src/helpers/claude.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
@@ -51,10 +51,7 @@ function readClaudeSettings() {
             path = GLib.canonicalize_filename(GLib.file_read_link(path), GLib.path_get_dirname(path));
         let [, bytes] = Gio.File.new_for_path(path).load_contents(null);
         let text = new TextDecoder().decode(bytes);
-        let settings = JSON.parse(text);
-        if (!settings || typeof settings !== 'object' || Array.isArray(settings))
-            throw new Error('not a JSON object');
-        return { path, settings, layout: settingsLayout(text) };
+        return { path, settings: parseSettings(text), layout: settingsLayout(text) };
     } catch (e) {
         if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
             return { path, settings: {}, layout: settingsLayout(null) };

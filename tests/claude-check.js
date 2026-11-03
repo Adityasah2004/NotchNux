@@ -12,7 +12,7 @@ import {
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
-    parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron,
+    parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron, mcpCheckOutcome,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -201,6 +201,14 @@ for (let [what, raw] of [
     eq(formatSettings(disconnectApproveHook(JSON.parse(on)), settingsLayout(on)), raw, `${what}: connect → disconnect exact`);
 }
 eq(formatSettings({ a: 1 }, settingsLayout(null)), '{\n  "a": 1\n}\n', 'no file yet → Claude Code\'s 2-space layout');
+for (let [what, raw] of [['CRLF', '{\r\n  "model": "opus",\r\n  "env": {\r\n    "A": "1"\r\n  }\r\n}\r\n'],
+    ['BOM', '\uFEFF{\n  "model": "opus"\n}\n'], ['BOM + CRLF, no newline', '\uFEFF{\r\n\t"model": "opus"\r\n}']]) {
+    let layout = settingsLayout(raw);
+    let parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
+    eq(formatSettings(parsed, layout), raw, `${what}: rewritten as is`);
+    let on = formatSettings(connectApproveHook(parsed, sock), layout);
+    eq(formatSettings(disconnectApproveHook(JSON.parse(on.replace(/^\uFEFF/, ''))), settingsLayout(on)), raw, `${what}: connect → disconnect exact`);
+}
 
 // ---- MCP health ----
 eq(parseSession(sess({ status: 'idle' })).cwd, '/home/u/Projetos/NotchNux', 'session cwd kept');
@@ -230,6 +238,13 @@ eq(parseMcpList(mcpOut), [
     { name: 'waiting', status: 'pending', detail: '' },
 ], 'claude mcp list parsed (plugin names with ":", " - " in a target, shell noise)');
 eq(parseMcpList('Checking MCP server health…\n\nNo MCP servers configured.\n'), [], 'no servers');
+eq(mcpCheckOutcome(mcpOut, null, false).servers.length, 6, 'check finished: its servers');
+eq(mcpCheckOutcome(mcpOut, 'claude mcp list failed', false).servers.length, 6, 'non-zero exit with output: still a check');
+eq(mcpCheckOutcome('Checking MCP server health…\n\nNo MCP servers configured.\n', null, false), { servers: [] }, 'no servers is a result');
+eq(mcpCheckOutcome(mcpOut, 'claude mcp list took too long', true), { error: 'claude mcp list took too long, so some servers weren\u2019t checked' },
+    'timed out: partial output is not a check');
+eq(mcpCheckOutcome('', 'claude mcp list failed', false), { error: 'claude mcp list failed' }, 'no output: the error');
+eq(mcpCheckOutcome(null, null, false), { error: 'claude mcp list printed nothing' }, 'nothing at all');
 let check = { at: 200, servers: parseMcpList(mcpOut) };
 let sum = mcpSummary(parseNeedsAuth(authText), check);
 eq(sum.problems.map(p => [p.name, p.status]), [['gestor', 'failed'], ['claude.ai Figma', 'auth'],
@@ -287,6 +302,9 @@ eq(parseSkillMeta('---\nname: "quoted"\ndescription: \'single\'\n---\n'), { name
 eq(parseSkillMeta('---\nname: folded\ndescription: >\n  first line\n  second line\nother: x\n---\n'),
     { name: 'folded', description: 'first line second line' }, 'folded description');
 eq(parseSkillMeta('# no frontmatter'), { name: '', description: '' }, 'no frontmatter');
+eq(parseSkillMeta('---\r\nname: crlf\r\ndescription: Windows lines.\r\n---\r\n'), { name: 'crlf', description: 'Windows lines.' }, 'CRLF frontmatter');
+eq(parseSkillMeta('---\nname: chomp\ndescription: >-\n  kept\n  short\n---\n'), { name: 'chomp', description: 'kept short' }, 'folded, stripped (>-)');
+eq(parseSkillMeta('---\nname: lit\ndescription: |+\n  a\n  b\n---\n'), { name: 'lit', description: 'a b' }, 'literal, kept (|+)');
 eq([skillOverride({}, 'a'), skillOverride({ skillOverrides: { a: 'off' } }, 'a'), skillOverride({ skillOverrides: { a: 'name-only' } }, 'a')],
     ['on', 'off', 'name-only'], 'skill override state');
 eq(skillSources(['/p/a', GLib.get_home_dir(), '/p/a', '']).map(x => [x.dir, x.settings, x.where]), [
@@ -313,7 +331,11 @@ function settle(promise) {
 let io = GLib.dir_make_tmp('nn-io-XXXXXX');
 const ioRead = p => new TextDecoder().decode(GLib.file_get_contents(p)[1]);
 let missing = settle(readSettingsAsync(`${io}/none.json`));
-eq([missing.settings, missing.layout, missing.error], [{}, { indent: '  ', eol: '\n' }, undefined], 'missing file → {}');
+eq([missing.settings, missing.layout, missing.error], [{}, { indent: '  ', eol: '\n', nl: '\n', bom: '' }, undefined], 'missing file → {}');
+GLib.file_set_contents(`${io}/empty.json`, '');
+eq(settle(readSettingsAsync(`${io}/empty.json`)).settings, {}, 'empty file → {}');
+GLib.file_set_contents(`${io}/bom.json`, '\uFEFF{"a": 1}\n');
+eq(settle(readSettingsAsync(`${io}/bom.json`)).settings, { a: 1 }, 'BOM ignored when reading');
 GLib.file_set_contents(`${io}/bad.json`, '{"a": ');
 ok(!!settle(readSettingsAsync(`${io}/bad.json`)).error, 'unparsable → error');
 GLib.file_set_contents(`${io}/arr.json`, '[1]');
