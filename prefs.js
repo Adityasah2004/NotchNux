@@ -19,7 +19,10 @@ import GObject from 'gi://GObject';
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
-import { SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine } from './src/helpers/claude.js';
+import {
+    SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine,
+    isApproveConnected, connectApproveHook, disconnectApproveHook,
+} from './src/helpers/claude.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -81,7 +84,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         this._addWallpaperGroup(page, config, window);
         this._addTabsGroup(page, config);
         this._addFeaturesGroup(page, config);
-        this._addClaudeGroup(page);
+        this._addClaudeGroup(page, config);
         this._addTrayMirrorGroup(page, config);
         this._addQuickShareGroup(page);
         this._addSystemGroup(page);
@@ -710,43 +713,64 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
     // command. Connect puts a small inline step in front of the user's own
     // command (helpers/claude.js) that saves those numbers for the notch;
     // Disconnect puts the original back exactly.
-    _addClaudeGroup(page) {
+    _addClaudeGroup(page, config) {
         const group = new Adw.PreferencesGroup({
             title: 'Claude Code',
-            description: 'Turn on the Claude tab in Tabs and “Claude Code in the pill” in Features to watch your sessions. To also see your 5-hour and weekly usage, connect Claude Code’s status line.',
+            description: 'Turn on the Claude tab in Tabs and “Claude Code in the pill” in Features to watch your sessions. To also see your 5-hour and weekly usage, connect Claude Code’s status line. To answer permission prompts from the notch, connect approvals.',
         });
         page.add(group);
 
-        const row = new Adw.ActionRow({ title: 'Usage limits', use_markup: false });
-        const btn = new Gtk.Button({ valign: Gtk.Align.CENTER });
-        row.add_suffix(btn);
-        group.add(row);
+        // One Connect / Disconnect row over ~/.claude/settings.json.
+        // `change(settings, on)` → [new settings, what to do once written].
+        const addRow = (title, isOn, change, onText, offText) => {
+            const row = new Adw.ActionRow({ title, use_markup: false });
+            const btn = new Gtk.Button({ valign: Gtk.Align.CENTER });
+            row.add_suffix(btn);
+            group.add(row);
 
-        const refresh = (note = null) => {
-            const r = readClaudeSettings();
-            const on = !r.error && isConnected(r.settings);
-            btn.label = on ? 'Disconnect' : 'Connect';
-            btn.sensitive = !r.error;
-            row.subtitle = note ?? r.error ?? (on
-                ? 'Connected. Your own status line still runs as before.'
-                : 'Adds a step in front of your status line in ~/.claude/settings.json that saves the usage numbers to ~/.cache/notchnux. Your status line keeps working; the old file is kept as settings.json~.');
-        };
-        btn.connect('clicked', () => {
-            const r = readClaudeSettings();
-            if (r.error) {
+            const refresh = (note = null) => {
+                const r = readClaudeSettings();
+                const on = !r.error && isOn(r.settings);
+                btn.label = on ? 'Disconnect' : 'Connect';
+                btn.sensitive = !r.error;
+                row.subtitle = note ?? r.error ?? (on ? onText : offText);
+            };
+            btn.connect('clicked', () => {
+                const r = readClaudeSettings();
+                if (r.error) {
+                    refresh();
+                    return;
+                }
+                const [next, done] = change(r.settings, isOn(r.settings));
+                try {
+                    writeClaudeSettings(r.path, next);
+                } catch (e) {
+                    refresh(`Couldn’t write ${r.path} (${e.message}).`);
+                    return;
+                }
+                done?.();
                 refresh();
-                return;
-            }
-            const next = isConnected(r.settings) ? disconnectStatusLine(r.settings) : connectStatusLine(r.settings);
-            try {
-                writeClaudeSettings(r.path, next);
-            } catch (e) {
-                refresh(`Couldn’t write ${r.path} (${e.message}).`);
-                return;
-            }
+            });
             refresh();
-        });
-        refresh();
+        };
+
+        addRow('Usage limits', isConnected,
+            (s, on) => [on ? disconnectStatusLine(s) : connectStatusLine(s)],
+            'Connected. Your own status line still runs as before.',
+            'Adds a step in front of your status line in ~/.claude/settings.json that saves the usage numbers to ~/.cache/notchnux. Your status line keeps working; the old file is kept as settings.json~.');
+
+        // The token goes in the hook and in NotchNux's config: the notch only
+        // answers requests that carry it. Settings are written first, so a
+        // failed write leaves the token as it was.
+        addRow('Approve from the notch', s => isApproveConnected(s) && !!config.claudeHookToken,
+            (s, on) => {
+                if (on)
+                    return [disconnectApproveHook(s), () => config.setClaudeHookToken('')];
+                const token = GLib.uuid_string_random();
+                return [connectApproveHook(s, token), () => config.setClaudeHookToken(token)];
+            },
+            'Connected. Permission prompts show Allow / Deny on the notch; the terminal prompt keeps working.',
+            'Allow or deny Claude Code’s permission prompts from the notch. Adds a hook to ~/.claude/settings.json that asks NotchNux on this computer only (127.0.0.1). The terminal prompt keeps working.');
     }
 
     // ---- Mirrored indicators (Tray tab) ----
