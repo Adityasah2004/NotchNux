@@ -6,11 +6,12 @@ import Gio from 'gi://Gio';
 import Soup from 'gi://Soup?version=3.0';
 import {
     parseSession, procStat, isLive, alertFor, parseUsage, sortSessions, pillDots,
-    fmtAge, wrapCommand, unwrapCommand, isConnected, connectStatusLine, disconnectStatusLine,
+    SETTINGS_PATH, fmtAge, wrapCommand, unwrapCommand, isConnected, connectStatusLine, disconnectStatusLine,
     SOCKET_NAME, approveSocketPath, approveCommand, passThrough, describeRequest, decisionBody,
     isApproveConnected, connectApproveHook, disconnectApproveHook,
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
+    SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -218,6 +219,66 @@ eq(mcpSummary(new Map([['odd', 100]]), check).problems.some(p => p.name === 'odd
 eq(mcpSummary(new Map([['odd', 300]]), check).problems.find(p => p.name === 'odd')?.status, 'auth', 'cache newer than the check: needs login');
 eq(mcpSummary(parseNeedsAuth(authText), null), { problems: [{ name: 'claude.ai Figma', status: 'auth', detail: '' },
     { name: 'plugin:bio-research:wiley', status: 'auth', detail: '' }], ok: 0, off: 0 }, 'no check yet: cache only');
+
+// ---- permission rules + default mode ----
+const perms = { model: 'opus', permissions: { allow: ['Bash(npm test:*)', 'WebFetch(domain:x.com)'], deny: ['Read(.env)'],
+    defaultMode: 'auto' } };
+eq(rulesOf(perms), [{ kind: 'deny', rule: 'Read(.env)' }, { kind: 'allow', rule: 'Bash(npm test:*)' },
+    { kind: 'allow', rule: 'WebFetch(domain:x.com)' }], 'rules: deny, ask, allow order');
+eq(rulesOf({}), [], 'no permissions');
+eq(rulesOf({ permissions: { allow: 'x', ask: [3, 'Edit'] } }), [{ kind: 'ask', rule: 'Edit' }], 'junk skipped');
+for (let raw of ['{\n  "permissions": {\n    "allow": [\n      "A",\n      "B"\n    ]\n  }\n}\n',
+    '{\n    "permissions": {\n        "allow": [\n            "A",\n            "B"\n        ]\n    }\n}\n']) {
+    let lay = settingsLayout(raw);
+    eq(formatSettings(removeRule(JSON.parse(raw), 'allow', 'A'), lay), raw.replace(/\n +"A",/, ''), `remove a rule, layout kept (${lay.indent.length} spaces)`);
+}
+eq(removeRule(perms, 'allow', 'gone'), perms, 'removing a missing rule changes nothing');
+eq(removeRule({ permissions: { deny: ['X'] } }, 'deny', 'X'), { permissions: { deny: [] } }, 'last rule: empty list kept');
+eq(SAFE_MODES, ['default', 'acceptEdits', 'plan', 'auto'], 'safe modes');
+eq(setDefaultMode(perms, 'plan').permissions, { ...perms.permissions, defaultMode: 'plan' }, 'set mode');
+eq(setDefaultMode({ model: 'x' }, 'acceptEdits'), { model: 'x', permissions: { defaultMode: 'acceptEdits' } }, 'set mode without permissions');
+for (let bad of ['bypassPermissions', 'dontAsk', 'manual', '', undefined]) {
+    let threw = false;
+    try { setDefaultMode(perms, bad); } catch (e) { threw = true; }
+    ok(threw, `unsafe mode refused: ${bad}`);
+}
+eq(claudeSettingsFiles(['/p/a', '/p/b', '/p/a']).map(f => [f.path, f.scope, f.label]), [
+    [SETTINGS_PATH, 'user', 'You · ~/.claude/settings.json'],
+    ['/p/a/.claude/settings.json', 'project', 'a · .claude/settings.json'],
+    ['/p/a/.claude/settings.local.json', 'local', 'a · .claude/settings.local.json'],
+    ['/p/b/.claude/settings.json', 'project', 'b · .claude/settings.json'],
+    ['/p/b/.claude/settings.local.json', 'local', 'b · .claude/settings.local.json'],
+], 'settings files: user + each live folder once');
+
+// ---- settings IO, async, on scratch files ----
+function settle(promise) {
+    let loop = new GLib.MainLoop(null, false), out, err;
+    promise.then(v => { out = v; loop.quit(); }, e => { err = e; loop.quit(); });
+    loop.run();
+    if (err)
+        throw err;
+    return out;
+}
+let io = GLib.dir_make_tmp('nn-io-XXXXXX');
+const ioRead = p => new TextDecoder().decode(GLib.file_get_contents(p)[1]);
+let missing = settle(readSettingsAsync(`${io}/none.json`));
+eq([missing.settings, missing.layout, missing.error], [{}, { indent: '  ', eol: '\n' }, undefined], 'missing file → {}');
+GLib.file_set_contents(`${io}/bad.json`, '{"a": ');
+ok(!!settle(readSettingsAsync(`${io}/bad.json`)).error, 'unparsable → error');
+GLib.file_set_contents(`${io}/arr.json`, '[1]');
+ok(!!settle(readSettingsAsync(`${io}/arr.json`)).error, 'not an object → error');
+const four = '{\n    "permissions": {\n        "allow": [\n            "A"\n        ]\n    }\n}\n';
+GLib.file_set_contents(`${io}/real.json`, four);
+GLib.spawn_command_line_sync(`ln -s real.json ${GLib.shell_quote(`${io}/link.json`)}`);
+let r = settle(readSettingsAsync(`${io}/link.json`));
+eq([r.path, r.settings.permissions.allow], [`${io}/real.json`, ['A']], 'symlink followed');
+settle(writeSettingsAsync(r.path, removeRule(r.settings, 'allow', 'A'), r.layout));
+eq(ioRead(`${io}/real.json`), four.replace('\n            "A"\n        ', ''), 'written in its own layout');
+eq(ioRead(`${io}/real.json~`), four, 'previous file kept as backup');
+ok(GLib.file_test(`${io}/link.json`, GLib.FileTest.IS_SYMLINK), 'symlink still a symlink');
+settle(writeSettingsAsync(`${io}/new/.claude/settings.json`, { a: 1 }, missing.layout));
+eq(ioRead(`${io}/new/.claude/settings.json`), '{\n  "a": 1\n}\n', 'creates the folder for a new file');
+GLib.spawn_command_line_sync(`rm -rf ${GLib.shell_quote(io)}`);
 
 // ---- config: approvals on/off (read-only checks; never saves) ----
 const cfg = obj => new ConfigStore({ contents: new TextEncoder().encode(JSON.stringify(obj)) });

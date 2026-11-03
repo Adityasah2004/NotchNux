@@ -74,7 +74,7 @@ function lbl(text, styleClass, props = {}) {
     return l;
 }
 
-function iconBtn(iconName, styleClass, onClick, name = '') {
+export function iconBtn(iconName, styleClass, onClick, name = '') {
     let b = new St.Button({ style_class: styleClass, can_focus: true, reactive: true,
         y_align: Clutter.ActorAlign.CENTER, accessible_name: name });
     b.set_child(new St.Icon({ icon_name: iconName, icon_size: 14 }));

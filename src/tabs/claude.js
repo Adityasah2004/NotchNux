@@ -5,7 +5,9 @@
 //            then the 5-hour usage
 //   tab:   Sessions · MCP views. Sessions: 5-hour / weekly usage bars, then
 //          one row per live session. MCP: servers that need a login (from
-//          Claude Code's own cache) or failed the last "Check now".
+//          Claude Code's own cache) or failed the last "Check now". Rules:
+//          the default mode for new sessions, and allow / ask / deny rules
+//          from the user's settings and every live session's folder.
 //
 // Data comes from files Claude Code already writes (see helpers/claude.js).
 // The sessions folder is watched, so a session asking for approval shows up
@@ -36,13 +38,14 @@ import {
     parseUsage, sortSessions, pillDots, fmtAge,
     APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
     MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
+    SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
 import { addPressFeedback } from '../helpers/motion.js';
 import { accentHex } from '../helpers/widgets.js';
 import { logError } from '../helpers/log.js';
-import { SYS, statColor } from './ledge.js';
+import { SYS, statColor, iconBtn } from './ledge.js';
 
 const SWEEP_S = 30;
 const DEBOUNCE_MS = 150;
@@ -57,7 +60,10 @@ const REQUEST_MAX_AGE_US = (HOOK_TIMEOUT_S - SWEEP_S - 5) * 1e6;
 // A click this soon after a banner (re)appears is the tail of a double-click
 // meant for the one before it.
 const CLICK_GUARD_US = 500 * 1000;
-const CLAUDE_VIEWS = [['sessions', 'Sessions'], ['mcp', 'MCP']];
+const CLAUDE_VIEWS = [['sessions', 'Sessions'], ['mcp', 'MCP'], ['rules', 'Rules']];
+const MODE_LABELS = [['default', 'Default'], ['acceptEdits', 'Accept edits'], ['plan', 'Plan'], ['auto', 'Auto']];
+const KIND_COLOR = { allow: SYS.green, ask: SYS.orange, deny: SYS.red };
+const CONFIRM_MS = 3000;
 // `claude mcp list` starts every server: ~20 s for 22 of them.
 const MCP_CHECK_TIMEOUT_S = 90;
 const MCP_TEXT = {
@@ -118,6 +124,7 @@ const ClaudeFeatures = {
             monitor: null, monitorId: 0, debounceId: 0, sweepId: 0,
             cancellable: null, seq: 0, pillSig: '',
             mcp: { auth: null, check: null, running: false, error: '' },
+            rules: { files: [], loaded: false, loading: 0, error: '', armed: null },
             procs: new Map(),      // running `claude` commands → their timeout source
             requests: [],          // held approvals, FIFO; the head is the one on screen
             server: null, socketPath: '', closing: null, listenLogged: false,
@@ -137,6 +144,7 @@ const ClaudeFeatures = {
             proc.force_exit();
         }
         this._claude.procs.clear();
+        this._disarmClaudeRule();
         this._stopClaudeMonitor();
     },
 
@@ -606,10 +614,31 @@ const ClaudeFeatures = {
         mcpView.add_child(scrolled(mcpList));
         panel.add_child(mcpView);
 
+        // ---- Rules ----
+        let rulesView = new St.BoxLayout({ vertical: true, x_expand: true });
+        let modeRow = new St.BoxLayout({ style_class: 'nn-claude-head', x_expand: true });
+        modeRow.add_child(text('Default mode', 'nn-claude-name', { x_expand: true }));
+        let modeSeg = new St.BoxLayout({ style_class: 'nook-segmented', y_align: Clutter.ActorAlign.CENTER });
+        let modeBtns = {};
+        for (let [id, label] of MODE_LABELS) {
+            let b = new St.Button({ style_class: 'nook-segment', label, can_focus: true });
+            b.connect('clicked', () => this._setClaudeMode(id));
+            modeSeg.add_child(b);
+            modeBtns[id] = b;
+        }
+        modeRow.add_child(modeSeg);
+        rulesView.add_child(modeRow);
+        let modeNote = text('', 'nook-card-meta nn-claude-note');
+        rulesView.add_child(modeNote);
+        let rulesList = new St.BoxLayout({ style_class: 'nn-claude-list', vertical: true, x_expand: true });
+        rulesView.add_child(scrolled(rulesList));
+        panel.add_child(rulesView);
+
         this._mount(panel);
-        this._claudeUi = { segBtns, views: { sessions: sessionsView, mcp: mcpView },
+        this._claudeUi = { segBtns, views: { sessions: sessionsView, mcp: mcpView, rules: rulesView },
             five, week, resets, list, sig: null, ages: [],
-            mcp: { meta, btn: checkBtn, list: mcpList, sig: null } };
+            mcp: { meta, btn: checkBtn, list: mcpList, sig: null },
+            rules: { modeBtns, note: modeNote, list: rulesList, sig: null } };
         this._claudeTabShown();
     },
 
@@ -617,6 +646,7 @@ const ClaudeFeatures = {
     _claudeTabShown() {
         let c = this._claude;
         c.tabOpen = true;
+        c.rules.loaded = false;   // re-read settings each time the tab shows
         c.unseen.clear();
         this._syncClaudeMonitor();
         this._updateClaudeTab(false);
@@ -630,6 +660,8 @@ const ClaudeFeatures = {
     // Switch views (and open the Claude tab if it isn't up).
     _openClaudeView(id) {
         this._claudeView = id;
+        if (id === 'rules')
+            this._claude.rules.loaded = false;
         if (this._activeTab !== 'claude' || !this.isExpanded) {
             this._openTab('claude');
             return;
@@ -695,6 +727,144 @@ const ClaudeFeatures = {
             label.set_text(fmtAge(now - since));
 
         this._updateClaudeMcp(ui.mcp);
+        if (view === 'rules' && !c.rules.loaded && !c.rules.loading)
+            this._loadClaudeRules();
+        this._updateClaudeRules(ui.rules);
+    },
+
+    // ---- Rules view ----
+    async _loadClaudeRules() {
+        let r = this._claude.rules;
+        let seq = ++r.loading;
+        let files = claudeSettingsFiles([...this._claude.sessions.values()].map(s => s.cwd));
+        let read = await Promise.all(files.map(f => readSettingsAsync(f.path).then(x => ({ ...f, ...x, file: f.path }))));
+        if (this._destroyed || seq !== r.loading)
+            return;
+        r.loading = 0;
+        r.files = read;
+        r.loaded = true;
+        this._updateClaudeTab(false);
+    },
+
+    _updateClaudeRules(ui) {
+        let r = this._claude.rules;
+        let user = r.files.find(f => f.scope === 'user');
+        let mode = user?.settings?.permissions?.defaultMode ?? 'default';
+        for (let [id, b] of Object.entries(ui.modeBtns)) {
+            if (id === mode)
+                b.add_style_class_name('nook-segment-active');
+            else
+                b.remove_style_class_name('nook-segment-active');
+        }
+        ui.note.set_text(r.error || (SAFE_MODES.includes(mode) ? 'New sessions start in this mode'
+            : `New sessions start in ${mode}, set outside the notch`));
+
+        let sig = JSON.stringify([r.loaded, r.files.map(f => [f.file, f.error, rulesOf(f.settings)])]);
+        if (sig === ui.sig)
+            return;
+        ui.sig = sig;
+        this._disarmClaudeRule();
+        ui.list.destroy_all_children();
+        let any = false;
+        for (let f of r.files) {
+            let rules = f.error ? [] : rulesOf(f.settings);
+            if (!rules.length && !f.error)
+                continue;
+            any = true;
+            ui.list.add_child(text(f.label, 'nook-card-meta nn-claude-group'));
+            if (f.error)
+                ui.list.add_child(text(f.error, 'nook-card-meta'));
+            for (let rule of rules)
+                ui.list.add_child(this._buildRuleRow(f, rule));
+        }
+        if (!any) {
+            let empty = new St.BoxLayout({ style_class: 'nook-empty', vertical: true, x_expand: true });
+            empty.add_child(new St.Icon({ icon_name: 'security-high-symbolic', icon_size: 22,
+                style_class: 'nook-dim', x_align: Clutter.ActorAlign.CENTER }));
+            empty.add_child(new St.Label({ text: r.loaded ? 'No permission rules' : 'Reading settings…',
+                style_class: 'nook-empty-title', x_align: Clutter.ActorAlign.CENTER }));
+            ui.list.add_child(empty);
+        }
+        this._resizeClaudeTab();
+    },
+
+    _buildRuleRow(f, { kind, rule }) {
+        let row = new St.BoxLayout({ style_class: 'nn-claude-row nn-claude-rule', x_expand: true });
+        row.add_child(text(kind, 'nn-claude-badge', { style: `color: ${KIND_COLOR[kind]};` }));
+        row.add_child(text(rule, 'nn-claude-rule-text', { x_expand: true }));
+        let del = iconBtn('window-close-symbolic', 'nook-mini-btn', () => this._armOrRemoveRule(del, f, kind, rule),
+            `Remove ${kind} rule ${rule}`);
+        row.add_child(del);
+        return row;
+    },
+
+    // × once arms it ("Remove?" for 3 s), a second click removes the rule.
+    _armOrRemoveRule(btn, f, kind, rule) {
+        let r = this._claude.rules;
+        if (r.armed?.btn === btn) {
+            this._disarmClaudeRule();
+            this._editClaudeSettings(f.path, s => removeRule(s, kind, rule));
+            return;
+        }
+        this._disarmClaudeRule();
+        btn.set_child(new St.Label({ text: 'Remove?', y_align: Clutter.ActorAlign.CENTER }));
+        btn.add_style_class_name('nook-danger');
+        let armed = { btn, id: 0, sig: 0 };
+        armed.id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CONFIRM_MS, () => {
+            armed.id = 0;
+            this._disarmClaudeRule();
+            return GLib.SOURCE_REMOVE;
+        });
+        // A rebuilt list destroys the button: forget it without touching it.
+        armed.sig = btn.connect('destroy', () => {
+            if (armed.id)
+                GLib.Source.remove(armed.id);
+            if (r.armed === armed)
+                r.armed = null;
+        });
+        r.armed = armed;
+    },
+
+    _disarmClaudeRule() {
+        let r = this._claude?.rules;
+        let a = r?.armed;
+        if (!a)
+            return;
+        r.armed = null;
+        if (a.id)
+            GLib.Source.remove(a.id);
+        a.btn.disconnect(a.sig);
+        a.btn.set_child(new St.Icon({ icon_name: 'window-close-symbolic', icon_size: 14 }));
+        a.btn.remove_style_class_name('nook-danger');
+    },
+
+    _setClaudeMode(mode) {
+        let user = this._claude.rules.files.find(f => f.scope === 'user');
+        if ((user?.settings?.permissions?.defaultMode ?? 'default') === mode)
+            return;
+        this._editClaudeSettings(user?.path ?? claudeSettingsFiles([])[0].path, s => setDefaultMode(s, mode));
+    },
+
+    // Re-read right before writing (Claude Code may have changed the file),
+    // apply `edit`, write in the file's own layout, then reload the view.
+    async _editClaudeSettings(path, edit) {
+        let r = this._claude.rules;
+        let cur = await readSettingsAsync(path);
+        r.error = '';
+        if (cur.error) {
+            r.error = cur.error;
+        } else {
+            let next = edit(cur.settings);
+            if (next !== cur.settings) {
+                try {
+                    await writeSettingsAsync(cur.path, next, cur.layout);
+                } catch (e) {
+                    r.error = `Couldn’t write ${cur.path} (${e.message})`;
+                }
+            }
+        }
+        if (!this._destroyed)
+            this._loadClaudeRules();
     },
 
     // ---- MCP view: problems first, then counts ----

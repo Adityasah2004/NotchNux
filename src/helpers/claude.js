@@ -11,6 +11,7 @@
 //     saved by the wrapper below. Its `rate_limits` carries the 5-hour and
 //     weekly usage (Claude Code 2.1.80+, Pro/Max plans).
 
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 const HOME = GLib.get_home_dir();
@@ -436,4 +437,102 @@ export function mcpSummary(auth, check) {
 export function claudeBinary() {
     let local = `${HOME}/.local/bin/claude`;
     return GLib.find_program_in_path('claude') ?? (GLib.file_test(local, GLib.FileTest.IS_EXECUTABLE) ? local : null);
+}
+
+// ---- Permission rules + default mode ----
+
+const RULE_KINDS = ['deny', 'ask', 'allow'];   // the order Claude Code checks them
+
+export function rulesOf(settings) {
+    let p = settings?.permissions;
+    let out = [];
+    for (let kind of RULE_KINDS) {
+        for (let rule of Array.isArray(p?.[kind]) ? p[kind] : []) {
+            if (typeof rule === 'string')
+                out.push({ kind, rule });
+        }
+    }
+    return out;
+}
+
+// Removes that one rule; an emptied list stays (an empty list means the same).
+export function removeRule(settings, kind, rule) {
+    let list = settings?.permissions?.[kind];
+    let i = Array.isArray(list) ? list.indexOf(rule) : -1;
+    if (i < 0)
+        return settings;
+    return { ...settings, permissions: { ...settings.permissions, [kind]: list.filter((_, j) => j !== i) } };
+}
+
+// What the notch may switch new sessions to. Never bypassPermissions or
+// dontAsk: one stray click shouldn't turn every prompt off.
+export const SAFE_MODES = ['default', 'acceptEdits', 'plan', 'auto'];
+
+export function setDefaultMode(settings, mode) {
+    if (!SAFE_MODES.includes(mode))
+        throw new Error(`not offered from the notch: ${mode}`);
+    return { ...settings, permissions: { ...(settings.permissions ?? {}), defaultMode: mode } };
+}
+
+// The files the Rules and Skills views cover: the user's, plus project and
+// local settings of every folder a live session runs in.
+export function claudeSettingsFiles(cwds) {
+    let files = [{ path: SETTINGS_PATH, scope: 'user', label: 'You · ~/.claude/settings.json' }];
+    for (let cwd of new Set(cwds)) {
+        if (!cwd)
+            continue;
+        let folder = GLib.path_get_basename(cwd);
+        for (let [scope, name] of [['project', 'settings.json'], ['local', 'settings.local.json']]) {
+            let path = `${cwd}/.claude/${name}`;
+            if (!files.some(f => f.path === path))   // a session in ~ shares the user file
+                files.push({ path, scope, label: `${folder} · .claude/${name}` });
+        }
+    }
+    return files;
+}
+
+// ---- Settings IO for the shell (async; Preferences has its own sync pair) ----
+
+// → { path, settings, layout } or { path, error }. A symlinked file is
+// followed so writes land on the real file; a missing one reads as {}.
+// Anything that isn't a JSON object is an error and is never written.
+export function readSettingsAsync(path, cancellable = null) {
+    if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK))
+        path = GLib.canonicalize_filename(GLib.file_read_link(path), GLib.path_get_dirname(path));
+    return new Promise(resolve => {
+        Gio.File.new_for_path(path).load_contents_async(cancellable, (f, res) => {
+            try {
+                let [, bytes] = f.load_contents_finish(res);
+                let text = new TextDecoder().decode(bytes);
+                let settings = JSON.parse(text);
+                if (!settings || typeof settings !== 'object' || Array.isArray(settings))
+                    throw new Error('not a JSON object');
+                resolve({ path, settings, layout: settingsLayout(text) });
+            } catch (e) {
+                if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                    resolve({ path, settings: {}, layout: settingsLayout(null) });
+                else
+                    resolve({ path, error: `Can’t read ${path} (${e.message})` });
+            }
+        });
+    });
+}
+
+// In the file's own layout; the previous file is kept as <name>~.
+// ponytail: read-modify-write without a lock — Claude Code seldom writes
+// these files; lock if a lost edit ever shows up.
+export function writeSettingsAsync(path, settings, layout) {
+    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
+    let bytes = new GLib.Bytes(new TextEncoder().encode(formatSettings(settings, layout)));
+    return new Promise((resolve, reject) => {
+        Gio.File.new_for_path(path).replace_contents_bytes_async(bytes, null, true, Gio.FileCreateFlags.NONE, null,
+            (f, res) => {
+                try {
+                    f.replace_contents_finish(res);
+                    resolve();
+                } catch (e) {
+                    reject(e);
+                }
+            });
+    });
 }

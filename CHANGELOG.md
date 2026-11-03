@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one newly does. **Check now** runs `claude mcp list` (through your shell,
   so servers see your usual PATH) in the newest session's folder and lists
   the failures with their reason. Long lists scroll.
+- A **Rules** view switches the default permission mode for new sessions
+  (Default / Accept edits / Plan / Auto; never bypassPermissions) and lists
+  the allow / ask / deny rules from `~/.claude/settings.json` and each
+  running session's `.claude/settings*.json`. × asks once, then removes the
+  rule; files keep their own layout and the old copy is kept as `name~`.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);

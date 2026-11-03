@@ -2535,6 +2535,24 @@
     margin-bottom: 4px;
     padding: 0 4px;
 }
+.nn-claude-note {
+    padding: 0 4px 4px;
+}
+.nn-claude-group {
+    padding: 10px 6px 2px;
+}
+.nn-claude-rule {
+    spacing: 10px;
+}
+.nn-claude-badge {
+    min-width: 34px;
+    font-size: 10.5px;
+    font-weight: bold;
+}
+.nn-claude-rule-text {
+    font-family: monospace;
+    font-size: 12px;
+}
 .nn-claude-mcp-sum {
     padding: 8px 6px 2px;
 }
