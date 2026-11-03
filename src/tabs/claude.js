@@ -93,7 +93,7 @@ const ClaudeFeatures = {
             monitor: null, monitorId: 0, debounceId: 0, sweepId: 0,
             cancellable: null, seq: 0, pillSig: '',
             requests: [],          // held approvals, FIFO; the head is the one on screen
-            server: null, portLogged: false,
+            server: null, closing: null, portLogged: false,
         };
         this._buildPillClaude();
         this._syncClaudeMonitor();
@@ -101,6 +101,9 @@ const ClaudeFeatures = {
 
     _destroyClaude() {
         this._stopClaudeApprove();
+        // No timer may outlive disable(): close now. Held replies can be cut
+        // off then (Claude Code reads that as no decision too).
+        this._closeClaudeServer();
         this._stopClaudeMonitor();
     },
 
@@ -300,6 +303,7 @@ const ClaudeFeatures = {
         let c = this._claude;
         if (c.server)
             return;
+        this._closeClaudeServer();   // a stop just before: free the port now
         let server = new Soup.Server();
         server.add_handler(APPROVE_PATH, (srv, msg) => this._onClaudeRequest(msg));
         try {
@@ -326,10 +330,31 @@ const ClaudeFeatures = {
         c.requests = [];
         for (let r of pending)
             this._replyClaude(r.msg, 200, decisionBody('none'));
-        c.server.disconnect();
+        // Closing the sockets at once would cut those replies off: stop taking
+        // requests (404 = no decision too) and close a moment later.
+        c.server.remove_handler(APPROVE_PATH);
+        let server = c.server;
         c.server = null;
+        c.closing = {
+            server,
+            id: GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                c.closing.id = 0;
+                this._closeClaudeServer();
+                return GLib.SOURCE_REMOVE;
+            }),
+        };
         if (this._peekSticky && !this._destroyed)
             this._hideNotificationPeek();
+    },
+
+    _closeClaudeServer() {
+        let c = this._claude;
+        if (!c.closing)
+            return;
+        if (c.closing.id)
+            GLib.Source.remove(c.closing.id);
+        c.closing.server.disconnect();
+        c.closing = null;
     },
 
     _replyClaude(msg, status, body = '') {

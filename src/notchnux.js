@@ -2605,9 +2605,10 @@ export const NotchNux = GObject.registerClass({
         // gets its width back when they let go.
         if (this.isExpanded || this._peekActive || this._alertShowing || this._tucked)
             return;
-        let width = this._pillWidth();
-        let targetX = monitor.x + Math.floor((monitor.width - width) / 2);
-        springTo(this, { x: targetX, width }, { duration: 380, damping: 1 });
+        // The whole rest geometry, not just x/width: springTo stops the spring
+        // in flight, so a width change while a peek shrinks back (the Claude
+        // dots changing right after an approval) would freeze its height.
+        springTo(this, this._restGeometry(), { duration: 380, damping: 1 });
     }
 
     // Distribute the zones evenly. With the pill sized by _pillWidth to hold all
