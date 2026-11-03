@@ -3,7 +3,9 @@
 //   pill:  ( ♫ Song…     Tue 3 · 2:32 PM     ● ◉ ○ 42%   🔋 87% )
 //            one dot per session (working · waiting for you · finished),
 //            then the 5-hour usage
-//   tab:   5-hour / weekly usage bars, then one row per live session
+//   tab:   Sessions · MCP views. Sessions: 5-hour / weekly usage bars, then
+//          one row per live session. MCP: servers that need a login (from
+//          Claude Code's own cache) or failed the last "Check now".
 //
 // Data comes from files Claude Code already writes (see helpers/claude.js).
 // The sessions folder is watched, so a session asking for approval shows up
@@ -33,6 +35,7 @@ import {
     SESSIONS_DIR, USAGE_PATH, SESSION_FILE, parseSession, procStat, isLive, alertFor,
     parseUsage, sortSessions, pillDots, fmtAge,
     APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
+    MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -54,6 +57,14 @@ const REQUEST_MAX_AGE_US = (HOOK_TIMEOUT_S - SWEEP_S - 5) * 1e6;
 // A click this soon after a banner (re)appears is the tail of a double-click
 // meant for the one before it.
 const CLICK_GUARD_US = 500 * 1000;
+const CLAUDE_VIEWS = [['sessions', 'Sessions'], ['mcp', 'MCP']];
+// `claude mcp list` starts every server: ~20 s for 22 of them.
+const MCP_CHECK_TIMEOUT_S = 90;
+const MCP_TEXT = {
+    failed: ['Failed', SYS.red, ''],
+    auth: ['Needs login', SYS.orange, 'Log in with /mcp in a Claude session'],
+    pending: ['Pending approval', SYS.orange, 'Approve it in a Claude session'],
+};
 const ALERT_ICON = { approval: 'dialog-warning-symbolic', question: 'dialog-question-symbolic', done: 'object-select-symbolic' };
 
 function dotColor(kind) {
@@ -77,6 +88,14 @@ function dot(color) {
 
 const read = (path, cancellable) => new Promise(resolve => readTextAsync(path, cancellable, resolve));
 
+function scrolled(child) {
+    let scroll = new St.ScrollView({ style_class: 'nn-claude-scroll', x_expand: true });
+    scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
+    scroll.set_overlay_scrollbars(true);
+    scroll.set_child(child);
+    return scroll;
+}
+
 // "16:30" today, "Thu 09:00" later on.
 function fmtReset(ms) {
     if (!ms)
@@ -98,6 +117,8 @@ const ClaudeFeatures = {
             tabOpen: false,
             monitor: null, monitorId: 0, debounceId: 0, sweepId: 0,
             cancellable: null, seq: 0, pillSig: '',
+            mcp: { auth: null, check: null, running: false, error: '' },
+            procs: new Map(),      // running `claude` commands → their timeout source
             requests: [],          // held approvals, FIFO; the head is the one on screen
             server: null, socketPath: '', closing: null, listenLogged: false,
         };
@@ -110,6 +131,12 @@ const ClaudeFeatures = {
         // No timer may outlive disable(): close now. Held replies can be cut
         // off then (Claude Code reads that as no decision too).
         this._closeClaudeServer();
+        for (let [proc, id] of this._claude.procs) {
+            if (id)
+                GLib.Source.remove(id);
+            proc.force_exit();
+        }
+        this._claude.procs.clear();
         this._stopClaudeMonitor();
     },
 
@@ -174,6 +201,7 @@ const ClaudeFeatures = {
         c.sessions = new Map();
         c.unseen.clear();
         c.usage = null;
+        c.mcp.auth = null;
     },
 
     // A session file changed: re-read once the burst of writes settles.
@@ -219,13 +247,14 @@ const ClaudeFeatures = {
                     return isLive(s, await read(`/proc/${s.pid}/stat`, cancellable)) ? s : null;
                 }));
                 let usage = parseUsage(await read(USAGE_PATH, cancellable) ?? '');
+                let auth = parseNeedsAuth(await read(MCP_AUTH_PATH, cancellable) ?? '');
                 if (this._destroyed || seq !== c.seq)
                     return;
-                this._applyClaude(found.filter(Boolean), usage);
+                this._applyClaude(found.filter(Boolean), usage, auth);
             });
     },
 
-    _applyClaude(list, usage) {
+    _applyClaude(list, usage, auth = new Map()) {
         let c = this._claude;
         let alerts = this._config.isFeatureEnabled('claudeMonitor');
         let next = new Map();
@@ -250,6 +279,13 @@ const ClaudeFeatures = {
             c.unseen.clear();
         c.sessions = next;
         c.usage = usage;
+        let fresh = newAuthNames(c.mcp.auth, auth);
+        c.mcp.auth = auth;
+        if (fresh.length && alerts)
+            this._pushAlert({ kind: 'claude-mcp', icon: 'dialog-password-symbolic', color: SYS.orange,
+                title: fresh.length === 1 ? fresh[0] : `${fresh.length} MCP servers`,
+                value: fresh.length === 1 ? 'needs login' : 'need login', valueColor: SYS.orange, ms: ALERT_MS,
+                onClick: () => this._openClaudeView('mcp') });
         // A socket that couldn't be opened is retried with every read.
         if (this._config.claudeApprove)
             this._startClaudeApprove();
@@ -533,19 +569,47 @@ const ClaudeFeatures = {
     _renderClaudeTab() {
         let panel = new St.BoxLayout({ style_class: 'notchnux-panel nn-claude', vertical: true, x_expand: true });
 
+        let seg = new St.BoxLayout({ style_class: 'nook-segmented', x_align: Clutter.ActorAlign.START });
+        let segBtns = {};
+        for (let [id, label] of CLAUDE_VIEWS) {
+            let b = new St.Button({ style_class: 'nook-segment', label, can_focus: true });
+            b.connect('clicked', () => this._openClaudeView(id));
+            seg.add_child(b);
+            segBtns[id] = b;
+        }
+        panel.add_child(seg);
+
+        // ---- Sessions ----
+        let sessionsView = new St.BoxLayout({ vertical: true, x_expand: true });
         let usageCard = new St.BoxLayout({ style_class: 'nn-cc-card nn-cc-list', vertical: true, x_expand: true });
         usageCard.add_child(text('USAGE', 'nook-card-eyebrow'));
         let five = this._ccMeter(usageCard, '5-hour');
         let week = this._ccMeter(usageCard, 'Weekly');
         let resets = text('', 'nook-card-meta nn-claude-resets');
         usageCard.add_child(resets);
-        panel.add_child(usageCard);
-
+        sessionsView.add_child(usageCard);
         let list = new St.BoxLayout({ style_class: 'nn-claude-list', vertical: true, x_expand: true });
-        panel.add_child(list);
+        sessionsView.add_child(scrolled(list));
+        panel.add_child(sessionsView);
+
+        // ---- MCP ----
+        let mcpView = new St.BoxLayout({ vertical: true, x_expand: true });
+        let head = new St.BoxLayout({ style_class: 'nn-claude-head', x_expand: true });
+        let meta = text('', 'nook-card-meta', { x_expand: true });
+        head.add_child(meta);
+        let checkBtn = new St.Button({ style_class: 'nook-clear-btn', label: 'Check now', can_focus: true,
+            y_align: Clutter.ActorAlign.CENTER });
+        checkBtn.connect('clicked', () => this._checkClaudeMcp());
+        head.add_child(checkBtn);
+        mcpView.add_child(head);
+        let mcpList = new St.BoxLayout({ style_class: 'nn-claude-list', vertical: true, x_expand: true });
+        mcpView.add_child(scrolled(mcpList));
+        panel.add_child(mcpView);
 
         this._mount(panel);
-        this._claudeUi = { five, week, resets, list, sig: null, ages: [] };
+        this._claudeUi = { segBtns, views: { sessions: sessionsView, mcp: mcpView },
+            five, week, resets, list, sig: null, ages: [],
+            mcp: { meta, btn: checkBtn, list: mcpList, sig: null } };
         this._claudeTabShown();
     },
 
@@ -563,11 +627,36 @@ const ClaudeFeatures = {
         this._syncClaudeMonitor();
     },
 
+    // Switch views (and open the Claude tab if it isn't up).
+    _openClaudeView(id) {
+        this._claudeView = id;
+        if (this._activeTab !== 'claude' || !this.isExpanded) {
+            this._openTab('claude');
+            return;
+        }
+        this._updateClaudeTab(false);
+        this._resizeClaudeTab();
+    },
+
+    _resizeClaudeTab() {
+        if (this.isExpanded && this._activeTab === 'claude' && !this._presenting)
+            this._resizeToContent();
+    },
+
     _updateClaudeTab(animate = true) {
         let ui = this._claudeUi;
         if (!ui || this._destroyed)
             return;
         let c = this._claude;
+
+        let view = this._claudeView ??= 'sessions';
+        for (let [id, b] of Object.entries(ui.segBtns)) {
+            if (id === view)
+                b.add_style_class_name('nook-segment-active');
+            else
+                b.remove_style_class_name('nook-segment-active');
+            ui.views[id].visible = id === view;
+        }
 
         // ---- usage ----
         let u = c.usage;
@@ -599,12 +688,138 @@ const ClaudeFeatures = {
             }
             for (let s of sessions)
                 ui.list.add_child(this._buildClaudeRow(s, ui));
-            if (this.isExpanded && this._activeTab === 'claude' && !this._presenting)
-                this._resizeToContent();
+            this._resizeClaudeTab();
         }
         let now = Date.now();
         for (let { label, since } of ui.ages)
             label.set_text(fmtAge(now - since));
+
+        this._updateClaudeMcp(ui.mcp);
+    },
+
+    // ---- MCP view: problems first, then counts ----
+    _updateClaudeMcp(ui) {
+        let m = this._claude.mcp;
+        let sum = mcpSummary(m.auth ?? new Map(), m.check);
+        ui.btn.label = m.running ? 'Checking…' : 'Check now';
+        ui.btn.reactive = !m.running;
+        let age = m.check && fmtAge(Date.now() - m.check.at);
+        ui.meta.set_text(m.running ? 'Starting each server, this takes a few seconds'
+            : m.error || (m.check ? `Checked ${age === 'now' ? 'just now' : `${age} ago`} in ${m.check.folder}`
+                : 'Check now tests every server'));
+
+        let sig = JSON.stringify([sum, !!m.check]);
+        if (sig === ui.sig)
+            return;
+        ui.sig = sig;
+        ui.list.destroy_all_children();
+        for (let p of sum.problems)
+            ui.list.add_child(this._buildMcpRow(p));
+        if (m.check) {
+            let line = [`✔ ${sum.ok} connected`, sum.off && `${sum.off} not configured`].filter(Boolean).join(' · ');
+            ui.list.add_child(text(line, 'nook-card-meta nn-claude-mcp-sum'));
+        } else if (!sum.problems.length) {
+            let empty = new St.BoxLayout({ style_class: 'nook-empty', vertical: true, x_expand: true });
+            empty.add_child(new St.Icon({ icon_name: 'network-server-symbolic', icon_size: 22,
+                style_class: 'nook-dim', x_align: Clutter.ActorAlign.CENTER }));
+            empty.add_child(new St.Label({ text: 'No MCP problems known',
+                style_class: 'nook-empty-title', x_align: Clutter.ActorAlign.CENTER }));
+            ui.list.add_child(empty);
+        }
+        this._resizeClaudeTab();
+    },
+
+    // Clicking brings the newest session's terminal forward, to run /mcp.
+    _buildMcpRow(p) {
+        let [state, color, hint] = MCP_TEXT[p.status];
+        let btn = new St.Button({ style_class: 'nn-claude-row', x_expand: true, can_focus: true,
+            accessible_name: `${p.name}: ${state}` });
+        let row = new St.BoxLayout({ x_expand: true });
+        row.add_child(dot(color));
+        let col = new St.BoxLayout({ vertical: true, x_expand: true, style_class: 'nn-claude-col' });
+        col.add_child(text(p.name, 'nn-claude-name'));
+        if (p.detail || hint)
+            col.add_child(text(p.detail || hint, 'nook-card-meta'));
+        row.add_child(col);
+        row.add_child(text(state, 'nn-claude-state', { style: `color: ${color};` }));
+        btn.set_child(row);
+        btn.connect('clicked', () => {
+            let newest = sortSessions(this._claude.sessions.values()).sort((a, b) => b.startedAt - a.startedAt)[0];
+            if (newest)
+                this._raiseClaudeTerminal(newest.pid);
+        });
+        addPressFeedback(btn);
+        return btn;
+    },
+
+    // `claude mcp list` in the newest session's folder (results depend on
+    // it), through the login shell so servers started with npx & co. see the
+    // same PATH as in a terminal. ponytail: one folder per check; other live
+    // folders' .mcp.json servers aren't tested.
+    _checkClaudeMcp() {
+        let c = this._claude;
+        let m = c.mcp;
+        if (m.running)
+            return;
+        let newest = [...c.sessions.values()].filter(s => s.cwd).sort((a, b) => b.startedAt - a.startedAt)[0];
+        let folder = newest?.folder || '~';
+        m.running = true;
+        m.error = '';
+        this._updateClaudeTab(false);
+        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, viaShell: true, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err) => {
+            m.running = false;
+            let servers = parseMcpList(out ?? '');
+            if (servers.length || /No MCP servers/.test(out ?? ''))
+                m.check = { at: Date.now(), folder, servers };
+            else
+                m.error = err ?? 'claude mcp list printed nothing';
+            this._updateClaudeTab(false);
+        });
+    },
+
+    // Run `claude <args>`; done(stdout | null, error | null). viaShell runs
+    // it inside the user's interactive shell (their rc sets PATH for nvm &
+    // co.). Killed after timeoutS and on disable.
+    _runClaude(args, { cwd = null, viaShell = false, timeoutS = 30 } = {}, done) {
+        let bin = claudeBinary();
+        if (!bin) {
+            done(null, 'Claude Code (claude) isn\u2019t on this computer\u2019s PATH');
+            return;
+        }
+        let argv = viaShell
+            ? [GLib.getenv('SHELL') || '/bin/sh', '-ic', `exec ${[bin, ...args].map(a => GLib.shell_quote(a)).join(' ')}`]
+            : [bin, ...args];
+        let launcher = new Gio.SubprocessLauncher({ flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE });
+        launcher.set_cwd(cwd || GLib.get_home_dir());
+        let proc;
+        try {
+            proc = launcher.spawnv(argv);
+        } catch (e) {
+            done(null, `Couldn\u2019t run claude (${e.message})`);
+            return;
+        }
+        let procs = this._claude.procs;
+        procs.set(proc, GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutS, () => {
+            procs.set(proc, 0);
+            proc.force_exit();
+            return GLib.SOURCE_REMOVE;
+        }));
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            let id = procs.get(p);
+            if (id)
+                GLib.Source.remove(id);
+            let timedOut = procs.get(p) === 0;
+            procs.delete(p);
+            let out = null;
+            try {
+                [, out] = p.communicate_utf8_finish(res);
+            } catch (e) {
+                // killed or failed: out stays null
+            }
+            if (this._destroyed)
+                return;
+            done(out, timedOut ? `claude ${args.join(' ')} took too long` : (p.get_successful() ? null : `claude ${args.join(' ')} failed`));
+        });
     },
 
     _buildClaudeRow(s, ui) {

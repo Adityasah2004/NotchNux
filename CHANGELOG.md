@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach; NotchNux listens only while connected. A command too long to show
   in full, prompts inside subagents, plan approvals and Claude's questions
   are approved in the terminal.
+- The Claude tab has **Sessions · MCP** views. MCP lists servers that need
+  a login, read from Claude Code's own cache, and a short alert says when
+  one newly does. **Check now** runs `claude mcp list` (through your shell,
+  so servers see your usual PATH) in the newest session's folder and lists
+  the failures with their reason. Long lists scroll.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);

@@ -10,6 +10,7 @@ import {
     SOCKET_NAME, approveSocketPath, approveCommand, passThrough, describeRequest, decisionBody,
     isApproveConnected, connectApproveHook, disconnectApproveHook,
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
+    parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -179,6 +180,44 @@ for (let [what, raw] of [
     eq(formatSettings(disconnectApproveHook(JSON.parse(on)), settingsLayout(on)), raw, `${what}: connect → disconnect exact`);
 }
 eq(formatSettings({ a: 1 }, settingsLayout(null)), '{\n  "a": 1\n}\n', 'no file yet → Claude Code\'s 2-space layout');
+
+// ---- MCP health ----
+eq(parseSession(sess({ status: 'idle' })).cwd, '/home/u/Projetos/NotchNux', 'session cwd kept');
+const authText = JSON.stringify({ 'claude.ai Figma': { timestamp: 100, id: 'x' }, 'plugin:bio-research:wiley': { timestamp: 300 } });
+eq([...parseNeedsAuth(authText)], [['claude.ai Figma', 100], ['plugin:bio-research:wiley', 300]], 'auth cache names + times');
+eq([...parseNeedsAuth('')], [], 'no auth cache');
+eq([...parseNeedsAuth('{"a": 4')], [], 'half-written auth cache');
+eq(newAuthNames(null, parseNeedsAuth(authText)), [], 'first read: no alert');
+eq(newAuthNames(new Map([['claude.ai Figma', 100]]), parseNeedsAuth(authText)), ['plugin:bio-research:wiley'], 'newly needs login');
+const mcpOut = [
+    'Checking MCP server health…', '',
+    'claude.ai Figma: https://mcp.figma.com/mcp (HTTP) - ! Needs authentication',
+    'plugin:playwright:playwright: npx @playwright/mcp@latest - ✔ Connected',
+    'plugin:bio-research:benchling: https://x (HTTP) - - Not configured',
+    'gestor: https://gestor.example/mcp (HTTP) - ✘ Failed to connect — Dynamic Client Registration rejected (HTTP 404): {',
+    'odd: sh -c "a - b" - ✔ Connected',
+    'waiting: https://y - ⏸ Pending approval',
+    'bash: cannot set terminal process group (1): Inappropriate ioctl for device',
+    'bash: no job control in this shell', '',
+].join('\n');
+eq(parseMcpList(mcpOut), [
+    { name: 'claude.ai Figma', status: 'auth', detail: '' },
+    { name: 'plugin:playwright:playwright', status: 'ok', detail: '' },
+    { name: 'plugin:bio-research:benchling', status: 'off', detail: '' },
+    { name: 'gestor', status: 'failed', detail: 'Dynamic Client Registration rejected (HTTP 404): {' },
+    { name: 'odd', status: 'ok', detail: '' },
+    { name: 'waiting', status: 'pending', detail: '' },
+], 'claude mcp list parsed (plugin names with ":", " - " in a target, shell noise)');
+eq(parseMcpList('Checking MCP server health…\n\nNo MCP servers configured.\n'), [], 'no servers');
+let check = { at: 200, servers: parseMcpList(mcpOut) };
+let sum = mcpSummary(parseNeedsAuth(authText), check);
+eq(sum.problems.map(p => [p.name, p.status]), [['gestor', 'failed'], ['claude.ai Figma', 'auth'],
+    ['plugin:bio-research:wiley', 'auth'], ['waiting', 'pending']], 'problems: failed, then login, then pending');
+eq([sum.ok, sum.off], [2, 1], 'connected / not configured counts');
+eq(mcpSummary(new Map([['odd', 100]]), check).problems.some(p => p.name === 'odd'), false, 'cache older than a passing check: ok');
+eq(mcpSummary(new Map([['odd', 300]]), check).problems.find(p => p.name === 'odd')?.status, 'auth', 'cache newer than the check: needs login');
+eq(mcpSummary(parseNeedsAuth(authText), null), { problems: [{ name: 'claude.ai Figma', status: 'auth', detail: '' },
+    { name: 'plugin:bio-research:wiley', status: 'auth', detail: '' }], ok: 0, off: 0 }, 'no check yet: cache only');
 
 // ---- config: approvals on/off (read-only checks; never saves) ----
 const cfg = obj => new ConfigStore({ contents: new TextEncoder().encode(JSON.stringify(obj)) });

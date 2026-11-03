@@ -18,6 +18,9 @@ const HOME = GLib.get_home_dir();
 export const CLAUDE_DIR = `${HOME}/.claude`;
 export const SESSIONS_DIR = `${CLAUDE_DIR}/sessions`;
 export const SETTINGS_PATH = `${CLAUDE_DIR}/settings.json`;
+// Servers waiting for a login, kept by Claude Code itself (refreshed by
+// `claude mcp list` and by sessions as they connect).
+export const MCP_AUTH_PATH = `${CLAUDE_DIR}/mcp-needs-auth-cache.json`;
 // Hard-coded rather than $XDG_CACHE_HOME: Claude Code (started from a
 // terminal) and gnome-shell can see different environments.
 export const USAGE_PATH = `${HOME}/.cache/notchnux/claude-usage.json`;
@@ -52,6 +55,7 @@ export function parseSession(text) {
         procStart: s.procStart == null ? '' : String(s.procStart),
         name: s.name || folder || `Session ${s.pid}`,
         folder,
+        cwd: typeof s.cwd === 'string' ? s.cwd : '',
         state,
         since: s.statusUpdatedAt ?? s.updatedAt ?? 0,
         startedAt: s.startedAt ?? 0,
@@ -365,4 +369,71 @@ export function settingsLayout(text) {
 
 export function formatSettings(settings, { indent, eol }) {
     return JSON.stringify(settings, null, indent) + eol;
+}
+
+// ---- MCP health ----
+
+// The auth cache → Map(server name → when it was found needing a login, ms).
+export function parseNeedsAuth(text) {
+    let out = new Map();
+    let data;
+    try {
+        data = JSON.parse(text);
+    } catch (e) {
+        return out;   // missing or caught mid-write
+    }
+    for (let [name, v] of Object.entries(data && typeof data === 'object' ? data : {}))
+        out.set(name, typeof v?.timestamp === 'number' ? v.timestamp : 0);
+    return out;
+}
+
+// Servers that started needing a login since the last read. Nothing on the
+// first read, like session alerts.
+export function newAuthNames(prev, next) {
+    return prev ? [...next.keys()].filter(n => !prev.has(n)) : [];
+}
+
+const MCP_STATUS = { '✔': 'ok', '!': 'auth', '✘': 'failed', '⏸': 'pending', '-': 'off' };
+
+// `claude mcp list` text (it has no --json) → [{ name, status, detail }].
+// "name: target - <glyph> text": names can hold ':' (plugin:x:y) but not
+// ': '; the status is the glyph after the last " - ". Other lines (the
+// header, shell noise) are skipped.
+export function parseMcpList(text) {
+    let out = [];
+    for (let line of String(text).split('\n')) {
+        let m = /^(.+?): (.*) - ([✔!✘⏸-]) (.*)$/.exec(line.trimEnd());
+        if (!m)
+            continue;
+        let status = MCP_STATUS[m[3]];
+        let detail = status === 'failed' ? m[4].replace(/^Failed to connect\s*(?:—\s*)?/, '') : '';
+        out.push({ name: m[1], status, detail });
+    }
+    return out;
+}
+
+const PROBLEM_RANK = { failed: 0, auth: 1, pending: 2 };
+
+// What the MCP view shows: problems first (failed, needs login, pending),
+// then counts. The auth cache wins over a check older than its entry.
+export function mcpSummary(auth, check) {
+    let byName = new Map((check?.servers ?? []).map(s => [s.name, s]));
+    for (let [name, at] of auth) {
+        let s = byName.get(name);
+        if (!s || (s.status !== 'auth' && at > (check?.at ?? 0)))
+            byName.set(name, { name, status: 'auth', detail: '' });
+    }
+    let all = [...byName.values()];
+    return {
+        problems: all.filter(s => s.status in PROBLEM_RANK)
+            .sort((a, b) => PROBLEM_RANK[a.status] - PROBLEM_RANK[b.status] || a.name.localeCompare(b.name)),
+        ok: all.filter(s => s.status === 'ok').length,
+        off: all.filter(s => s.status === 'off').length,
+    };
+}
+
+// The claude binary, or null. gnome-shell's PATH may lack ~/.local/bin.
+export function claudeBinary() {
+    let local = `${HOME}/.local/bin/claude`;
+    return GLib.find_program_in_path('claude') ?? (GLib.file_test(local, GLib.FileTest.IS_EXECUTABLE) ? local : null);
 }

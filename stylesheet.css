@@ -2527,6 +2527,17 @@
 .nn-claude-resets {
     padding-top: 4px;
 }
+.nn-claude-scroll {
+    max-height: 300px;
+}
+.nn-claude-head {
+    spacing: 8px;
+    margin-bottom: 4px;
+    padding: 0 4px;
+}
+.nn-claude-mcp-sum {
+    padding: 8px 6px 2px;
+}
 .nn-claude-list {
     spacing: 2px;
 }
