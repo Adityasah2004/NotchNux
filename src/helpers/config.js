@@ -295,7 +295,10 @@ export class ConfigStore {
             // Music tab shows synced lyrics in place of the vinyl + knob.
             musicLyrics: false,
             // "Approve from the notch" connected in Preferences.
-            claudeApprove: false
+            claudeApprove: false,
+            // Desktop id of the editor the Claude tab opens files in; '' =
+            // the first one installed (helpers/claude.js EDITORS).
+            claudeEditor: ''
         };
     }
 
@@ -348,6 +351,7 @@ export class ConfigStore {
                 data.keepAwake = !!parsed.keepAwake;
                 data.musicLyrics = !!parsed.musicLyrics;
                 data.claudeApprove = !!parsed.claudeApprove;
+                data.claudeEditor = typeof parsed.claudeEditor === 'string' ? parsed.claudeEditor : '';
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
@@ -496,6 +500,15 @@ export class ConfigStore {
     setClaudeApprove(on) {
         this._refresh();
         this._data.claudeApprove = !!on;
+        this._save();
+    }
+
+    get claudeEditor() {
+        return this._data.claudeEditor ?? '';
+    }
+    setClaudeEditor(id) {
+        this._refresh();
+        this._data.claudeEditor = String(id ?? '');
         this._save();
     }
 

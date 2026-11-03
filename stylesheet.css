@@ -2559,6 +2559,9 @@
 .nn-claude-list {
     spacing: 2px;
 }
+.nn-claude-session {
+    spacing: 4px;
+}
 .nn-claude-row {
     padding: 7px 10px;
     border-radius: 12px;

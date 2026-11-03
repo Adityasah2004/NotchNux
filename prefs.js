@@ -15,6 +15,7 @@ import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import GioUnix from 'gi://GioUnix';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
@@ -22,6 +23,7 @@ import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, 
 import {
     SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine,
     isApproveConnected, connectApproveHook, disconnectApproveHook, settingsLayout, formatSettings, parseSettings,
+    installedEditors,
 } from './src/helpers/claude.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
@@ -765,6 +767,21 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                 : [connectApproveHook(s), () => config.setClaudeApprove(true)],
             'Connected. Permission prompts show Allow / Deny on the notch; the terminal prompt keeps working.',
             'Allow or deny Claude Code’s permission prompts from the notch. Adds a hook to ~/.claude/settings.json that hands each prompt to NotchNux through a private socket only your user can reach (needs curl). The terminal prompt keeps working.');
+
+        // Which editor the Claude tab's open button uses. Only installed
+        // ones are offered; none installed hides the row (and the button).
+        const editors = installedEditors(id => GioUnix.DesktopAppInfo.new(id));
+        if (editors.length) {
+            const cur = editors.findIndex(e => e.id === config.claudeEditor);
+            const editorRow = new Adw.ComboRow({
+                title: 'Editor',
+                subtitle: 'The Claude tab’s open button shows ~/.claude and the file for the view you’re on in this editor',
+                model: Gtk.StringList.new(editors.map(e => e.name)),
+                selected: Math.max(0, cur),
+            });
+            editorRow.connect('notify::selected', () => config.setClaudeEditor(editors[editorRow.selected]?.id ?? ''));
+            group.add(editorRow);
+        }
     }
 
     // ---- Mirrored indicators (Tray tab) ----

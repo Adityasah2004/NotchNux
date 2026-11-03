@@ -463,10 +463,10 @@ export function mcpCheckOutcome(out, err, timedOut) {
     return { error: err ?? 'claude mcp list printed nothing' };
 }
 
-// `claude mcp list` text (it has no --json) → [{ name, status, detail }].
-// "name: target - <glyph> text": names can hold ':' (plugin:x:y) but not
-// ': '; the status is the glyph after the last " - ". Other lines (the
-// header, shell noise) are skipped.
+// `claude mcp list` text (it has no --json) → [{ name, target, status,
+// detail }]. "name: target - <glyph> text": names can hold ':'
+// (plugin:x:y) but not ': '; the status is the glyph after the last " - ".
+// Other lines (the header, shell noise) are skipped.
 export function parseMcpList(text) {
     let out = [];
     for (let line of String(text).split('\n')) {
@@ -475,28 +475,32 @@ export function parseMcpList(text) {
             continue;
         let status = MCP_STATUS[m[3]];
         let detail = status === 'failed' ? m[4].replace(/^Failed to connect\s*(?:—\s*)?/, '') : '';
-        out.push({ name: m[1], status, detail });
+        out.push({ name: m[1], target: m[2], status, detail });
     }
     return out;
 }
 
 const PROBLEM_RANK = { failed: 0, auth: 1, pending: 2 };
+const byName = (a, b) => a.name.localeCompare(b.name);
 
-// What the MCP view shows: problems first (failed, needs login, pending),
-// then counts. The auth cache wins over a check older than its entry.
+// What the MCP view shows: problems first (failed, needs /mcp, pending),
+// then the connected servers, then how many aren't configured. The auth
+// cache wins over a check older than its entry. Claude Code keeps servers
+// that just failed in that cache too, so an entry means "needs /mcp", not
+// always a login.
 export function mcpSummary(auth, check) {
-    let byName = new Map((check?.servers ?? []).map(s => [s.name, s]));
+    let all = new Map((check?.servers ?? []).map(s => [s.name, s]));
     for (let [name, at] of auth) {
-        let s = byName.get(name);
+        let s = all.get(name);
         if (!s || (s.status !== 'auth' && at > (check?.at ?? 0)))
-            byName.set(name, { name, status: 'auth', detail: '' });
+            all.set(name, { name, target: s?.target ?? '', status: 'auth', detail: '' });
     }
-    let all = [...byName.values()];
+    let list = [...all.values()];
     return {
-        problems: all.filter(s => s.status in PROBLEM_RANK)
-            .sort((a, b) => PROBLEM_RANK[a.status] - PROBLEM_RANK[b.status] || a.name.localeCompare(b.name)),
-        ok: all.filter(s => s.status === 'ok').length,
-        off: all.filter(s => s.status === 'off').length,
+        problems: list.filter(s => s.status in PROBLEM_RANK)
+            .sort((a, b) => PROBLEM_RANK[a.status] - PROBLEM_RANK[b.status] || byName(a, b)),
+        ok: list.filter(s => s.status === 'ok').sort(byName),
+        off: list.filter(s => s.status === 'off').length,
     };
 }
 
@@ -539,6 +543,57 @@ export function setDefaultMode(settings, mode) {
     if (!SAFE_MODES.includes(mode))
         throw new Error(`not offered from the notch: ${mode}`);
     return { ...settings, permissions: { ...(settings.permissions ?? {}), defaultMode: mode } };
+}
+
+// ---- Remote Control for new sessions ----
+// A running session can only start Remote Control itself (/rc); this key
+// makes every new session start with it. Only the user's file (or policy)
+// can turn it on: project and local files can only turn it off.
+
+export const remoteAtStartup = settings => settings?.remoteControlAtStartup === true;
+
+// On sets the key; off removes it, so on → off restores the file exactly.
+// ponytail: an explicit `false` that was there before comes back as absent
+// (same meaning).
+export function setRemoteAtStartup(settings, on) {
+    if (on)
+        return { ...settings, remoteControlAtStartup: true };
+    if (!('remoteControlAtStartup' in settings))
+        return settings;
+    let out = { ...settings };
+    delete out.remoteControlAtStartup;
+    return out;
+}
+
+// ---- Editors that can open Claude Code's files ----
+// [label, desktop ids]: the first id that's installed wins.
+export const EDITORS = [
+    ['VS Code', ['com.microsoft.VSCode.desktop', 'code.desktop', 'code_code.desktop']],
+    ['Cursor', ['cursor.desktop', 'cursor_cursor.desktop']],
+    ['Antigravity', ['antigravity.desktop']],
+];
+
+// → [{ name, id, app }] for the editors on this computer. `lookup(id)` →
+// a Gio.AppInfo or null: the shell asks its own app list (no file reads),
+// Preferences GioUnix.DesktopAppInfo.
+export function installedEditors(lookup) {
+    let out = [];
+    for (let [name, ids] of EDITORS) {
+        for (let id of ids) {
+            let app = lookup(id);
+            if (app) {
+                out.push({ name, id, app });
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// The editor picked in Preferences, or the first one installed, or null.
+export function editorApp(preferredId, lookup) {
+    let all = installedEditors(lookup);
+    return (all.find(e => e.id === preferredId) ?? all[0])?.app ?? null;
 }
 
 // The files the Rules and Skills views cover: the user's, plus project and

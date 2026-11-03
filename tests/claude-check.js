@@ -13,7 +13,8 @@ import {
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
     parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron, mcpCheckOutcome,
-    MANAGED_SETTINGS_PATH, effectiveSkill, skillEdit,
+    MANAGED_SETTINGS_PATH, effectiveSkill, skillEdit, remoteAtStartup, setRemoteAtStartup,
+    installedEditors, editorApp,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -231,12 +232,12 @@ const mcpOut = [
     'bash: no job control in this shell', '',
 ].join('\n');
 eq(parseMcpList(mcpOut), [
-    { name: 'claude.ai Figma', status: 'auth', detail: '' },
-    { name: 'plugin:playwright:playwright', status: 'ok', detail: '' },
-    { name: 'plugin:bio-research:benchling', status: 'off', detail: '' },
-    { name: 'gestor', status: 'failed', detail: 'Dynamic Client Registration rejected (HTTP 404): {' },
-    { name: 'odd', status: 'ok', detail: '' },
-    { name: 'waiting', status: 'pending', detail: '' },
+    { name: 'claude.ai Figma', target: 'https://mcp.figma.com/mcp (HTTP)', status: 'auth', detail: '' },
+    { name: 'plugin:playwright:playwright', target: 'npx @playwright/mcp@latest', status: 'ok', detail: '' },
+    { name: 'plugin:bio-research:benchling', target: 'https://x (HTTP)', status: 'off', detail: '' },
+    { name: 'gestor', target: 'https://gestor.example/mcp (HTTP)', status: 'failed', detail: 'Dynamic Client Registration rejected (HTTP 404): {' },
+    { name: 'odd', target: 'sh -c "a - b"', status: 'ok', detail: '' },
+    { name: 'waiting', target: 'https://y', status: 'pending', detail: '' },
 ], 'claude mcp list parsed (plugin names with ":", " - " in a target, shell noise)');
 eq(parseMcpList('Checking MCP server health…\n\nNo MCP servers configured.\n'), [], 'no servers');
 eq(mcpCheckOutcome(mcpOut, null, false).servers.length, 6, 'check finished: its servers');
@@ -250,11 +251,16 @@ let check = { at: 200, servers: parseMcpList(mcpOut) };
 let sum = mcpSummary(parseNeedsAuth(authText), check);
 eq(sum.problems.map(p => [p.name, p.status]), [['gestor', 'failed'], ['claude.ai Figma', 'auth'],
     ['plugin:bio-research:wiley', 'auth'], ['waiting', 'pending']], 'problems: failed, then login, then pending');
-eq([sum.ok, sum.off], [2, 1], 'connected / not configured counts');
+eq(sum.ok.map(s => [s.name, s.target]), [['odd', 'sh -c "a - b"'], ['plugin:playwright:playwright', 'npx @playwright/mcp@latest']],
+    'connected servers listed by name, with their target');
+eq(sum.off, 1, 'not configured count');
 eq(mcpSummary(new Map([['odd', 100]]), check).problems.some(p => p.name === 'odd'), false, 'cache older than a passing check: ok');
-eq(mcpSummary(new Map([['odd', 300]]), check).problems.find(p => p.name === 'odd')?.status, 'auth', 'cache newer than the check: needs login');
-eq(mcpSummary(parseNeedsAuth(authText), null), { problems: [{ name: 'claude.ai Figma', status: 'auth', detail: '' },
-    { name: 'plugin:bio-research:wiley', status: 'auth', detail: '' }], ok: 0, off: 0 }, 'no check yet: cache only');
+let newer = mcpSummary(new Map([['odd', 300]]), check);
+eq(newer.problems.find(p => p.name === 'odd'), { name: 'odd', target: 'sh -c "a - b"', status: 'auth', detail: '' },
+    'cache newer than the check: needs /mcp, target kept');
+eq(newer.ok.some(s => s.name === 'odd'), false, 'and no longer listed as connected');
+eq(mcpSummary(parseNeedsAuth(authText), null), { problems: [{ name: 'claude.ai Figma', target: '', status: 'auth', detail: '' },
+    { name: 'plugin:bio-research:wiley', target: '', status: 'auth', detail: '' }], ok: [], off: 0 }, 'no check yet: cache only');
 
 // ---- permission rules + default mode ----
 const perms = { model: 'opus', permissions: { allow: ['Bash(npm test:*)', 'WebFetch(domain:x.com)'], deny: ['Read(.env)'],
@@ -278,6 +284,24 @@ for (let bad of ['bypassPermissions', 'dontAsk', 'manual', '', undefined]) {
     try { setDefaultMode(perms, bad); } catch (e) { threw = true; }
     ok(threw, `unsafe mode refused: ${bad}`);
 }
+
+// ---- Remote Control for new sessions ----
+const rcBase = { model: 'opus', permissions: { defaultMode: 'auto' } };
+let rcOn = setRemoteAtStartup(rcBase, true);
+eq(rcOn, { ...rcBase, remoteControlAtStartup: true }, 'remote control on');
+ok(remoteAtStartup(rcOn) && !remoteAtStartup(rcBase) && !remoteAtStartup({ remoteControlAtStartup: 'yes' }), 'only true counts as on');
+eq(JSON.stringify(setRemoteAtStartup(rcOn, false)), JSON.stringify(rcBase), 'on → off restores the file exactly');
+ok(setRemoteAtStartup(rcBase, false) === rcBase, 'off when absent: unchanged');
+eq(setRemoteAtStartup({ remoteControlAtStartup: false }, false), {}, 'an explicit false goes (same meaning)');
+
+// ---- editors ----
+const apps = { 'code.desktop': 'vscode', 'antigravity.desktop': 'ag' };
+const lookup = id => apps[id] ?? null;
+eq(installedEditors(lookup).map(e => [e.name, e.id]), [['VS Code', 'code.desktop'], ['Antigravity', 'antigravity.desktop']],
+    'installed editors, first matching id each');
+eq(editorApp('antigravity.desktop', lookup), 'ag', 'the chosen editor');
+eq(editorApp('cursor.desktop', lookup), 'vscode', 'chosen one gone: the first installed');
+eq(editorApp('', () => null), null, 'no editor at all');
 eq(claudeSettingsFiles(['/p/a', '/p/b', '/p/a']).map(f => [f.path, f.scope, f.label]), [
     [SETTINGS_PATH, 'user', 'You · ~/.claude/settings.json'],
     ['/p/a/.claude/settings.json', 'project', 'a · .claude/settings.json'],

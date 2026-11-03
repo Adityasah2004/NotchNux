@@ -3,9 +3,12 @@
 //   pill:  ( ♫ Song…     Tue 3 · 2:32 PM     ● ◉ ○ 42%   🔋 87% )
 //            one dot per session (working · waiting for you · finished),
 //            then the 5-hour usage
-//   tab:   Sessions · MCP views. Sessions: 5-hour / weekly usage bars, then
-//          one row per live session. MCP: servers that need a login (from
-//          Claude Code's own cache) or failed the last "Check now". Rules:
+//   tab:   Sessions · MCP views. Sessions: 5-hour / weekly usage bars, the
+//          Remote Control for new sessions switch, then one row per live
+//          session (with /rc and /rename shortcuts). MCP: servers that need
+//          /mcp (from Claude Code's own cache) or failed the last "Check
+//          now", then the connected ones. The header opens ~/.claude in the
+//          editor picked in Preferences. Rules:
 //          the default mode for new sessions, and allow / ask / deny rules
 //          from the user's settings and every live session's folder.
 //          Plugins: plugin on/off (the claude CLI) and skill on/off
@@ -30,6 +33,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import Soup from 'gi://Soup';
 import St from 'gi://St';
 
@@ -43,6 +47,7 @@ import {
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
     SETTINGS_PATH, parsePluginList, parseSkillMeta, setSkillOverride, skillSources, parseEnviron,
     mcpCheckOutcome, MANAGED_SETTINGS_PATH, effectiveSkill, skillEdit,
+    CLAUDE_DIR, remoteAtStartup, setRemoteAtStartup, editorApp,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -73,11 +78,18 @@ const KIND_COLOR = { allow: SYS.green, ask: SYS.orange, deny: SYS.red };
 const CONFIRM_MS = 3000;
 // `claude mcp list` starts every server: ~20 s for 22 of them.
 const MCP_CHECK_TIMEOUT_S = 90;
+// Claude Code's login cache also holds servers that just failed, so "auth"
+// reads as "needs /mcp" (log in or reconnect there).
 const MCP_TEXT = {
     failed: ['Failed', SYS.red, ''],
-    auth: ['Needs login', SYS.orange, 'Log in with /mcp in a Claude session'],
+    auth: ['Needs /mcp', SYS.orange, 'Log in or reconnect it with /mcp in a Claude session'],
     pending: ['Pending approval', SYS.orange, 'Approve it in a Claude session'],
+    ok: ['Connected', SYS.green, ''],
 };
+// What the header's editor button opens next to ~/.claude, per view.
+const HOME_DIR = GLib.get_home_dir();
+const VIEW_FILE = { sessions: SETTINGS_PATH, rules: SETTINGS_PATH, mcp: `${HOME_DIR}/.claude.json`, plugins: null };
+const lookupApp = id => Shell.AppSystem.get_default().lookup_app(id)?.get_app_info() ?? null;
 const ALERT_ICON = { approval: 'dialog-warning-symbolic', question: 'dialog-question-symbolic', done: 'object-select-symbolic' };
 
 function dotColor(kind) {
@@ -306,7 +318,7 @@ const ClaudeFeatures = {
         if (fresh.length && alerts)
             this._pushAlert({ kind: 'claude-mcp', icon: 'dialog-password-symbolic', color: SYS.orange,
                 title: fresh.length === 1 ? fresh[0] : `${fresh.length} MCP servers`,
-                value: fresh.length === 1 ? 'needs login' : 'need login', valueColor: SYS.orange, ms: ALERT_MS,
+                value: fresh.length === 1 ? 'needs /mcp' : 'need /mcp', valueColor: SYS.orange, ms: ALERT_MS,
                 onClick: () => this._openClaudeView('mcp') });
         // A socket that couldn't be opened is retried with every read.
         if (this._config.claudeApprove)
@@ -632,7 +644,17 @@ const ClaudeFeatures = {
             seg.add_child(b);
             segBtns[id] = b;
         }
-        panel.add_child(seg);
+        let top = new St.BoxLayout({ x_expand: true });
+        top.add_child(seg);
+        top.add_child(new St.Widget({ x_expand: true }));
+        // Opens ~/.claude plus the view's file in the editor from Preferences.
+        let editBtn = new St.Button({ style_class: 'nook-mini-btn', can_focus: true, visible: false,
+            y_align: Clutter.ActorAlign.CENTER });
+        editBtn.set_child(new St.Icon({ icon_size: 16 }));
+        editBtn.connect('clicked', () => this._openInEditor([CLAUDE_DIR, VIEW_FILE[this._claudeView]]));
+        addPressFeedback(editBtn);
+        top.add_child(editBtn);
+        panel.add_child(top);
 
         // ---- Sessions ----
         let sessionsView = new St.BoxLayout({ vertical: true, x_expand: true });
@@ -643,6 +665,9 @@ const ClaudeFeatures = {
         let resets = text('', 'nook-card-meta nn-claude-resets');
         usageCard.add_child(resets);
         sessionsView.add_child(usageCard);
+        let rcBox = new St.BoxLayout({ style_class: 'nn-cc-list', vertical: true, x_expand: true });
+        let rc = this._ccRow(rcBox, 'Remote Control for new sessions', () => this._toggleClaudeRemote());
+        sessionsView.add_child(rcBox);
         let list = new St.BoxLayout({ style_class: 'nn-claude-list', vertical: true, x_expand: true });
         sessionsView.add_child(scrolled(list));
         panel.add_child(sessionsView);
@@ -691,7 +716,7 @@ const ClaudeFeatures = {
 
         this._mount(panel);
         this._claudeUi = { segBtns, views: { sessions: sessionsView, mcp: mcpView, rules: rulesView, plugins: pluginsView },
-            five, week, resets, list, sig: null, ages: [],
+            editBtn, rc, five, week, resets, list, sig: null, ages: [],
             mcp: { meta, btn: checkBtn, list: mcpList, sig: null },
             rules: { modeBtns, note: modeNote, list: rulesList, sig: null },
             extras: { note: extrasNote, list: extrasList, sig: null } };
@@ -748,6 +773,23 @@ const ClaudeFeatures = {
                 b.remove_style_class_name('nook-segment-active');
             ui.views[id].visible = id === view;
         }
+        let editor = editorApp(this._config.claudeEditor, lookupApp);
+        ui.editBtn.visible = !!editor;
+        if (editor) {
+            ui.editBtn.child.gicon = editor.get_icon();
+            // Claude Code rewrites ~/.claude.json while sessions run.
+            ui.editBtn.accessible_name = view === 'mcp'
+                ? `Open ~/.claude.json in ${editor.get_name()} (close Claude sessions before editing MCP servers by hand)`
+                : `Open ~/.claude in ${editor.get_name()}`;
+        }
+
+        // ---- Remote Control for new sessions (the user's settings.json) ----
+        let r = c.rules;
+        let user = r.files.find(f => f.scope === 'user');
+        let rcOn = remoteAtStartup(user?.settings);
+        ui.rc.update(rcOn, r.error || user?.error || (!r.loaded ? 'Reading settings…'
+            : `${rcOn ? 'On' : 'Off'} · a running session’s phone button copies /rc`), 'phone-symbolic');
+        ui.rc.setEnabled(r.loaded && !user?.error);
 
         // ---- usage ----
         let u = c.usage;
@@ -787,10 +829,11 @@ const ClaudeFeatures = {
 
         this._updateClaudeMcp(ui.mcp);
         // Load on open, and again when the live folders change (sessions
-        // usually arrive after the view opens).
+        // usually arrive after the view opens). Sessions reads the user's
+        // settings too, for the Remote Control switch.
         let key = this._claudeFoldersKey();
         let stale = st => st.key !== key || (!st.loaded && !st.loading);
-        if (view === 'rules' && stale(c.rules))
+        if ((view === 'rules' || view === 'sessions') && stale(c.rules))
             this._loadClaudeRules();
         this._updateClaudeRules(ui.rules);
         if (view === 'plugins' && stale(c.extras))
@@ -839,7 +882,8 @@ const ClaudeFeatures = {
         ui.note.set_text(r.error || (SAFE_MODES.includes(mode) ? 'New sessions start in this mode'
             : `New sessions start in ${mode}, set outside the notch`));
 
-        let sig = JSON.stringify([r.loaded, r.files.map(f => [f.file, f.error, rulesOf(f.settings)])]);
+        let canEdit = !!editorApp(this._config.claudeEditor, lookupApp);
+        let sig = JSON.stringify([r.loaded, canEdit, r.files.map(f => [f.file, f.error, rulesOf(f.settings)])]);
         if (sig === ui.sig)
             return;
         ui.sig = sig;
@@ -851,7 +895,15 @@ const ClaudeFeatures = {
             if (!rules.length && !f.error)
                 continue;
             any = true;
-            ui.list.add_child(text(f.label, 'nook-card-meta nn-claude-group'));
+            let head = new St.BoxLayout({ x_expand: true });
+            head.add_child(text(f.label, 'nook-card-meta nn-claude-group', { x_expand: true }));
+            if (canEdit) {
+                // The file's own folder (~/.claude, or the session's folder).
+                let folder = f.scope === 'user' ? CLAUDE_DIR : GLib.path_get_dirname(GLib.path_get_dirname(f.file));
+                head.add_child(iconBtn('document-edit-symbolic', 'nook-mini-btn', () => this._openInEditor([folder, f.file]),
+                    `Open ${f.label} in the editor`));
+            }
+            ui.list.add_child(head);
             if (f.error)
                 ui.list.add_child(text(f.error, 'nook-card-meta'));
             for (let rule of rules)
@@ -1193,12 +1245,18 @@ const ClaudeFeatures = {
     _updateClaudeMcp(ui) {
         let m = this._claude.mcp;
         let sum = mcpSummary(m.auth ?? new Map(), m.check);
+        // No session, no check: the desktop's PATH would fail servers that
+        // need the terminal's (nvm & co.), and Claude Code caches those
+        // failures for every session for a while.
+        let hasSession = [...this._claude.sessions.values()].some(s => s.cwd);
         ui.btn.label = m.running ? 'Checking…' : 'Check now';
-        ui.btn.reactive = !m.running;
+        ui.btn.reactive = !m.running && hasSession;
+        ui.btn.opacity = ui.btn.reactive || m.running ? 255 : 110;
         let age = m.check && fmtAge(Date.now() - m.check.at);
         ui.meta.set_text(m.running ? 'Starting each server, this takes a few seconds'
             : m.error || (m.check ? `Checked ${age === 'now' ? 'just now' : `${age} ago`} in ${m.check.folder}`
-                : 'Check now tests every server'));
+                : hasSession ? 'Check now tests every server'
+                    : 'Open a Claude Code session to check: it uses that session’s PATH'));
 
         let sig = JSON.stringify([sum, !!m.check]);
         if (sig === ui.sig)
@@ -1207,14 +1265,18 @@ const ClaudeFeatures = {
         ui.list.destroy_all_children();
         for (let p of sum.problems)
             ui.list.add_child(this._buildMcpRow(p));
-        if (m.check) {
-            let line = [`✔ ${sum.ok} connected`, sum.off && `${sum.off} not configured`].filter(Boolean).join(' · ');
-            ui.list.add_child(text(line, 'nook-card-meta nn-claude-mcp-sum'));
-        } else if (!sum.problems.length) {
+        if (sum.ok.length) {
+            ui.list.add_child(text('Connected', 'nook-card-meta nn-claude-group'));
+            for (let p of sum.ok)
+                ui.list.add_child(this._buildMcpRow({ ...p, detail: p.target }));
+        }
+        if (sum.off)
+            ui.list.add_child(text(`${sum.off} not configured`, 'nook-card-meta nn-claude-mcp-sum'));
+        if (!sum.problems.length && !sum.ok.length && !sum.off) {
             let empty = new St.BoxLayout({ style_class: 'nook-empty', vertical: true, x_expand: true });
             empty.add_child(new St.Icon({ icon_name: 'network-server-symbolic', icon_size: 22,
                 style_class: 'nook-dim', x_align: Clutter.ActorAlign.CENTER }));
-            empty.add_child(new St.Label({ text: 'No MCP problems known',
+            empty.add_child(new St.Label({ text: m.check ? 'No MCP servers' : 'No MCP problems known',
                 style_class: 'nook-empty-title', x_align: Clutter.ActorAlign.CENTER }));
             ui.list.add_child(empty);
         }
@@ -1247,7 +1309,7 @@ const ClaudeFeatures = {
     // `claude mcp list` in the newest session's folder (results depend on
     // it) and with that session's own environment from /proc, so servers
     // started with npx & co. see the terminal's PATH and variables without
-    // running the user's shell rc. No session: the desktop's environment.
+    // running the user's shell rc. No session: no check (see _updateClaudeMcp).
     // ponytail: one folder per check; other live folders' .mcp.json servers
     // aren't tested.
     async _checkClaudeMcp() {
@@ -1256,14 +1318,24 @@ const ClaudeFeatures = {
         if (m.running)
             return;
         let newest = [...c.sessions.values()].filter(s => s.cwd).sort((a, b) => b.startedAt - a.startedAt)[0];
+        if (!newest)
+            return;
         m.running = true;
         m.error = '';
         this._updateClaudeTab(false);
-        let env = newest ? parseEnviron(await read(`/proc/${newest.pid}/environ`, null) ?? '') : [];
+        let env = parseEnviron(await read(`/proc/${newest.pid}/environ`, null) ?? '');
         if (this._destroyed)
             return;
-        let folder = newest?.folder || '~';
-        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, env, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err, timedOut) => {
+        // The session ended meanwhile (environ unreadable): the desktop's
+        // environment would be wrong, so no check.
+        if (!env.length) {
+            m.running = false;
+            m.error = `${newest.name} ended before the check started`;
+            this._updateClaudeTab(false);
+            return;
+        }
+        let folder = newest.folder || '~';
+        this._runClaude(['mcp', 'list'], { cwd: newest.cwd, env, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err, timedOut) => {
             m.running = false;
             let result = mcpCheckOutcome(out, err, timedOut);
             if (result.servers)
@@ -1327,6 +1399,7 @@ const ClaudeFeatures = {
     },
 
     _buildClaudeRow(s, ui) {
+        let line = new St.BoxLayout({ style_class: 'nn-claude-session', x_expand: true });
         let btn = new St.Button({ style_class: 'nn-claude-row', x_expand: true, can_focus: true,
             accessible_name: `${s.name}: ${STATE_TEXT[s.state]}` });
         let row = new St.BoxLayout({ x_expand: true });
@@ -1343,7 +1416,48 @@ const ClaudeFeatures = {
         btn.set_child(row);
         btn.connect('clicked', () => this._raiseClaudeTerminal(s.pid));
         addPressFeedback(btn);
-        return btn;
+        line.add_child(btn);
+        for (let [icon, cmd, what] of [['phone-symbolic', '/rc', 'start Remote Control'],
+            ['document-edit-symbolic', '/rename ', 'rename it']]) {
+            line.add_child(iconBtn(icon, 'nook-mini-btn', () => this._pasteToClaude(s, cmd),
+                `Copy ${cmd.trim()} and open ${s.name}’s terminal to ${what}`));
+        }
+        return line;
+    },
+
+    // A running session only takes /rc and /rename at its own prompt: put
+    // the command on the clipboard and bring its terminal forward. The new
+    // name shows here by itself (the row reads Claude Code's own name).
+    _pasteToClaude(s, cmd) {
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, cmd);
+        this._raiseClaudeTerminal(s.pid);
+        this._pushAlert({ kind: 'claude-paste', icon: 'edit-paste-symbolic', color: accentHex(),
+            title: s.name, value: `paste ${cmd.trim()}`, valueColor: accentHex(), ms: ALERT_MS });
+    },
+
+    // Remote Control for new sessions: remoteControlAtStartup in the user's
+    // settings.json (project and local files can't turn it on).
+    _toggleClaudeRemote() {
+        let r = this._claude.rules;
+        let user = r.files.find(f => f.scope === 'user');
+        if (!r.loaded || user?.error)
+            return;
+        let on = !remoteAtStartup(user?.settings);
+        this._editRules(user?.path ?? SETTINGS_PATH, st => setRemoteAtStartup(st, on), true);
+    },
+
+    // Open `paths` (a folder, then files) in the editor from Preferences.
+    _openInEditor(paths) {
+        let app = editorApp(this._config.claudeEditor, lookupApp);
+        if (!app)
+            return;
+        if (this.isExpanded)
+            this._collapseImmediately();
+        try {
+            app.launch(paths.filter(Boolean).map(p => Gio.File.new_for_path(p)), global.create_app_launch_context(0, -1));
+        } catch (e) {
+            logError(`Couldn’t open ${app.get_name()}`, e);
+        }
     },
 };
 

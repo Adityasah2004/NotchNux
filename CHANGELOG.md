@@ -31,11 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in full, prompts inside subagents, plan approvals and Claude's questions
   are approved in the terminal.
 - The Claude tab has **Sessions · MCP** views. MCP lists servers that need
-  a login, read from Claude Code's own cache, and a short alert says when
-  one newly does. **Check now** runs `claude mcp list` in the newest
-  session's folder, with that session's own environment (so servers see
-  your terminal's PATH), and lists the failures with their reason. Long
-  lists scroll.
+  `/mcp` (a login, or a recent failure), read from Claude Code's own cache,
+  and a short alert says when one newly does. **Check now** runs `claude mcp
+  list` in the newest session's folder, with that session's own environment
+  (so servers see your terminal's PATH), and lists the failures with their
+  reason, then the connected servers with their command or URL. With no
+  session running, Check now waits for one: the desktop's PATH would fail
+  servers started through nvm & co., and Claude Code would then skip them in
+  every session for 15 minutes. Long lists scroll.
+- Sessions has a **Remote Control for new sessions** switch
+  (`remoteControlAtStartup` in `~/.claude/settings.json`; off removes the
+  key again). Each running session's row has **/rc** and **/rename**
+  buttons: Claude Code only takes those at the session's own prompt, so
+  they copy the command and bring its terminal forward.
+- An **open in editor** button (Preferences → Claude Code → Editor: VS Code,
+  Cursor or Antigravity, whichever is installed) opens `~/.claude` with the
+  current view's file (`settings.json`, or `~/.claude.json` for MCP), and
+  each Rules group has its own button for that file.
 - A **Rules** view switches the default permission mode for new sessions
   (Default / Accept edits / Plan / Auto; never bypassPermissions) and lists
   the allow / ask / deny rules from `~/.claude/settings.json` and each
