@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the allow / ask / deny rules from `~/.claude/settings.json` and each
   running session's `.claude/settings*.json`. × asks once, then removes the
   rule; files keep their own layout and the old copy is kept as `name~`.
+- A **Plugins** view turns plugins on or off with `claude plugin
+  enable/disable` (open sessions pick it up after `/reload-plugins`), and
+  personal skills (`~/.claude/skills`) and each running session's project
+  skills on or off through `skillOverrides`; turning one back on removes
+  the override, so the file returns to how it was.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);

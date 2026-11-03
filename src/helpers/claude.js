@@ -536,3 +536,67 @@ export function writeSettingsAsync(path, settings, layout) {
             });
     });
 }
+
+// ---- Plugins & skills ----
+
+// `claude plugin list --json` → [{ id, name, marketplace, enabled, scope,
+// version }] by name, or null if it isn't the expected list.
+export function parsePluginList(text) {
+    let list;
+    try {
+        list = JSON.parse(text);
+    } catch (e) {
+        return null;
+    }
+    if (!Array.isArray(list))
+        return null;
+    return list.filter(p => typeof p?.id === 'string').map(p => {
+        let [name, marketplace = ''] = p.id.split('@');
+        return { id: p.id, name, marketplace, enabled: !!p.enabled, scope: p.scope || 'user', version: p.version || '' };
+    }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+const unquote = v => v.replace(/^(["'])(.*)\1$/, '$2');
+
+// SKILL.md frontmatter → { name, description }. Only what the list shows:
+// plain, quoted and folded (> |) values.
+export function parseSkillMeta(text) {
+    let out = { name: '', description: '' };
+    let m = /^---\n([\s\S]*?)\n---/.exec(String(text));
+    if (!m)
+        return out;
+    let lines = m[1].split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        let kv = /^(name|description):\s*(.*)$/.exec(lines[i]);
+        if (!kv)
+            continue;
+        let value = kv[2].trim();
+        if (value === '>' || value === '|') {
+            let more = [];
+            while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]))
+                more.push(lines[++i].trim());
+            value = more.join(' ');
+        }
+        out[kv[1]] = unquote(value);
+    }
+    return out;
+}
+
+export const skillOverride = (settings, name) => settings?.skillOverrides?.[name] ?? 'on';
+
+// Off → `skillOverrides[name] = 'off'`; on → the override goes (and the
+// whole key when it empties), so off → on restores the file exactly.
+// ponytail: a "name-only" override turned off and on comes back as plain on.
+export function setSkillOverride(settings, name, on) {
+    let cur = settings.skillOverrides && typeof settings.skillOverrides === 'object' ? settings.skillOverrides : {};
+    if (!on)
+        return { ...settings, skillOverrides: { ...cur, [name]: 'off' } };
+    if (!(name in cur))
+        return settings;
+    let rest = { ...cur };
+    delete rest[name];
+    let out = { ...settings, skillOverrides: rest };
+    if (!Object.keys(rest).length)
+        delete out.skillOverrides;
+    return out;
+}

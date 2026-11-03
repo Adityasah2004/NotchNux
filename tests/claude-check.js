@@ -12,6 +12,7 @@ import {
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
+    parsePluginList, parseSkillMeta, skillOverride, setSkillOverride,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -249,6 +250,31 @@ eq(claudeSettingsFiles(['/p/a', '/p/b', '/p/a']).map(f => [f.path, f.scope, f.la
     ['/p/b/.claude/settings.json', 'project', 'b · .claude/settings.json'],
     ['/p/b/.claude/settings.local.json', 'local', 'b · .claude/settings.local.json'],
 ], 'settings files: user + each live folder once');
+
+// ---- plugins & skills ----
+const pluginJson = JSON.stringify([
+    { id: 'ponytail@ponytail', enabled: true, scope: 'user', version: '4.8.4', installPath: '/x' },
+    { id: 'claude-mem@thedotmack', enabled: false, scope: 'user', version: '1.0' },
+    { id: 'harness-mem@chachamaru127', enabled: true, scope: 'project', version: '0.22.2' }]);
+eq(parsePluginList(pluginJson), [
+    { id: 'claude-mem@thedotmack', name: 'claude-mem', marketplace: 'thedotmack', enabled: false, scope: 'user', version: '1.0' },
+    { id: 'harness-mem@chachamaru127', name: 'harness-mem', marketplace: 'chachamaru127', enabled: true, scope: 'project', version: '0.22.2' },
+    { id: 'ponytail@ponytail', name: 'ponytail', marketplace: 'ponytail', enabled: true, scope: 'user', version: '4.8.4' },
+], 'plugin list parsed, by name');
+ok(parsePluginList('not json') === null && parsePluginList('{}') === null, 'bad plugin list → null');
+eq(parseSkillMeta('---\nname: fastapi\ndescription: FastAPI best practices.\n---\n\n# FastAPI\n'),
+    { name: 'fastapi', description: 'FastAPI best practices.' }, 'skill frontmatter');
+eq(parseSkillMeta('---\nname: "quoted"\ndescription: \'single\'\n---\n'), { name: 'quoted', description: 'single' }, 'quoted values');
+eq(parseSkillMeta('---\nname: folded\ndescription: >\n  first line\n  second line\nother: x\n---\n'),
+    { name: 'folded', description: 'first line second line' }, 'folded description');
+eq(parseSkillMeta('# no frontmatter'), { name: '', description: '' }, 'no frontmatter');
+eq([skillOverride({}, 'a'), skillOverride({ skillOverrides: { a: 'off' } }, 'a'), skillOverride({ skillOverrides: { a: 'name-only' } }, 'a')],
+    ['on', 'off', 'name-only'], 'skill override state');
+const sk = { model: 'opus', skillOverrides: { keep: 'name-only' } };
+eq(setSkillOverride(sk, 'x', false).skillOverrides, { keep: 'name-only', x: 'off' }, 'skill off');
+eq(text(setSkillOverride(setSkillOverride(sk, 'x', false), 'x', true)), text(sk), 'skill off → on restores exactly');
+eq(text(setSkillOverride(setSkillOverride({ model: 'opus' }, 'x', false), 'x', true)), text({ model: 'opus' }), 'no overrides before → none after');
+eq(setSkillOverride(sk, 'keep', true), { model: 'opus' }, 'turning an override back on drops it');
 
 // ---- settings IO, async, on scratch files ----
 function settle(promise) {
