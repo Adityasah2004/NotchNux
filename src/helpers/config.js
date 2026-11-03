@@ -294,9 +294,8 @@ export class ConfigStore {
             keepAwake: false,
             // Music tab shows synced lyrics in place of the vinyl + knob.
             musicLyrics: false,
-            // Set while "Approve from the notch" is connected in Preferences;
-            // Claude Code's hook sends it back with every request.
-            claudeHookToken: ''
+            // "Approve from the notch" connected in Preferences.
+            claudeApprove: false
         };
     }
 
@@ -348,7 +347,7 @@ export class ConfigStore {
                 data.pinnedTabs = this._cleanPinned(parsed.pinnedTabs ?? DEFAULT_PINNED);
                 data.keepAwake = !!parsed.keepAwake;
                 data.musicLyrics = !!parsed.musicLyrics;
-                data.claudeHookToken = typeof parsed.claudeHookToken === 'string' ? parsed.claudeHookToken : '';
+                data.claudeApprove = !!parsed.claudeApprove;
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
@@ -491,12 +490,12 @@ export class ConfigStore {
         this._save();
     }
 
-    get claudeHookToken() {
-        return this._data.claudeHookToken || '';
+    get claudeApprove() {
+        return !!this._data.claudeApprove;
     }
-    setClaudeHookToken(token) {
+    setClaudeApprove(on) {
         this._refresh();
-        this._data.claudeHookToken = typeof token === 'string' ? token : '';
+        this._data.claudeApprove = !!on;
         this._save();
     }
 

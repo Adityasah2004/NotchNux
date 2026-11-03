@@ -162,7 +162,7 @@ Configuration is stored as plain JSON under `~/.config/notchnux/config.json` —
 | `~/.local/share/notchnux/shelf/` | Files added to the Shelf (cleared once per login) |
 | `~/.cache/notchnux/` | Album art, wallpaper thumbnails and processed wallpapers (pruned automatically) |
 
-Everything is stored locally, readable only by you (`0600` files in `0700` folders). Nothing is uploaded; the only network requests are the weather forecast (Open-Meteo), place-name lookups (OpenStreetMap Nominatim) and album art from your music player. While *Approve from the notch* is connected, NotchNux also listens on `127.0.0.1:47391` for Claude Code's permission hook; only programs on this computer can reach it, and only with the token stored in your config.
+Everything is stored locally, readable only by you (`0600` files in `0700` folders). Nothing is uploaded; the only network requests are the weather forecast (Open-Meteo), place-name lookups (OpenStreetMap Nominatim) and album art from your music player. While *Approve from the notch* is connected, NotchNux also listens on a socket in your runtime folder (`$XDG_RUNTIME_DIR/notchnux-claude.sock`) for Claude Code's permission hook, which reaches it with `curl`; only your own user can connect to it.
 
 > **Quick Share** sends files through the [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) extension. Install and pair a device in GSConnect to send files to your phone from the Shelf. Pasting a copied file into the Shelf uses `wl-clipboard` (`wl-paste`) on Wayland.
 

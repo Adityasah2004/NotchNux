@@ -380,7 +380,7 @@ export const NotchNux = GObject.registerClass({
             trayMirrorKey: this._config.trayMirrorKey,
             pinnedKey: JSON.stringify(this._config.pinnedTabs),
             keepAwake: this._config.keepAwake,
-            claudeHookToken: this._config.claudeHookToken,
+            claudeApprove: this._config.claudeApprove,
         };
     }
 
@@ -469,7 +469,7 @@ export const NotchNux = GObject.registerClass({
         if (next.keepAwake !== prev.keepAwake)
             this._setKeepAwake(next.keepAwake, { persist: false });
         // "Approve from the notch" connected / disconnected in prefs.
-        if (next.claudeHookToken !== prev.claudeHookToken)
+        if (next.claudeApprove !== prev.claudeApprove)
             this._syncClaudeMonitor();
 
         // Which indicators the Tray tab mirrors changed in prefs: repaint the

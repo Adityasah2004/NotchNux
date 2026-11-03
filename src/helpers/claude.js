@@ -209,14 +209,27 @@ export function disconnectStatusLine(settings) {
 // ---- Approve from the notch ----
 //
 // Claude Code's PermissionRequest hook runs alongside the terminal's
-// permission dialog: whichever answers first wins. Preferences adds an HTTP
-// hook pointing at a tiny server the shell runs on 127.0.0.1 (tabs/claude.js),
-// which holds each request until a banner button is clicked. No answer
-// (connection refused, `{}`) leaves the terminal dialog in charge.
-export const APPROVE_PORT = 47391;
+// permission dialog: whichever answers first wins. Preferences adds a hook
+// command that hands the request to a tiny server the shell runs on a socket
+// in the user's runtime folder (tabs/claude.js), which holds it until a banner
+// button is clicked. No answer (nothing listening, `{}`) leaves the terminal
+// dialog in charge.
+//
+// A socket in $XDG_RUNTIME_DIR (0700) rather than a localhost port: only this
+// user's own processes can reach it, so while NotchNux is off (screen lock,
+// disabled) nothing else — another user, a container, a sandboxed app — can
+// take its place and approve prompts.
 export const APPROVE_PATH = '/claude/permission';
-export const APPROVE_URL = `http://127.0.0.1:${APPROVE_PORT}${APPROVE_PATH}`;
-export const TOKEN_HEADER = 'X-NotchNux-Token';
+export const SOCKET_NAME = 'notchnux-claude.sock';
+export const approveSocketPath = () => `${GLib.get_user_runtime_dir()}/${SOCKET_NAME}`;
+
+// curl reads the hook input on stdin and prints the decision. `|| true`: a
+// failure (NotchNux off, curl missing, a 4xx) must exit 0 with no output —
+// no decision — because exit code 2 from a hook means deny.
+export function approveCommand(socketPath) {
+    return `curl -sf --max-time 600 --unix-socket ${GLib.shell_quote(socketPath)} ` +
+        `-H 'Content-Type: application/json' --data-binary @- http://notchnux${APPROVE_PATH} || true`;
+}
 
 // Answered at once with no decision, so only the terminal handles them:
 // inside a subagent Claude Code waits for the hook *before* showing its
@@ -232,15 +245,22 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const BODY_LINES = 4;
 const BODY_CHARS = 240;
 
+// Invisible or reordering characters (controls, bidi overrides) would make
+// the banner read differently from what gets approved: shown as a marker.
+const HIDDEN = /[\u0000-\u0008\u000B-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
+// → { body, exact }: exact when the banner shows the whole text as is.
 function clip(text) {
-    let out = text.split('\n').slice(0, BODY_LINES).join('\n').slice(0, BODY_CHARS);
-    return out === text ? out : `${out.trimEnd()}…`;
+    let masked = text.replace(HIDDEN, '\uFFFD');
+    let out = masked.split('\n').slice(0, BODY_LINES).join('\n').slice(0, BODY_CHARS);
+    return { body: out === masked ? out : `${out.trimEnd()}…`, exact: out === text };
 }
 
 const base = p => (typeof p === 'string' && p ? GLib.path_get_basename(p) : '');
 
-// Hook input → the banner's { title, body }: "<session> wants to <action>"
-// over the exact command / file / URL. Never logged.
+// Hook input → the banner's { title, body, exact }: "<session> wants to
+// <action>" over the command / file / URL. `exact` is false when the body is
+// cut or masked — then the banner offers no Allow. Never logged.
 export function describeRequest(req, name = '') {
     let tool = String(req?.tool_name ?? '');
     let input = req?.tool_input && typeof req.tool_input === 'object' ? req.tool_input : {};
@@ -266,7 +286,7 @@ export function describeRequest(req, name = '') {
         [action, body] = [`use ${tool || 'a tool'}`, JSON.stringify(input)];
     }
     let who = name || base(req?.cwd) || 'Claude Code';
-    return { title: `${who} wants to ${action}`, body: clip(typeof body === 'string' ? body : '') };
+    return { title: `${who} wants to ${action}`, ...clip(typeof body === 'string' ? body : '') };
 }
 
 // The hook's HTTP response body for 'allow' | 'always' | 'deny' | 'none'.
@@ -286,7 +306,7 @@ export function decisionBody(kind, req) {
 // ---- Hook wiring (used by Preferences), same contract as the status line:
 // pure settings in → settings out, other hooks untouched, Disconnect
 // restores the file exactly.
-const isOurHook = h => h?.type === 'http' && h.url === APPROVE_URL;
+const isOurHook = h => h?.type === 'command' && typeof h.command === 'string' && h.command.includes(SOCKET_NAME);
 
 export function isApproveConnected(settings) {
     let list = settings?.hooks?.PermissionRequest;
@@ -312,12 +332,11 @@ export function disconnectApproveHook(settings) {
     return out;
 }
 
-// Connecting again replaces the token (Preferences re-connects when the
-// config lost it).
-export function connectApproveHook(settings, token) {
+// Connecting again replaces our entry (keeps the socket path current).
+export function connectApproveHook(settings, socketPath = approveSocketPath()) {
     let s = disconnectApproveHook(settings);
     let hooks = s.hooks ?? {};
     let list = Array.isArray(hooks.PermissionRequest) ? hooks.PermissionRequest : [];
-    let entry = { hooks: [{ type: 'http', url: APPROVE_URL, timeout: 600, headers: { [TOKEN_HEADER]: token } }] };
+    let entry = { hooks: [{ type: 'command', command: approveCommand(socketPath), timeout: 600 }] };
     return { ...s, hooks: { ...hooks, PermissionRequest: [...list, entry] } };
 }

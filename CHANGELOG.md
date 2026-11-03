@@ -22,11 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preferences → Claude Code → **Approve from the notch**: permission prompts
   show on a banner with **Allow / Always allow / Deny** that stays until you
   answer, even during Do Not Disturb. The terminal prompt keeps working;
-  answering there clears the banner. Connect adds an HTTP
-  `PermissionRequest` hook to `~/.claude/settings.json`, and NotchNux
-  listens on `127.0.0.1:47391` only while connected, guarded by a random
-  token. Prompts inside subagents, plan approvals and Claude's questions
-  stay in the terminal.
+  answering there clears the banner. Connect adds a `PermissionRequest`
+  hook to `~/.claude/settings.json` that hands each prompt to NotchNux with
+  `curl` over a socket in your runtime folder, which only your user can
+  reach; NotchNux listens only while connected. A command too long to show
+  in full, prompts inside subagents, plan approvals and Claude's questions
+  are approved in the terminal.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);

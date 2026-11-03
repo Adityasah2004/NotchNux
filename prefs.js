@@ -759,18 +759,14 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             'Connected. Your own status line still runs as before.',
             'Adds a step in front of your status line in ~/.claude/settings.json that saves the usage numbers to ~/.cache/notchnux. Your status line keeps working; the old file is kept as settings.json~.');
 
-        // The token goes in the hook and in NotchNux's config: the notch only
-        // answers requests that carry it. Settings are written first, so a
-        // failed write leaves the token as it was.
-        addRow('Approve from the notch', s => isApproveConnected(s) && !!config.claudeHookToken,
-            (s, on) => {
-                if (on)
-                    return [disconnectApproveHook(s), () => config.setClaudeHookToken('')];
-                const token = GLib.uuid_string_random();
-                return [connectApproveHook(s, token), () => config.setClaudeHookToken(token)];
-            },
+        // Settings are written first, so a failed write leaves the notch's
+        // side as it was.
+        addRow('Approve from the notch', s => isApproveConnected(s) && config.claudeApprove,
+            (s, on) => on
+                ? [disconnectApproveHook(s), () => config.setClaudeApprove(false)]
+                : [connectApproveHook(s), () => config.setClaudeApprove(true)],
             'Connected. Permission prompts show Allow / Deny on the notch; the terminal prompt keeps working.',
-            'Allow or deny Claude Code’s permission prompts from the notch. Adds a hook to ~/.claude/settings.json that asks NotchNux on this computer only (127.0.0.1). The terminal prompt keeps working.');
+            'Allow or deny Claude Code’s permission prompts from the notch. Adds a hook to ~/.claude/settings.json that hands each prompt to NotchNux through a private socket only your user can reach (needs curl). The terminal prompt keeps working.');
     }
 
     // ---- Mirrored indicators (Tray tab) ----
