@@ -22,6 +22,9 @@ export const SETTINGS_PATH = `${CLAUDE_DIR}/settings.json`;
 // Servers waiting for a login, kept by Claude Code itself (refreshed by
 // `claude mcp list` and by sessions as they connect).
 export const MCP_AUTH_PATH = `${CLAUDE_DIR}/mcp-needs-auth-cache.json`;
+// Admin policy, read-only. ponytail: the managed-settings.d drop-ins aren't
+// read; add them if a policy there is ever missed.
+export const MANAGED_SETTINGS_PATH = '/etc/claude-code/managed-settings.json';
 // Hard-coded rather than $XDG_CACHE_HOME: Claude Code (started from a
 // terminal) and gnome-shell can see different environments.
 export const USAGE_PATH = `${HOME}/.cache/notchnux/claude-usage.json`;
@@ -661,6 +664,28 @@ export function parseSkillMeta(text) {
 
 export const skillOverride = (settings, name) => settings?.skillOverrides?.[name] ?? 'on';
 
+// Which setting decides a skill in one folder, in Claude Code's order:
+// admin policy, then the folder's settings.local.json, its settings.json,
+// then the user's. → { state, scope } (scope null: nobody set it, so on).
+const SKILL_ORDER = ['policy', 'local', 'project', 'user'];
+export function effectiveSkill(name, files) {
+    for (let scope of SKILL_ORDER) {
+        let v = files[scope]?.skillOverrides?.[name];
+        if (typeof v === 'string')
+            return { state: v, scope };
+    }
+    return { state: 'on', scope: null };
+}
+
+// The edit that turns a skill on or off in one file, given what the files
+// below it say (`lower`): off writes "off"; on removes the override (exact
+// restore) unless something below has it off, then it writes "on".
+export function skillEdit(name, on, lower = 'on') {
+    if (!on || lower !== 'off')
+        return s => setSkillOverride(s, name, on);
+    return s => ({ ...s, skillOverrides: { ...(s.skillOverrides ?? {}), [name]: 'on' } });
+}
+
 // Off → `skillOverrides[name] = 'off'`; on → the override goes (and the
 // whole key when it empties), so off → on restores the file exactly.
 // ponytail: a "name-only" override turned off and on comes back as plain on.
@@ -682,12 +707,12 @@ export function setSkillOverride(settings, name, on) {
 // each other live folder's own (its settings.local.json, not committed). A
 // session in ~ adds nothing: its .claude/skills is the personal folder.
 export function skillSources(cwds) {
-    let out = [{ dir: `${CLAUDE_DIR}/skills`, settings: SETTINGS_PATH, where: '' }];
+    let out = [{ dir: `${CLAUDE_DIR}/skills`, settings: SETTINGS_PATH, where: '', cwd: '' }];
     for (let cwd of new Set(cwds)) {
         if (!cwd || cwd === HOME)
             continue;
         out.push({ dir: `${cwd}/.claude/skills`, settings: `${cwd}/.claude/settings.local.json`,
-            where: GLib.path_get_basename(cwd) });
+            where: GLib.path_get_basename(cwd), cwd });
     }
     return out;
 }

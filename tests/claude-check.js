@@ -13,6 +13,7 @@ import {
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
     parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron, mcpCheckOutcome,
+    MANAGED_SETTINGS_PATH, effectiveSkill, skillEdit,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -318,6 +319,20 @@ eq(setSkillOverride(sk, 'x', false).skillOverrides, { keep: 'name-only', x: 'off
 eq(text(setSkillOverride(setSkillOverride(sk, 'x', false), 'x', true)), text(sk), 'skill off → on restores exactly');
 eq(text(setSkillOverride(setSkillOverride({ model: 'opus' }, 'x', false), 'x', true)), text({ model: 'opus' }), 'no overrides before → none after');
 eq(setSkillOverride(sk, 'keep', true), { model: 'opus' }, 'turning an override back on drops it');
+
+// ---- which setting decides a skill (Claude Code: policy, local, project, user) ----
+ok(MANAGED_SETTINGS_PATH === '/etc/claude-code/managed-settings.json', 'managed settings path');
+const ov = v => ({ skillOverrides: { x: v } });
+eq(effectiveSkill('x', {}), { state: 'on', scope: null }, 'no override: on');
+eq(effectiveSkill('x', { user: ov('off') }), { state: 'off', scope: 'user' }, 'user decides');
+eq(effectiveSkill('x', { user: ov('off'), project: ov('on') }), { state: 'on', scope: 'project' }, 'project beats user');
+eq(effectiveSkill('x', { user: ov('on'), project: ov('off'), local: ov('name-only') }), { state: 'name-only', scope: 'local' }, 'local beats project');
+eq(effectiveSkill('x', { local: ov('on'), policy: ov('off') }), { state: 'off', scope: 'policy' }, 'policy beats everything');
+eq(effectiveSkill('x', { user: { skillOverrides: { y: 'off' } } }), { state: 'on', scope: null }, 'other skills ignored');
+eq(skillEdit('x', false, 'on')({ a: 1 }), { a: 1, skillOverrides: { x: 'off' } }, 'off writes off');
+eq(text(skillEdit('x', true, 'on')(skillEdit('x', false, 'on')({ a: 1 }))), text({ a: 1 }), 'on over nothing below: the override goes (exact)');
+eq(skillEdit('x', true, 'off')({ a: 1 }), { a: 1, skillOverrides: { x: 'on' } }, 'on over an off below: writes on');
+eq(skillEdit('x', true, 'name-only')({ skillOverrides: { x: 'off' } }), {}, 'on over a still-listed state below: the override goes');
 
 // ---- settings IO, async, on scratch files ----
 function settle(promise) {

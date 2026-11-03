@@ -41,8 +41,8 @@ import {
     APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
     MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
-    SETTINGS_PATH, parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron,
-    mcpCheckOutcome,
+    SETTINGS_PATH, parsePluginList, parseSkillMeta, setSkillOverride, skillSources, parseEnviron,
+    mcpCheckOutcome, MANAGED_SETTINGS_PATH, effectiveSkill, skillEdit,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -66,6 +66,8 @@ const REQUEST_MAX_AGE_US = (HOOK_TIMEOUT_S - SWEEP_S - 5) * 1e6;
 const CLICK_GUARD_US = 500 * 1000;
 const CLAUDE_VIEWS = [['sessions', 'Sessions'], ['mcp', 'MCP'], ['rules', 'Rules'], ['plugins', 'Plugins']];
 const OVERRIDE_TEXT = { 'name-only': 'name only', 'user-invocable-only': 'only when you ask' };
+const OVERRIDE_COLOR = { on: SYS.green, off: SYS.red };
+const SCOPE_TEXT = { local: 'local', project: 'project' };
 const MODE_LABELS = [['default', 'Default'], ['acceptEdits', 'Accept edits'], ['plan', 'Plan'], ['auto', 'Auto']];
 const KIND_COLOR = { allow: SYS.green, ask: SYS.orange, deny: SYS.red };
 const CONFIRM_MS = 3000;
@@ -131,7 +133,7 @@ const ClaudeFeatures = {
             mcp: { auth: null, check: null, running: false, error: '' },
             // seq: newest load wins; key: the live folders a load covered.
             rules: { files: [], loaded: false, loading: false, seq: 0, key: null, error: '', armed: null },
-            extras: { plugins: null, skills: [], loaded: false, loading: false, seq: 0, pseq: 0, key: null,
+            extras: { plugins: null, skills: [], overrides: [], loaded: false, loading: false, seq: 0, pseq: 0, key: null,
                 error: '', actionError: '', note: '', busy: new Set() },
             edits: Promise.resolve(),   // settings edits run one after another
             procs: new Map(),      // running `claude` commands → { id: timeout source, timedOut }
@@ -870,18 +872,19 @@ const ClaudeFeatures = {
         let row = new St.BoxLayout({ style_class: 'nn-claude-row nn-claude-rule', x_expand: true });
         row.add_child(text(kind, 'nn-claude-badge', { style: `color: ${KIND_COLOR[kind]};` }));
         row.add_child(text(rule, 'nn-claude-rule-text', { x_expand: true }));
-        let del = iconBtn('window-close-symbolic', 'nook-mini-btn', () => this._armOrRemoveRule(del, f, kind, rule),
+        let del = iconBtn('window-close-symbolic', 'nook-mini-btn',
+            () => this._armOrRun(del, () => this._editRules(f.path, s => removeRule(s, kind, rule), f.scope === 'user')),
             `Remove ${kind} rule ${rule}`);
         row.add_child(del);
         return row;
     },
 
-    // × once arms it ("Remove?" for 3 s), a second click removes the rule.
-    _armOrRemoveRule(btn, f, kind, rule) {
+    // × once arms it ("Remove?" for 3 s), a second click runs `action`.
+    _armOrRun(btn, action) {
         let r = this._claude.rules;
         if (r.armed?.btn === btn) {
             this._disarmClaudeRule();
-            this._editRules(f.path, s => removeRule(s, kind, rule), f.scope === 'user');
+            action();
             return;
         }
         this._disarmClaudeRule();
@@ -970,12 +973,13 @@ const ClaudeFeatures = {
         x.key = this._claudeFoldersKey();
         x.loading = true;
         try {
-            let sources = skillSources(x.key ? x.key.split('\n') : []);
-            let [listed, skills] = await Promise.all([
+            let cwds = x.key ? x.key.split('\n') : [];
+            let [listed, ctx] = await Promise.all([
                 plugins ? new Promise(resolve => this._runClaude(['plugin', 'list', '--json'], { timeoutS: 30 },
                     (out, err) => resolve({ list: parsePluginList(out ?? ''), err }))) : null,
-                Promise.all(sources.map(src => this._readSkills(src))).then(all => all.flat()),
+                this._readSkillSettings(cwds),
             ]);
+            let skills = (await Promise.all(skillSources(cwds).map(src => this._readSkills(src, ctx)))).flat();
             if (this._destroyed)
                 return;
             if (listed && pseq === x.pseq) {
@@ -985,6 +989,7 @@ const ClaudeFeatures = {
             if (seq !== x.seq)
                 return;
             x.skills = skills;
+            x.overrides = ctx.overrides;
         } catch (e) {
             x.error = `Couldn’t read plugins and skills (${e.message})`;
         } finally {
@@ -997,8 +1002,37 @@ const ClaudeFeatures = {
             this._updateClaudeTab(false);
     },
 
-    // One skills folder → [{ name, description, state, settings, where }].
-    async _readSkills(src) {
+    // Every file that can decide a skill: admin policy, the user's settings,
+    // and each live folder's settings.json + settings.local.json, plus the
+    // overrides those folders hold (listed so they can be removed).
+    async _readSkillSettings(cwds) {
+        let get = async path => (await readSettingsAsync(path)).settings ?? {};
+        let [policy, user] = await Promise.all([get(MANAGED_SETTINGS_PATH), get(SETTINGS_PATH)]);
+        let folders = await Promise.all(cwds.map(async cwd => {
+            let projectPath = `${cwd}/.claude/settings.json`;
+            let localPath = `${cwd}/.claude/settings.local.json`;
+            // A session in ~: its project file is the user's own.
+            let [project, local] = await Promise.all([projectPath === SETTINGS_PATH ? null : get(projectPath), get(localPath)]);
+            return { cwd, name: GLib.path_get_basename(cwd), project, local, projectPath, localPath };
+        }));
+        let overrides = [];
+        for (let f of folders) {
+            for (let [scope, path, settings] of [['local', f.localPath, f.local], ['project', f.projectPath, f.project]]) {
+                for (let [name, value] of Object.entries(settings?.skillOverrides ?? {})) {
+                    if (typeof value === 'string')
+                        overrides.push({ name, value, path, scope, folder: f.name });
+                }
+            }
+        }
+        overrides.sort((a, b) => a.name.localeCompare(b.name) || a.folder.localeCompare(b.folder));
+        return { policy, user, folders, overrides };
+    },
+
+    // One skills folder → [{ name, description, state, scope, lower, settings,
+    // where, notes }]. Personal skills: the toggle sets the user-level default
+    // (the one setting every project sees); `notes` say where a live folder
+    // decides otherwise. A folder's own skills: its local file, as /skills does.
+    async _readSkills(src, ctx) {
         // All async: a session folder can sit on a network mount.
         let names = await new Promise(resolve => {
             Gio.File.new_for_path(src.dir).enumerate_children_async('standard::name,standard::type',
@@ -1038,14 +1072,27 @@ const ClaudeFeatures = {
                     more();
                 });
         });
-        let settings = (await readSettingsAsync(src.settings)).settings ?? {};
+        let home = ctx.folders.find(f => f.cwd === src.cwd);
         let skills = await Promise.all(names.map(async dirName => {
             let text = await read(`${src.dir}/${dirName}/SKILL.md`, null);
             if (text === null)
                 return null;
             let meta = parseSkillMeta(text);
             let name = meta.name || dirName;
-            return { name, description: meta.description, state: skillOverride(settings, name),
+            let eff, lower, notes = [];
+            if (!home) {
+                eff = effectiveSkill(name, { policy: ctx.policy, user: ctx.user });
+                lower = 'on';
+                for (let f of ctx.folders) {
+                    let there = effectiveSkill(name, { policy: ctx.policy, local: f.local, project: f.project, user: ctx.user });
+                    if (there.scope in SCOPE_TEXT && there.state !== eff.state)
+                        notes.push(`${OVERRIDE_TEXT[there.state] ?? there.state} in ${f.name}`);
+                }
+            } else {
+                eff = effectiveSkill(name, { policy: ctx.policy, local: home.local, project: home.project, user: ctx.user });
+                lower = effectiveSkill(name, { project: home.project, user: ctx.user }).state;
+            }
+            return { name, description: meta.description, state: eff.state, scope: eff.scope, lower, notes,
                 settings: src.settings, where: src.where };
         }));
         return skills.filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
@@ -1055,10 +1102,11 @@ const ClaudeFeatures = {
         let x = this._claude.extras;
         ui.note.set_text(x.actionError || x.error || x.note || (x.loaded ? 'Plugin changes reach open sessions after /reload-plugins'
             : 'Reading plugins and skills…'));
-        let sig = JSON.stringify([x.loaded, x.plugins, x.skills, [...x.busy]]);
+        let sig = JSON.stringify([x.loaded, x.plugins, x.skills, x.overrides, [...x.busy]]);
         if (sig === ui.sig)
             return;
         ui.sig = sig;
+        this._disarmClaudeRule();
         ui.list.destroy_all_children();
         if (x.plugins?.length) {
             ui.list.add_child(text('Plugins', 'nook-card-meta nn-claude-group'));
@@ -1076,9 +1124,23 @@ const ClaudeFeatures = {
             for (let sk of x.skills) {
                 let on = sk.state !== 'off';
                 let item = this._ccRow(ui.list, sk.name, () => this._toggleClaudeSkill(sk));
-                let sub = [sk.where, OVERRIDE_TEXT[sk.state], sk.description].filter(Boolean).join(' · ');
+                let sub = [sk.where, OVERRIDE_TEXT[sk.state], sk.scope === 'policy' && 'set by policy', ...sk.notes,
+                    sk.description].filter(Boolean).join(' · ');
                 item.update(on, sub, 'accessories-text-editor-symbolic');
-                item.setEnabled(!x.busy.has(`skill:${sk.settings}:${sk.name}`));
+                item.setEnabled(sk.scope !== 'policy' && !x.busy.has(`skill:${sk.settings}:${sk.name}`));
+            }
+        }
+        if (x.overrides.length) {
+            ui.list.add_child(text('Overrides in live folders', 'nook-card-meta nn-claude-group'));
+            for (let o of x.overrides) {
+                let row = new St.BoxLayout({ style_class: 'nn-claude-row nn-claude-rule', x_expand: true });
+                row.add_child(text(OVERRIDE_TEXT[o.value] ?? o.value, 'nn-claude-badge',
+                    { style: `color: ${OVERRIDE_COLOR[o.value] ?? SYS.orange};` }));
+                row.add_child(text(`${o.name} · ${o.folder} (${SCOPE_TEXT[o.scope]})`, 'nn-claude-rule-text', { x_expand: true }));
+                let del = iconBtn('window-close-symbolic', 'nook-mini-btn', () => this._armOrRun(del, () => this._removeSkillOverride(o)),
+                    `Remove the ${o.name} override in ${o.folder}`);
+                row.add_child(del);
+                ui.list.add_child(row);
             }
         }
         this._resizeClaudeTab();
@@ -1106,13 +1168,24 @@ const ClaudeFeatures = {
         x.busy.add(key);
         this._updateClaudeTab(false);
         let off = sk.state !== 'off';
-        let err = await this._editClaudeSettings(sk.settings, s => setSkillOverride(s, sk.name, !off),
+        let err = await this._editClaudeSettings(sk.settings, skillEdit(sk.name, !off, sk.lower),
             sk.settings === SETTINGS_PATH);
         if (this._destroyed)
             return;
         x.busy.delete(key);
         x.actionError = err;
         x.note = err ? '' : `${sk.name} ${off ? 'off' : 'on'} for new sessions`;
+        this._loadClaudeExtras({ plugins: false });
+    },
+
+    // Drop one folder's override, so the skill follows the next setting down.
+    async _removeSkillOverride(o) {
+        let x = this._claude.extras;
+        let err = await this._editClaudeSettings(o.path, s => setSkillOverride(s, o.name, true));
+        if (this._destroyed)
+            return;
+        x.actionError = err;
+        x.note = err ? '' : `${o.name}: ${o.folder}'s override removed`;
         this._loadClaudeExtras({ plugins: false });
     },
 

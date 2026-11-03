@@ -45,7 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable/disable` (open sessions pick it up after `/reload-plugins`), and
   personal skills (`~/.claude/skills`) and each running session's project
   skills on or off through `skillOverrides`; turning one back on removes
-  the override, so the file returns to how it was.
+  the override, so the file returns to how it was. Skills follow Claude
+  Code's order (admin policy, the folder's local settings, its project
+  settings, then yours): a personal skill says where a running session's
+  folder decides otherwise, and those folder overrides are listed with a ×
+  to remove them.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
