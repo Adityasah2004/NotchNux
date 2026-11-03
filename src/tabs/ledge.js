@@ -404,6 +404,9 @@ export const LedgeFeatures = {
 
     // Something that blocked alerts went away (collapse, peek hidden).
     _promoteAlert() {
+        // A held Claude Code approval goes first (tabs/claude.js).
+        if (this._presentClaudeRequest())
+            return;
         if (this._alertShowing || !this._canShowAlert() || !this._alerts.hasPending)
             return;
         if (this._alerts.promote())

@@ -380,6 +380,7 @@ export const NotchNux = GObject.registerClass({
             trayMirrorKey: this._config.trayMirrorKey,
             pinnedKey: JSON.stringify(this._config.pinnedTabs),
             keepAwake: this._config.keepAwake,
+            claudeHookToken: this._config.claudeHookToken,
         };
     }
 
@@ -467,6 +468,9 @@ export const NotchNux = GObject.registerClass({
         }
         if (next.keepAwake !== prev.keepAwake)
             this._setKeepAwake(next.keepAwake, { persist: false });
+        // "Approve from the notch" connected / disconnected in prefs.
+        if (next.claudeHookToken !== prev.claudeHookToken)
+            this._syncClaudeMonitor();
 
         // Which indicators the Tray tab mirrors changed in prefs: repaint the
         // Tray tab so the row reflects the new selection. Only meaningful while
@@ -937,7 +941,11 @@ export const NotchNux = GObject.registerClass({
         // Clicking the main area = activate the notification (its default
         // action) and dismiss the peek.
         this._notifPeekMain.connect('clicked', () => {
-            this._activateCurrentNotification();
+            // A Claude approval banner raises the session's terminal and stays up.
+            if (this._peekMainClick)
+                this._peekMainClick();
+            else
+                this._activateCurrentNotification();
         });
 
         // Hovering anywhere on the banner pauses the auto-dismiss; leaving
@@ -997,12 +1005,21 @@ export const NotchNux = GObject.registerClass({
             btn.connect('clicked', () => {
                 // Run the app's action handler, then collapse. Guard it — a
                 // throwing callback must not leave the peek stuck open.
+                let failed = false;
                 try {
                     if (typeof action.callback === 'function') action.callback();
                 } catch (e) {
+                    failed = true;
                     logError('notification action failed', e);
                 }
-                this._hideNotificationPeek(true);
+                // manualHide: the callback shows what comes next itself (a
+                // Claude approval moves on to the next request, or hides with
+                // the spring back to the pill — the immediate path below
+                // leaves a collapsed island at peek height).
+                if (!action.manualHide)
+                    this._hideNotificationPeek(true);
+                else if (failed)
+                    this._hideNotificationPeek();
             });
             this._notifPeekActions.add_child(btn);
         }
@@ -5199,9 +5216,26 @@ export const NotchNux = GObject.registerClass({
     // Morph pill → banner and start the auto-dismiss countdown. If a peek is
     // already showing, just swap its content and restart the timer (so a burst
     // of notifications keeps the banner up and current rather than flickering).
-    _showNotificationPeek(title, body, gicon, notification = null, actions = []) {
+    //
+    // opts.sticky: no auto-dismiss, hovering doesn't open the dashboard, and
+    // other peeks wait it out (Claude Code approvals). opts.onMainClick
+    // replaces activating the notification; the banner stays up.
+    _showNotificationPeek(title, body, gicon, notification = null, actions = [], opts = {}) {
         if (this._destroyed) return;
         if (!this._notifBanner) return;
+        // ponytail: while a sticky banner is up, other peeks (notifications,
+        // the Focus timer) are skipped, not queued; notifications still land
+        // in the Notifications tab. Queue them if that ever matters.
+        if (this._peekActive && this._peekSticky && !opts.sticky) return;
+
+        this._peekSticky = !!opts.sticky;
+        this._peekMainClick = opts.onMainClick ?? null;
+        // A sticky banner's body is a command / path: wrap it rather than cut
+        // it to one line (helpers/claude.js caps it at 4 lines).
+        let bodyText = this._notifPeekBody.clutter_text;
+        bodyText.line_wrap = this._peekSticky;
+        bodyText.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+        bodyText.set_ellipsize(this._peekSticky ? Pango.EllipsizeMode.NONE : Pango.EllipsizeMode.END);
 
         this._peekNotification = notification;
         this._notifPeekTitle.set_text(title);
@@ -5289,6 +5323,8 @@ export const NotchNux = GObject.registerClass({
     _hideNotificationPeek(immediate = false) {
         if (!this._peekActive) return;
         this._peekActive = false;
+        this._peekSticky = false;
+        this._peekMainClick = null;
         // The shell expires transient notifications when their banner hides;
         // the peek replaced that banner, so do the same here.
         let shown = this._peekNotification;
@@ -5343,6 +5379,7 @@ export const NotchNux = GObject.registerClass({
 
     _armPeekDismissTimer() {
         this._clearPeekDismissTimer();
+        if (this._peekSticky) return;   // stays until answered
         this._peekDismissId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PEEK_DISMISS_MS, () => {
             this._peekDismissId = 0;
             // Don't yank the banner out from under the pointer — reschedule.
@@ -6148,10 +6185,12 @@ export const NotchNux = GObject.registerClass({
                 GLib.Source.remove(this._collapseTimeoutId);
                 this._collapseTimeoutId = null;
             }
-            if (!this.isExpanded && !this._expandTimeoutId) {
+            // Not over a sticky banner: reaching for its buttons would open
+            // the dashboard, which hides the banner.
+            if (!this.isExpanded && !this._expandTimeoutId && !this._peekSticky) {
                 this._expandTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 180, () => {
                     this._expandTimeoutId = null;
-                    if (this._pointerInside && !this.isExpanded && !this._anyOwnedMenuOpen())
+                    if (this._pointerInside && !this.isExpanded && !this._anyOwnedMenuOpen() && !this._peekSticky)
                         this.expand();
                     return GLib.SOURCE_REMOVE;
                 });
@@ -6197,7 +6236,7 @@ export const NotchNux = GObject.registerClass({
             this._openPillMenu();
             return Clutter.EVENT_STOP;
         }
-        if (event.get_button() === 1 && !this.isExpanded && !this._anyOwnedMenuOpen()) {
+        if (event.get_button() === 1 && !this.isExpanded && !this._anyOwnedMenuOpen() && !this._peekSticky) {
             this._untuckForExpand();
             this.expand();
         }

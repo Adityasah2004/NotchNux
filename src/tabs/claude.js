@@ -11,6 +11,11 @@
 // and the tab's "time in state". Nothing runs unless the `claudeMonitor`
 // feature is on or the Claude tab is open.
 //
+// Approve from the notch: while connected (a hook token is set), a server on
+// 127.0.0.1 receives Claude Code's PermissionRequest hook and holds each
+// request until a button on a sticky banner answers it, or the terminal
+// answers first (seen as the session leaving its waiting state).
+//
 // Methods mixed into the NotchNux actor, like tabs/tray.js.
 
 import Clutter from 'gi://Clutter';
@@ -18,6 +23,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Soup from 'gi://Soup';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -25,6 +31,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {
     SESSIONS_DIR, USAGE_PATH, SESSION_FILE, parseSession, procStat, isLive, alertFor,
     parseUsage, sortSessions, pillDots, fmtAge,
+    APPROVE_PORT, APPROVE_PATH, TOKEN_HEADER, passThrough, describeRequest, decisionBody,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -38,6 +45,9 @@ const DEBOUNCE_MS = 150;
 const ALERT_MS = 4000;
 const DONE_GREY = 'rgba(255, 255, 255, 0.35)';
 const STATE_TEXT = { working: 'Working', approval: 'Needs approval', question: 'Has a question', done: 'Done' };
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+// The hook times out after 600 s; a click after that would do nothing.
+const REQUEST_MAX_AGE_MS = 590 * 1000;
 const ALERT_ICON = { approval: 'dialog-warning-symbolic', question: 'dialog-question-symbolic', done: 'object-select-symbolic' };
 
 function dotColor(kind) {
@@ -82,12 +92,15 @@ const ClaudeFeatures = {
             tabOpen: false,
             monitor: null, monitorId: 0, debounceId: 0, sweepId: 0,
             cancellable: null, seq: 0, pillSig: '',
+            requests: [],          // held approvals, FIFO; the head is the one on screen
+            server: null, portLogged: false,
         };
         this._buildPillClaude();
         this._syncClaudeMonitor();
     },
 
     _destroyClaude() {
+        this._stopClaudeApprove();
         this._stopClaudeMonitor();
     },
 
@@ -97,10 +110,16 @@ const ClaudeFeatures = {
     },
 
     _syncClaudeMonitor() {
-        if (this._config.isFeatureEnabled('claudeMonitor') || this._claude.tabOpen)
+        // Approvals need the monitor too: it's how a terminal answer is seen.
+        let approve = !!this._config.claudeHookToken;
+        if (this._config.isFeatureEnabled('claudeMonitor') || this._claude.tabOpen || approve)
             this._startClaudeMonitor();
         else
             this._stopClaudeMonitor();
+        if (approve)
+            this._startClaudeApprove();
+        else
+            this._stopClaudeApprove();
         this._syncPillClaude();
     },
 
@@ -205,7 +224,9 @@ const ClaudeFeatures = {
             let prev = c.sessions.get(s.pid);
             next.set(s.pid, s);
             let a = alertFor(prev, s);
-            if (a && alerts)
+            // A held request already has its banner.
+            let held = a?.state === 'approval' && c.requests.some(r => r.sessionId && r.sessionId === s.sessionId);
+            if (a && alerts && !held)
                 this._pushClaudeAlert(s, a);
             if (s.state !== 'done')
                 c.unseen.delete(s.pid);
@@ -220,6 +241,7 @@ const ClaudeFeatures = {
             c.unseen.clear();
         c.sessions = next;
         c.usage = usage;
+        this._sweepClaudeRequests();
         this._syncPillClaude();
         if (this._invalidateTab('claude'))
             this._updateClaudeTab();
@@ -270,6 +292,140 @@ const ClaudeFeatures = {
                 return;
             p = procStat(stat).ppid;
         }
+    },
+
+    // ================================================================ approvals
+
+    _startClaudeApprove() {
+        let c = this._claude;
+        if (c.server)
+            return;
+        let server = new Soup.Server();
+        server.add_handler(APPROVE_PATH, (srv, msg) => this._onClaudeRequest(msg));
+        try {
+            // 127.0.0.1 only.
+            server.listen_local(APPROVE_PORT, Soup.ServerListenOptions.IPV4_ONLY);
+        } catch (e) {
+            // ponytail: fixed port; if something else holds it, approvals
+            // stay in the terminal. Make it configurable if anyone hits this.
+            if (!c.portLogged)
+                logError(`Claude approvals: can't listen on port ${APPROVE_PORT}`, e);
+            c.portLogged = true;
+            server.disconnect();
+            return;
+        }
+        c.server = server;
+    },
+
+    // Every held request gets "no decision", so the terminal dialogs carry on.
+    _stopClaudeApprove() {
+        let c = this._claude;
+        if (!c?.server)
+            return;
+        let pending = c.requests;
+        c.requests = [];
+        for (let r of pending)
+            this._replyClaude(r.msg, 200, decisionBody('none'));
+        c.server.disconnect();
+        c.server = null;
+        if (this._peekSticky && !this._destroyed)
+            this._hideNotificationPeek();
+    },
+
+    _replyClaude(msg, status, body = '') {
+        try {
+            msg.set_status(status, null);
+            if (body)
+                msg.set_response('application/json', Soup.MemoryUse.COPY, new TextEncoder().encode(body));
+            msg.unpause();
+        } catch (e) {
+            logError('Claude approval reply failed', e);
+        }
+    },
+
+    _onClaudeRequest(msg) {
+        if (msg.get_method() !== 'POST')
+            return this._replyClaude(msg, 405);
+        // The token keeps other local users out; being a custom header, it
+        // also makes a browser preflight first, which this never answers.
+        let token = this._config.claudeHookToken;
+        if (!token || msg.get_request_headers().get_one(TOKEN_HEADER) !== token)
+            return this._replyClaude(msg, 403);
+        let bytes = msg.get_request_body().flatten().get_data() ?? new Uint8Array();
+        if (bytes.length > MAX_REQUEST_BYTES)
+            return this._replyClaude(msg, 413);
+        let req = null;
+        try {
+            req = JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) {
+            // answered below
+        }
+        if (!req || typeof req !== 'object')
+            return this._replyClaude(msg, 400);
+        if (passThrough(req))
+            return this._replyClaude(msg, 200, decisionBody('none'));
+
+        let c = this._claude;
+        msg.pause();
+        let r = { req, msg, sessionId: String(req.session_id ?? ''), at: Date.now(), seenWaiting: false };
+        c.requests.push(r);
+        // A session shows one dialog at a time: a new request means its
+        // older ones were answered in the terminal. "No decision" is safe
+        // even if that's wrong — it never approves anything.
+        for (let old of c.requests.filter(o => o !== r && o.sessionId && o.sessionId === r.sessionId))
+            this._answerClaudeRequest(old, 'none');
+        this._presentClaudeRequest();
+    },
+
+    _answerClaudeRequest(r, kind) {
+        let c = this._claude;
+        let i = c.requests.indexOf(r);
+        if (i < 0)
+            return;
+        c.requests.splice(i, 1);
+        this._replyClaude(r.msg, 200, decisionBody(kind, r.req));
+        // The head is the one on screen: move on to the next, or spring back
+        // to the pill.
+        if (i === 0 && this._peekSticky && !this._presentClaudeRequest(true))
+            this._hideNotificationPeek();
+    },
+
+    // After each sessions read: a request whose session was seen waiting and
+    // has moved on was answered in the terminal; one older than the hook's
+    // timeout can't be answered any more.
+    _sweepClaudeRequests() {
+        let c = this._claude;
+        if (!c.requests.length)
+            return;
+        let now = Date.now();
+        for (let r of [...c.requests]) {
+            let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
+            let waiting = s?.state === 'approval' || s?.state === 'question';
+            if (waiting)
+                r.seenWaiting = true;
+            if (now - r.at > REQUEST_MAX_AGE_MS || (r.seenWaiting && !waiting))
+                this._answerClaudeRequest(r, 'none');
+        }
+    },
+
+    // Show the head of the queue on the sticky banner. `replace` swaps the
+    // banner already up. Returns whether a Claude banner is showing.
+    _presentClaudeRequest(replace = false) {
+        let c = this._claude;
+        let r = c?.requests[0];
+        if (!r || this.isExpanded || this._isExpanding || (this._peekSticky && !replace))
+            return false;
+        let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
+        let { title, body } = describeRequest(r.req, s?.name);
+        let answer = (label, kind) => ({ label, manualHide: true, callback: () => this._answerClaudeRequest(r, kind) });
+        let actions = [answer('Allow', 'allow')];
+        // Only when the terminal would offer it too.
+        if (Array.isArray(r.req.permission_suggestions) && r.req.permission_suggestions.length)
+            actions.push(answer('Always allow', 'always'));
+        actions.push(answer('Deny', 'deny'));
+        this._showNotificationPeek(title, body, new Gio.ThemedIcon({ name: 'dialog-warning-symbolic' }), null, actions,
+            { sticky: true, onMainClick: () => s && this._raiseClaudeTerminal(s.pid) });
+        return !!this._peekSticky;
     },
 
     // ================================================================ pill
