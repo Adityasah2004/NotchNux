@@ -40,7 +40,7 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 | 🏝️ | **Island alerts** | Volume, brightness, charging, low battery, headphones and a 5-minute event heads-up grow out of the pill for a moment, one at a time. |
 | 🫥 | **Hide when idle** | Optional: the notch tucks into the top edge until something is live, or you rest the pointer at the top centre. |
 | 🔲 | **Grid launcher** | Home plus up to five shortcuts in the header; everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
-| 🤖 | **Claude Code** | Opt-in: a tab listing your running Claude Code sessions (working, needs approval, has a question, done) with your 5-hour and weekly usage, plus a dot per session and the 5-hour % in the pill and a short alert when one finishes or needs you. Click a session to bring its terminal forward. *Connect* in Preferences to see usage. Everything stays on your machine. |
+| 🤖 | **Claude Code** | Opt-in: a tab listing your running Claude Code sessions (working, needs approval, has a question, done) with your 5-hour and weekly usage, plus a dot per session and the 5-hour % in the pill and a short alert when one finishes or needs you. Click a session to bring its terminal forward. *Connect* in Preferences to see usage. Connect **Approve from the notch** to answer permission prompts with Allow / Always allow / Deny on a banner that stays until you answer (the terminal prompt keeps working). Everything stays on your machine. |
 | 📋 | **Clipboard** | The last 20 text clips with search and pins. Passwords are skipped; only pinned clips are saved. |
 | ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
 | 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |
@@ -162,7 +162,7 @@ Configuration is stored as plain JSON under `~/.config/notchnux/config.json` —
 | `~/.local/share/notchnux/shelf/` | Files added to the Shelf (cleared once per login) |
 | `~/.cache/notchnux/` | Album art, wallpaper thumbnails and processed wallpapers (pruned automatically) |
 
-Everything is stored locally, readable only by you (`0600` files in `0700` folders). Nothing is uploaded; the only network requests are the weather forecast (Open-Meteo), place-name lookups (OpenStreetMap Nominatim) and album art from your music player.
+Everything is stored locally, readable only by you (`0600` files in `0700` folders). Nothing is uploaded; the only network requests are the weather forecast (Open-Meteo), place-name lookups (OpenStreetMap Nominatim) and album art from your music player. While *Approve from the notch* is connected, NotchNux also listens on `127.0.0.1:47391` for Claude Code's permission hook; only programs on this computer can reach it, and only with the token stored in your config.
 
 > **Quick Share** sends files through the [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) extension. Install and pair a device in GSConnect to send files to your phone from the Shelf. Pasting a copied file into the Shelf uses `wl-clipboard` (`wl-paste`) on Wayland.
 

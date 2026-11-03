@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.cache/notchnux`; your status line keeps working, and **Disconnect**
   restores the original. Sessions are read from `~/.claude/sessions`.
   Nothing leaves your machine. Both are off by default.
+- Preferences → Claude Code → **Approve from the notch**: permission prompts
+  show on a banner with **Allow / Always allow / Deny** that stays until you
+  answer, even during Do Not Disturb. The terminal prompt keeps working;
+  answering there clears the banner. Connect adds an HTTP
+  `PermissionRequest` hook to `~/.claude/settings.json`, and NotchNux
+  listens on `127.0.0.1:47391` only while connected, guarded by a random
+  token. Prompts inside subagents, plan approvals and Claude's questions
+  stay in the terminal.
 
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
