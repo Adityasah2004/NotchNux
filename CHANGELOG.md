@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preferences → Claude Code → **Approve from the notch**: permission prompts
   show on a banner with **Allow / Always allow / Deny** that stays until you
   answer, even during Do Not Disturb. The terminal prompt keeps working;
-  answering there clears the banner. Connect adds a `PermissionRequest`
+  answering there clears the banner. Allow is offered only when the banner
+  shows everything it would approve (file edits and unshown options go to
+  the terminal), and Always allow shows the rule it adds. Connect adds a `PermissionRequest`
   hook to `~/.claude/settings.json` that hands each prompt to NotchNux with
   `curl` over a socket in your runtime folder, which only your user can
   reach; NotchNux listens only while connected. A command too long to show
@@ -30,9 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are approved in the terminal.
 - The Claude tab has **Sessions · MCP** views. MCP lists servers that need
   a login, read from Claude Code's own cache, and a short alert says when
-  one newly does. **Check now** runs `claude mcp list` (through your shell,
-  so servers see your usual PATH) in the newest session's folder and lists
-  the failures with their reason. Long lists scroll.
+  one newly does. **Check now** runs `claude mcp list` in the newest
+  session's folder, with that session's own environment (so servers see
+  your terminal's PATH), and lists the failures with their reason. Long
+  lists scroll.
 - A **Rules** view switches the default permission mode for new sessions
   (Default / Accept edits / Plan / Auto; never bypassPermissions) and lists
   the allow / ask / deny rules from `~/.claude/settings.json` and each

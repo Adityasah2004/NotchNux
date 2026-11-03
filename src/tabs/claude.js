@@ -41,7 +41,7 @@ import {
     APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
     MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
-    CLAUDE_DIR, SETTINGS_PATH, parsePluginList, parseSkillMeta, skillOverride, setSkillOverride,
+    SETTINGS_PATH, parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -128,9 +128,12 @@ const ClaudeFeatures = {
             monitor: null, monitorId: 0, debounceId: 0, sweepId: 0,
             cancellable: null, seq: 0, pillSig: '',
             mcp: { auth: null, check: null, running: false, error: '' },
-            rules: { files: [], loaded: false, loading: 0, error: '', armed: null },
-            extras: { plugins: null, skills: [], loaded: false, loading: 0, error: '', note: '', busy: new Set() },
-            procs: new Map(),      // running `claude` commands → their timeout source
+            // seq: newest load wins; key: the live folders a load covered.
+            rules: { files: [], loaded: false, loading: false, seq: 0, key: null, error: '', armed: null },
+            extras: { plugins: null, skills: [], loaded: false, loading: false, seq: 0, key: null,
+                error: '', actionError: '', note: '', busy: new Set() },
+            edits: Promise.resolve(),   // settings edits run one after another
+            procs: new Map(),      // running `claude` commands → { id: timeout source, timedOut }
             requests: [],          // held approvals, FIFO; the head is the one on screen
             server: null, socketPath: '', closing: null, listenLogged: false,
         };
@@ -143,9 +146,9 @@ const ClaudeFeatures = {
         // No timer may outlive disable(): close now. Held replies can be cut
         // off then (Claude Code reads that as no decision too).
         this._closeClaudeServer();
-        for (let [proc, id] of this._claude.procs) {
-            if (id)
-                GLib.Source.remove(id);
+        for (let [proc, entry] of this._claude.procs) {
+            if (entry.id)
+                GLib.Source.remove(entry.id);
             proc.force_exit();
         }
         this._claude.procs.clear();
@@ -267,7 +270,7 @@ const ClaudeFeatures = {
             });
     },
 
-    _applyClaude(list, usage, auth = new Map()) {
+    _applyClaude(list, usage, auth = null) {
         let c = this._claude;
         let alerts = this._config.isFeatureEnabled('claudeMonitor');
         let next = new Map();
@@ -292,8 +295,11 @@ const ClaudeFeatures = {
             c.unseen.clear();
         c.sessions = next;
         c.usage = usage;
-        let fresh = newAuthNames(c.mcp.auth, auth);
-        c.mcp.auth = auth;
+        let fresh = [];
+        if (auth !== null) {   // null: caught mid-write, keep the last one
+            fresh = newAuthNames(c.mcp.auth, auth);
+            c.mcp.auth = auth;
+        }
         if (fresh.length && alerts)
             this._pushAlert({ kind: 'claude-mcp', icon: 'dialog-password-symbolic', color: SYS.orange,
                 title: fresh.length === 1 ? fresh[0] : `${fresh.length} MCP servers`,
@@ -502,7 +508,7 @@ const ClaudeFeatures = {
         if (!r || this.isExpanded || this._isExpanding || (this._peekSticky && !replace))
             return false;
         let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
-        let { title, body, exact } = describeRequest(r.req, s?.name);
+        let { title, body, exact, always } = describeRequest(r.req, s?.name);
         let raise = () => s && this._raiseClaudeTerminal(s.pid);
         r.shownAt = GLib.get_monotonic_time();
         let act = (label, fn) => ({ label, manualHide: true, callback: () => {
@@ -513,9 +519,11 @@ const ClaudeFeatures = {
         // Allow only what the banner shows in full; the rest is approved in
         // the terminal.
         let actions = exact ? [answer('Allow', 'allow')] : [act('Open terminal', raise)];
-        // Only when the terminal would offer it too.
-        if (exact && Array.isArray(r.req.permission_suggestions) && r.req.permission_suggestions.length)
+        // Only a plain allow rule for this tool, and the banner says which.
+        if (always) {
             actions.push(answer('Always allow', 'always'));
+            body = `${body}\nAlways allow adds ${always}`;
+        }
         actions.push(answer('Deny', 'deny'));
         this._showNotificationPeek(title, body, new Gio.ThemedIcon({ name: 'dialog-warning-symbolic' }), null, actions,
             { sticky: true, onMainClick: raise });
@@ -744,26 +752,44 @@ const ClaudeFeatures = {
             label.set_text(fmtAge(now - since));
 
         this._updateClaudeMcp(ui.mcp);
-        if (view === 'rules' && !c.rules.loaded && !c.rules.loading)
+        // Load on open, and again when the live folders change (sessions
+        // usually arrive after the view opens).
+        let key = this._claudeFoldersKey();
+        let stale = st => st.key !== key || (!st.loaded && !st.loading);
+        if (view === 'rules' && stale(c.rules))
             this._loadClaudeRules();
         this._updateClaudeRules(ui.rules);
-        if (view === 'plugins' && !c.extras.loaded && !c.extras.loading)
+        if (view === 'plugins' && stale(c.extras))
             this._loadClaudeExtras();
         this._updateClaudeExtras(ui.extras);
+    },
+
+    _claudeFoldersKey() {
+        return [...new Set([...this._claude.sessions.values()].map(s => s.cwd).filter(Boolean))].sort().join('\n');
     },
 
     // ---- Rules view ----
     async _loadClaudeRules() {
         let r = this._claude.rules;
-        let seq = ++r.loading;
-        let files = claudeSettingsFiles([...this._claude.sessions.values()].map(s => s.cwd));
-        let read = await Promise.all(files.map(f => readSettingsAsync(f.path).then(x => ({ ...f, ...x, file: f.path }))));
-        if (this._destroyed || seq !== r.loading)
-            return;
-        r.loading = 0;
-        r.files = read;
-        r.loaded = true;
-        this._updateClaudeTab(false);
+        let seq = ++r.seq;
+        r.key = this._claudeFoldersKey();
+        r.loading = true;
+        try {
+            let files = claudeSettingsFiles(r.key ? r.key.split('\n') : []);
+            let read = await Promise.all(files.map(f => readSettingsAsync(f.path).then(x => ({ ...f, ...x, file: f.path }))));
+            if (this._destroyed || seq !== r.seq)
+                return;
+            r.files = read;
+        } catch (e) {
+            r.error = `Couldn’t read settings (${e.message})`;
+        } finally {
+            if (seq === r.seq) {
+                r.loading = false;
+                r.loaded = true;   // even after an error: no reload loop
+            }
+        }
+        if (!this._destroyed && seq === r.seq)
+            this._updateClaudeTab(false);
     },
 
     _updateClaudeRules(ui) {
@@ -823,7 +849,7 @@ const ClaudeFeatures = {
         let r = this._claude.rules;
         if (r.armed?.btn === btn) {
             this._disarmClaudeRule();
-            this._editRules(f.path, s => removeRule(s, kind, rule));
+            this._editRules(f.path, s => removeRule(s, kind, rule), f.scope === 'user');
             return;
         }
         this._disarmClaudeRule();
@@ -862,19 +888,28 @@ const ClaudeFeatures = {
         let user = this._claude.rules.files.find(f => f.scope === 'user');
         if ((user?.settings?.permissions?.defaultMode ?? 'default') === mode)
             return;
-        this._editRules(user?.path ?? SETTINGS_PATH, s => setDefaultMode(s, mode));
+        this._editRules(user?.path ?? SETTINGS_PATH, s => setDefaultMode(s, mode), true);
     },
 
-    async _editRules(path, edit) {
+    async _editRules(path, edit, backup) {
         let r = this._claude.rules;
-        r.error = await this._editClaudeSettings(path, edit);
+        r.error = await this._editClaudeSettings(path, edit, backup);
         if (!this._destroyed)
             this._loadClaudeRules();
     },
 
     // Re-read right before writing (Claude Code may have changed the file),
     // apply `edit`, write in the file's own layout. → '' or what went wrong.
-    async _editClaudeSettings(path, edit) {
+    // Edits queue up, so two quick clicks can't both start from the same
+    // copy and undo each other. `backup` only for the user's own file.
+    _editClaudeSettings(path, edit, backup = false) {
+        let c = this._claude;
+        let run = c.edits.then(() => this._editClaudeSettingsNow(path, edit, backup));
+        c.edits = run.catch(() => {});
+        return run;
+    },
+
+    async _editClaudeSettingsNow(path, edit, backup) {
         let cur = await readSettingsAsync(path);
         if (cur.error)
             return cur.error;
@@ -882,7 +917,7 @@ const ClaudeFeatures = {
         if (next === cur.settings)
             return '';
         try {
-            await writeSettingsAsync(cur.path, next, cur.layout);
+            await writeSettingsAsync(cur.path, next, cur.layout, { backup });
             return '';
         } catch (e) {
             return `Couldn’t write ${cur.path} (${e.message})`;
@@ -895,44 +930,72 @@ const ClaudeFeatures = {
     // settings.local.json (not committed). Plugin skills follow their plugin.
     async _loadClaudeExtras() {
         let x = this._claude.extras;
-        let seq = ++x.loading;
-        let cwds = [...new Set([...this._claude.sessions.values()].map(s => s.cwd).filter(Boolean))];
-        let sources = [{ dir: `${CLAUDE_DIR}/skills`, settings: SETTINGS_PATH, where: '' },
-            ...cwds.map(cwd => ({ dir: `${cwd}/.claude/skills`, settings: `${cwd}/.claude/settings.local.json`,
-                where: GLib.path_get_basename(cwd) }))];
-        let [plugins, skills] = await Promise.all([
-            new Promise(resolve => this._runClaude(['plugin', 'list', '--json'], { timeoutS: 30 },
-                (out, err) => resolve({ list: parsePluginList(out ?? ''), err }))),
-            Promise.all(sources.map(src => this._readSkills(src))).then(all => all.flat()),
-        ]);
-        if (this._destroyed || seq !== x.loading)
-            return;
-        x.loading = 0;
-        x.loaded = true;
-        x.plugins = plugins.list;
-        x.error = plugins.list ? '' : (plugins.err ?? 'claude plugin list printed nothing');
-        x.skills = skills;
-        this._updateClaudeTab(false);
+        let seq = ++x.seq;
+        x.key = this._claudeFoldersKey();
+        x.loading = true;
+        try {
+            let sources = skillSources(x.key ? x.key.split('\n') : []);
+            let [plugins, skills] = await Promise.all([
+                new Promise(resolve => this._runClaude(['plugin', 'list', '--json'], { timeoutS: 30 },
+                    (out, err) => resolve({ list: parsePluginList(out ?? ''), err }))),
+                Promise.all(sources.map(src => this._readSkills(src))).then(all => all.flat()),
+            ]);
+            if (this._destroyed || seq !== x.seq)
+                return;
+            x.plugins = plugins.list;
+            x.error = plugins.list ? '' : (plugins.err ?? 'claude plugin list printed nothing');
+            x.skills = skills;
+        } catch (e) {
+            x.error = `Couldn’t read plugins and skills (${e.message})`;
+        } finally {
+            if (seq === x.seq) {
+                x.loading = false;
+                x.loaded = true;
+            }
+        }
+        if (!this._destroyed && seq === x.seq)
+            this._updateClaudeTab(false);
     },
 
     // One skills folder → [{ name, description, state, settings, where }].
     async _readSkills(src) {
+        // All async: a session folder can sit on a network mount.
         let names = await new Promise(resolve => {
             Gio.File.new_for_path(src.dir).enumerate_children_async('standard::name,standard::type',
                 Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_LOW, null, (dir, res) => {
-                    let out = [];
+                    let en;
                     try {
-                        let en = dir.enumerate_children_finish(res);
-                        let info;
-                        while ((info = en.next_file(null)) !== null) {
+                        en = dir.enumerate_children_finish(res);
+                    } catch (e) {
+                        resolve([]);   // no skills folder: no skills
+                        return;
+                    }
+                    let out = [];
+                    let more = () => en.next_files_async(64, GLib.PRIORITY_LOW, null, (e, r) => {
+                        let infos = [];
+                        try {
+                            infos = e.next_files_finish(r);
+                        } catch (err) {
+                            // stop at a read error
+                        }
+                        for (let info of infos) {
                             if (info.get_file_type() === Gio.FileType.DIRECTORY)
                                 out.push(info.get_name());
                         }
-                        en.close(null);
-                    } catch (e) {
-                        // no skills folder: no skills
-                    }
-                    resolve(out);
+                        if (infos.length) {
+                            more();
+                            return;
+                        }
+                        en.close_async(GLib.PRIORITY_LOW, null, (e2, r2) => {
+                            try {
+                                e2.close_finish(r2);
+                            } catch (err) {
+                                // closing can't lose anything here
+                            }
+                        });
+                        resolve(out);
+                    });
+                    more();
                 });
         });
         let settings = (await readSettingsAsync(src.settings)).settings ?? {};
@@ -950,7 +1013,7 @@ const ClaudeFeatures = {
 
     _updateClaudeExtras(ui) {
         let x = this._claude.extras;
-        ui.note.set_text(x.error || x.note || (x.loaded ? 'Plugin changes reach open sessions after /reload-plugins'
+        ui.note.set_text(x.actionError || x.error || x.note || (x.loaded ? 'Plugin changes reach open sessions after /reload-plugins'
             : 'Reading plugins and skills…'));
         let sig = JSON.stringify([x.loaded, x.plugins, x.skills, [...x.busy]]);
         if (sig === ui.sig)
@@ -963,7 +1026,9 @@ const ClaudeFeatures = {
                 let item = this._ccRow(ui.list, p.name, () => this._toggleClaudePlugin(p));
                 item.update(p.enabled, [p.marketplace, p.version, p.scope !== 'user' && p.scope].filter(Boolean).join(' · '),
                     'application-x-addon-symbolic');
-                item.setEnabled(!x.busy.has(p.id));
+                // ponytail: user-scope only — a project plugin's folder isn't
+                // in the list output, so toggling from ~ could hit the wrong one.
+                item.setEnabled(p.scope === 'user' && !x.busy.has(p.id));
             }
         }
         if (x.skills.length) {
@@ -981,14 +1046,14 @@ const ClaudeFeatures = {
 
     _toggleClaudePlugin(p) {
         let x = this._claude.extras;
-        if (x.busy.has(p.id))
+        if (x.busy.has(p.id) || p.scope !== 'user')
             return;
         x.busy.add(p.id);
         this._updateClaudeTab(false);
         this._runClaude(['plugin', p.enabled ? 'disable' : 'enable', p.id, '--scope', p.scope], { timeoutS: 60 }, (out, err) => {
             x.busy.delete(p.id);
-            x.error = err ?? '';
-            x.note = `${p.name} ${p.enabled ? 'off' : 'on'}: open sessions pick it up after /reload-plugins`;
+            x.actionError = err ?? '';
+            x.note = err ? '' : `${p.name} ${p.enabled ? 'off' : 'on'}: open sessions pick it up after /reload-plugins`;
             this._loadClaudeExtras();
         });
     },
@@ -1001,11 +1066,12 @@ const ClaudeFeatures = {
         x.busy.add(key);
         this._updateClaudeTab(false);
         let off = sk.state !== 'off';
-        let err = await this._editClaudeSettings(sk.settings, s => setSkillOverride(s, sk.name, !off));
+        let err = await this._editClaudeSettings(sk.settings, s => setSkillOverride(s, sk.name, !off),
+            sk.settings === SETTINGS_PATH);
         if (this._destroyed)
             return;
         x.busy.delete(key);
-        x.error = err;
+        x.actionError = err;
         x.note = err ? '' : `${sk.name} ${off ? 'off' : 'on'} for new sessions`;
         this._loadClaudeExtras();
     },
@@ -1066,20 +1132,25 @@ const ClaudeFeatures = {
     },
 
     // `claude mcp list` in the newest session's folder (results depend on
-    // it), through the login shell so servers started with npx & co. see the
-    // same PATH as in a terminal. ponytail: one folder per check; other live
-    // folders' .mcp.json servers aren't tested.
-    _checkClaudeMcp() {
+    // it) and with that session's own environment from /proc, so servers
+    // started with npx & co. see the terminal's PATH and variables without
+    // running the user's shell rc. No session: the desktop's environment.
+    // ponytail: one folder per check; other live folders' .mcp.json servers
+    // aren't tested.
+    async _checkClaudeMcp() {
         let c = this._claude;
         let m = c.mcp;
         if (m.running)
             return;
         let newest = [...c.sessions.values()].filter(s => s.cwd).sort((a, b) => b.startedAt - a.startedAt)[0];
-        let folder = newest?.folder || '~';
         m.running = true;
         m.error = '';
         this._updateClaudeTab(false);
-        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, viaShell: true, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err) => {
+        let env = newest ? parseEnviron(await read(`/proc/${newest.pid}/environ`, null) ?? '') : [];
+        if (this._destroyed)
+            return;
+        let folder = newest?.folder || '~';
+        this._runClaude(['mcp', 'list'], { cwd: newest?.cwd, env, timeoutS: MCP_CHECK_TIMEOUT_S }, (out, err) => {
             m.running = false;
             let servers = parseMcpList(out ?? '');
             if (servers.length || /No MCP servers/.test(out ?? ''))
@@ -1090,38 +1161,44 @@ const ClaudeFeatures = {
         });
     },
 
-    // Run `claude <args>`; done(stdout | null, error | null). viaShell runs
-    // it inside the user's interactive shell (their rc sets PATH for nvm &
-    // co.). Killed after timeoutS and on disable.
-    _runClaude(args, { cwd = null, viaShell = false, timeoutS = 30 } = {}, done) {
+    // Run `claude <args>`; done(stdout | null, error | null). `env` (a list
+    // of NAME=value) replaces the environment when given. After timeoutS
+    // it gets SIGTERM (claude stops the servers it started), SIGKILL 5 s
+    // later; disable() kills at once.
+    _runClaude(args, { cwd = null, env = null, timeoutS = 30 } = {}, done) {
         let bin = claudeBinary();
         if (!bin) {
             done(null, 'Claude Code (claude) isn\u2019t on this computer\u2019s PATH');
             return;
         }
-        let argv = viaShell
-            ? [GLib.getenv('SHELL') || '/bin/sh', '-ic', `exec ${[bin, ...args].map(a => GLib.shell_quote(a)).join(' ')}`]
-            : [bin, ...args];
         let launcher = new Gio.SubprocessLauncher({ flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE });
         launcher.set_cwd(cwd || GLib.get_home_dir());
+        if (env?.length)
+            launcher.set_environ(env);
         let proc;
         try {
-            proc = launcher.spawnv(argv);
+            proc = launcher.spawnv([bin, ...args]);
         } catch (e) {
             done(null, `Couldn\u2019t run claude (${e.message})`);
             return;
         }
         let procs = this._claude.procs;
-        procs.set(proc, GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutS, () => {
-            procs.set(proc, 0);
-            proc.force_exit();
+        let entry = { id: 0, timedOut: false };
+        procs.set(proc, entry);
+        entry.id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, timeoutS, () => {
+            entry.timedOut = true;
+            proc.send_signal(15);
+            entry.id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+                entry.id = 0;
+                proc.force_exit();
+                return GLib.SOURCE_REMOVE;
+            });
             return GLib.SOURCE_REMOVE;
-        }));
+        });
         proc.communicate_utf8_async(null, null, (p, res) => {
-            let id = procs.get(p);
-            if (id)
-                GLib.Source.remove(id);
-            let timedOut = procs.get(p) === 0;
+            if (entry.id)
+                GLib.Source.remove(entry.id);
+            entry.id = 0;
             procs.delete(p);
             let out = null;
             try {
@@ -1131,7 +1208,8 @@ const ClaudeFeatures = {
             }
             if (this._destroyed)
                 return;
-            done(out, timedOut ? `claude ${args.join(' ')} took too long` : (p.get_successful() ? null : `claude ${args.join(' ')} failed`));
+            done(out, entry.timedOut ? `claude ${args.join(' ')} took too long`
+                : (p.get_successful() ? null : `claude ${args.join(' ')} failed`));
         });
     },
 

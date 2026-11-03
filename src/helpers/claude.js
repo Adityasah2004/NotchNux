@@ -254,7 +254,7 @@ const BODY_CHARS = 240;
 
 // Invisible or reordering characters (controls, bidi overrides) would make
 // the banner read differently from what gets approved: shown as a marker.
-const HIDDEN = /[\u0000-\u0008\u000B-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const HIDDEN = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u061C\u200B-\u200F\u2028-\u202E\u2060-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
 
 // → { body, exact }: exact when the banner shows the whole text as is.
 function clip(text) {
@@ -265,9 +265,40 @@ function clip(text) {
 
 const base = p => (typeof p === 'string' && p ? GLib.path_get_basename(p) : '');
 
-// Hook input → the banner's { title, body, exact }: "<session> wants to
-// <action>" over the command / file / URL. `exact` is false when the body is
-// cut or masked — then the banner offers no Allow. Never logged.
+// Per tool, the input keys the banner shows or that don't change what runs.
+// Anything else (dangerouslyDisableSandbox, …) makes the request not exact.
+const SHOWN_KEYS = {
+    Bash: ['command', 'description', 'timeout', 'run_in_background'],
+    Read: ['file_path', 'offset', 'limit'],
+    WebFetch: ['url', 'prompt'],
+};
+
+// "Always allow" only when every suggestion is a plain allow rule for this
+// tool, shown as text (e.g. "Bash(npm test:*)"); anything else (a mode
+// switch, directories, another tool) isn't offered from the notch.
+function alwaysRules(req, tool) {
+    let sugg = req?.permission_suggestions;
+    if (!Array.isArray(sugg) || !sugg.length)
+        return null;
+    let rules = [];
+    for (let s of sugg) {
+        if (s?.type !== 'addRules' || s.behavior !== 'allow' || !Array.isArray(s.rules) || !s.rules.length)
+            return null;
+        for (let r of s.rules) {
+            if (r?.toolName !== tool || (r.ruleContent != null && typeof r.ruleContent !== 'string'))
+                return null;
+            rules.push(r.ruleContent ? `${tool}(${r.ruleContent})` : tool);
+        }
+    }
+    let text = rules.join(', ');
+    return clip(text).exact ? text : null;
+}
+
+// Hook input → the banner's { title, body, exact, always }: "<session> wants
+// to <action>" over the command / file / URL. `exact` is false when the
+// banner can't show everything that would be allowed (cut or masked text,
+// an edit's content, an unshown option) — then it offers no Allow.
+// `always`: the rule "Always allow" adds, or null. Never logged.
 export function describeRequest(req, name = '') {
     let tool = String(req?.tool_name ?? '');
     let input = req?.tool_input && typeof req.tool_input === 'object' ? req.tool_input : {};
@@ -293,7 +324,10 @@ export function describeRequest(req, name = '') {
         [action, body] = [`use ${tool || 'a tool'}`, JSON.stringify(input)];
     }
     let who = name || base(req?.cwd) || 'Claude Code';
-    return { title: `${who} wants to ${action}`, ...clip(typeof body === 'string' ? body : '') };
+    let shown = clip(typeof body === 'string' ? body : '');
+    let keysShown = !(tool in SHOWN_KEYS) || Object.keys(input).every(k => SHOWN_KEYS[tool].includes(k));
+    let exact = shown.exact && keysShown && !EDIT_TOOLS.has(tool);
+    return { title: `${who} wants to ${action}`, body: shown.body, exact, always: exact ? alwaysRules(req, tool) : null };
 }
 
 // The hook's HTTP response body for 'allow' | 'always' | 'deny' | 'none'.
@@ -374,14 +408,18 @@ export function formatSettings(settings, { indent, eol }) {
 
 // ---- MCP health ----
 
-// The auth cache → Map(server name → when it was found needing a login, ms).
+// The auth cache → Map(server name → when it was found needing a login,
+// ms); empty when there's no file, null when it was caught mid-write (keep
+// the last one, or every name would look new).
 export function parseNeedsAuth(text) {
     let out = new Map();
+    if (!text)
+        return out;
     let data;
     try {
         data = JSON.parse(text);
     } catch (e) {
-        return out;   // missing or caught mid-write
+        return null;
     }
     for (let [name, v] of Object.entries(data && typeof data === 'object' ? data : {}))
         out.set(name, typeof v?.timestamp === 'number' ? v.timestamp : 0);
@@ -496,10 +534,25 @@ export function claudeSettingsFiles(cwds) {
 // → { path, settings, layout } or { path, error }. A symlinked file is
 // followed so writes land on the real file; a missing one reads as {}.
 // Anything that isn't a JSON object is an error and is never written.
+// All async: a session folder can sit on a network mount.
 export function readSettingsAsync(path, cancellable = null) {
-    if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK))
-        path = GLib.canonicalize_filename(GLib.file_read_link(path), GLib.path_get_dirname(path));
     return new Promise(resolve => {
+        Gio.File.new_for_path(path).query_info_async('standard::is-symlink,standard::symlink-target',
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, GLib.PRIORITY_DEFAULT, cancellable, (link, linkRes) => {
+                try {
+                    let info = link.query_info_finish(linkRes);
+                    if (info.get_is_symlink())
+                        path = GLib.canonicalize_filename(info.get_symlink_target(), GLib.path_get_dirname(path));
+                } catch (e) {
+                    // missing: the read below says so
+                }
+                loadSettings(path, cancellable, resolve);
+            });
+    });
+}
+
+function loadSettings(path, cancellable, resolve) {
+    {
         Gio.File.new_for_path(path).load_contents_async(cancellable, (f, res) => {
             try {
                 let [, bytes] = f.load_contents_finish(res);
@@ -515,17 +568,18 @@ export function readSettingsAsync(path, cancellable = null) {
                     resolve({ path, error: `Can’t read ${path} (${e.message})` });
             }
         });
-    });
+    }
 }
 
-// In the file's own layout; the previous file is kept as <name>~.
-// ponytail: read-modify-write without a lock — Claude Code seldom writes
-// these files; lock if a lost edit ever shows up.
-export function writeSettingsAsync(path, settings, layout) {
-    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
+// In the file's own layout. `backup` keeps the old file as <name>~ — only
+// for ~/.claude/settings.json: in a project it would sit untracked in the
+// repo. Never creates folders (every file these views write sits in a
+// folder that exists). ponytail: read-modify-write without a lock — Claude
+// Code seldom writes these files; lock if a lost edit ever shows up.
+export function writeSettingsAsync(path, settings, layout, { backup = false } = {}) {
     let bytes = new GLib.Bytes(new TextEncoder().encode(formatSettings(settings, layout)));
     return new Promise((resolve, reject) => {
-        Gio.File.new_for_path(path).replace_contents_bytes_async(bytes, null, true, Gio.FileCreateFlags.NONE, null,
+        Gio.File.new_for_path(path).replace_contents_bytes_async(bytes, null, backup, Gio.FileCreateFlags.NONE, null,
             (f, res) => {
                 try {
                     f.replace_contents_finish(res);
@@ -599,4 +653,24 @@ export function setSkillOverride(settings, name, on) {
     if (!Object.keys(rest).length)
         delete out.skillOverrides;
     return out;
+}
+
+// Where skills live: personal ones (they follow the user's settings), then
+// each other live folder's own (its settings.local.json, not committed). A
+// session in ~ adds nothing: its .claude/skills is the personal folder.
+export function skillSources(cwds) {
+    let out = [{ dir: `${CLAUDE_DIR}/skills`, settings: SETTINGS_PATH, where: '' }];
+    for (let cwd of new Set(cwds)) {
+        if (!cwd || cwd === HOME)
+            continue;
+        out.push({ dir: `${cwd}/.claude/skills`, settings: `${cwd}/.claude/settings.local.json`,
+            where: GLib.path_get_basename(cwd) });
+    }
+    return out;
+}
+
+// /proc/<pid>/environ → ['NAME=value', …]: a live session's environment, so
+// `claude mcp list` sees the same PATH and variables as in its terminal.
+export function parseEnviron(text) {
+    return String(text).split('\0').filter(e => e.includes('='));
 }

