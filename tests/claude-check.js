@@ -6,6 +6,8 @@ import Gio from 'gi://Gio';
 import {
     parseSession, procStat, isLive, alertFor, parseUsage, sortSessions, pillDots,
     fmtAge, wrapCommand, unwrapCommand, isConnected, connectStatusLine, disconnectStatusLine,
+    APPROVE_URL, passThrough, describeRequest, decisionBody,
+    isApproveConnected, connectApproveHook, disconnectApproveHook,
 } from '../src/helpers/claude.js';
 
 let n = 0;
@@ -94,6 +96,58 @@ eq(text(disconnectStatusLine(connectStatusLine(bare))), text(bare), 'no statusLi
 eq(disconnectStatusLine(original), original, 'disconnect of a foreign command is a no-op');
 let tricky = `echo "it's \\"quoted\\"" | cat; printf '%s' $HOME`;
 eq(unwrapCommand(wrapCommand(tricky)), tricky, 'quotes, pipes and $ survive');
+
+// ---- approve from the notch: request handling ----
+eq(parseSession(sess({ sessionId: 'abc-1', status: 'idle' })).sessionId, 'abc-1', 'sessionId parsed');
+eq(parseSession(sess({ status: 'idle' })).sessionId, '', 'no sessionId → empty');
+const req = (tool_name, tool_input = {}, extra = {}) => ({ session_id: 'abc-1', cwd: '/home/u/Projetos/NotchNux', tool_name, tool_input, ...extra });
+ok(passThrough(req('Bash', {}, { agent_id: 'a1' })), 'subagent prompt goes to the terminal');
+for (let t of ['ExitPlanMode', 'AskUserQuestion', 'dialogFoo'])
+    ok(passThrough(req(t)), `${t} goes to the terminal`);
+ok(!passThrough(req('Bash', { command: 'ls' })), 'main-session Bash is held');
+eq(describeRequest(req('Bash', { command: 'npm test' }), 'notchnux-bf'),
+    { title: 'notchnux-bf wants to run a command', body: 'npm test' }, 'Bash');
+eq(describeRequest(req('Edit', { file_path: '/x/src/a.js' }), 'nn'), { title: 'nn wants to edit a.js', body: '/x/src/a.js' }, 'Edit');
+eq(describeRequest(req('NotebookEdit', { notebook_path: '/x/n.ipynb' }), 'nn').title, 'nn wants to edit n.ipynb', 'NotebookEdit');
+eq(describeRequest(req('Read', { file_path: '/etc/hosts' }), 'nn').title, 'nn wants to read hosts', 'Read');
+eq(describeRequest(req('WebFetch', { url: 'https://docs.example.com/a?b=1' }), 'nn'),
+    { title: 'nn wants to fetch docs.example.com', body: 'https://docs.example.com/a?b=1' }, 'WebFetch');
+eq(describeRequest(req('mcp__claude_ai_Canva__create-design', { q: 1 }), 'nn'),
+    { title: 'nn wants to use claude_ai_Canva · create-design', body: '{"q":1}' }, 'MCP tool');
+eq(describeRequest(req('Glob', { pattern: '*.js' }), 'nn'), { title: 'nn wants to use Glob', body: '{"pattern":"*.js"}' }, 'other tool');
+eq(describeRequest(req('Bash', { command: 'ls' })).title, 'NotchNux wants to run a command', 'no session name → folder');
+let long = describeRequest(req('Bash', { command: 'a\nb\nc\nd\ne\nf' }), 'nn').body;
+eq(long, 'a\nb\nc\nd…', 'body capped at 4 lines');
+ok(describeRequest(req('Bash', { command: 'x'.repeat(500) }), 'nn').body.length <= 241, 'body capped at 240 chars');
+ok(describeRequest(req('Bash', {}), 'nn').body === '', 'missing command → empty body');
+
+const sugg = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'npm test' }], behavior: 'allow', destination: 'localSettings' }];
+const decision = (kind, r) => JSON.parse(decisionBody(kind, r)).hookSpecificOutput;
+eq(decision('allow', req('Bash')), { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } }, 'allow');
+eq(decision('always', req('Bash', {}, { permission_suggestions: sugg })).decision,
+    { behavior: 'allow', updatedPermissions: sugg }, 'always allow carries the suggestions verbatim');
+eq(decision('deny', req('Bash')).decision, { behavior: 'deny', message: 'Denied from NotchNux' }, 'deny');
+eq(decisionBody('none', req('Bash')), '{}', 'no decision');
+
+// ---- approve from the notch: hook connect / disconnect ----
+ok(APPROVE_URL === 'http://127.0.0.1:47391/claude/permission', 'hook URL');
+let hooked = connectApproveHook(original, 'tok-1');
+ok(isApproveConnected(hooked) && !isApproveConnected(original), 'isApproveConnected');
+eq(hooked.hooks.PermissionRequest, [{ hooks: [{ type: 'http', url: APPROVE_URL, timeout: 600,
+    headers: { 'X-NotchNux-Token': 'tok-1' } }] }], 'hook entry');
+eq(text(disconnectApproveHook(JSON.parse(text(hooked)))), text(original), 'no hooks before → exact restore');
+eq(connectApproveHook(hooked, 'tok-1'), hooked, 'connect is idempotent');
+eq(connectApproveHook(hooked, 'tok-2').hooks.PermissionRequest[0].hooks[0].headers['X-NotchNux-Token'], 'tok-2',
+    'reconnect replaces the token');
+eq(connectApproveHook(hooked, 'tok-2').hooks.PermissionRequest.length, 1, 'reconnect keeps one entry');
+const foreign = { model: 'opus', hooks: { PermissionRequest: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'x' }] }],
+    Stop: [{ hooks: [{ type: 'command', command: 'y' }] }] }, env: { A: '1' } };
+let both = connectApproveHook(foreign, 'tok-1');
+eq(both.hooks.PermissionRequest.length, 2, 'foreign PermissionRequest hook kept');
+eq(text(disconnectApproveHook(JSON.parse(text(both)))), text(foreign), 'foreign hooks → exact restore');
+eq(disconnectApproveHook(foreign), foreign, 'disconnect without our hook is a no-op');
+eq(text(disconnectApproveHook(connectApproveHook(connectStatusLine(original), 't'))), text(connectStatusLine(original)),
+    'status line wiring untouched');
 
 // ---- run the wrapped command for real, in a scratch HOME ----
 let home = GLib.dir_make_tmp('nn-claude-XXXXXX');

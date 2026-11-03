@@ -48,6 +48,7 @@ export function parseSession(text) {
     let folder = s.cwd ? GLib.path_get_basename(s.cwd) : '';
     return {
         pid: s.pid,
+        sessionId: typeof s.sessionId === 'string' ? s.sessionId : '',
         procStart: s.procStart == null ? '' : String(s.procStart),
         name: s.name || folder || `Session ${s.pid}`,
         folder,
@@ -203,4 +204,120 @@ export function disconnectStatusLine(settings) {
     else
         delete out.statusLine;
     return out;
+}
+
+// ---- Approve from the notch ----
+//
+// Claude Code's PermissionRequest hook runs alongside the terminal's
+// permission dialog: whichever answers first wins. Preferences adds an HTTP
+// hook pointing at a tiny server the shell runs on 127.0.0.1 (tabs/claude.js),
+// which holds each request until a banner button is clicked. No answer
+// (connection refused, `{}`) leaves the terminal dialog in charge.
+export const APPROVE_PORT = 47391;
+export const APPROVE_PATH = '/claude/permission';
+export const APPROVE_URL = `http://127.0.0.1:${APPROVE_PORT}${APPROVE_PATH}`;
+export const TOKEN_HEADER = 'X-NotchNux-Token';
+
+// Answered at once with no decision, so only the terminal handles them:
+// inside a subagent Claude Code waits for the hook *before* showing its
+// dialog (holding it would hide the prompt); plan approval and questions
+// need more than allow/deny.
+const TERMINAL_ONLY = new Set(['ExitPlanMode', 'AskUserQuestion']);
+export function passThrough(req) {
+    let tool = String(req?.tool_name ?? '');
+    return !!req?.agent_id || TERMINAL_ONLY.has(tool) || tool.startsWith('dialog');
+}
+
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const BODY_LINES = 4;
+const BODY_CHARS = 240;
+
+function clip(text) {
+    let out = text.split('\n').slice(0, BODY_LINES).join('\n').slice(0, BODY_CHARS);
+    return out === text ? out : `${out.trimEnd()}…`;
+}
+
+const base = p => (typeof p === 'string' && p ? GLib.path_get_basename(p) : '');
+
+// Hook input → the banner's { title, body }: "<session> wants to <action>"
+// over the exact command / file / URL. Never logged.
+export function describeRequest(req, name = '') {
+    let tool = String(req?.tool_name ?? '');
+    let input = req?.tool_input && typeof req.tool_input === 'object' ? req.tool_input : {};
+    let action, body, m;
+    if (tool === 'Bash') {
+        [action, body] = ['run a command', input.command];
+    } else if (EDIT_TOOLS.has(tool)) {
+        body = input.file_path ?? input.notebook_path;
+        action = `edit ${base(body)}`;
+    } else if (tool === 'Read') {
+        [action, body] = [`read ${base(input.file_path)}`, input.file_path];
+    } else if (tool === 'WebFetch') {
+        let host = '';
+        try {
+            host = GLib.Uri.parse(String(input.url), GLib.UriFlags.NONE).get_host() ?? '';
+        } catch (e) {
+            // not a URL: show it as is
+        }
+        [action, body] = [`fetch ${host || 'a page'}`, input.url];
+    } else if ((m = /^mcp__(.+?)__(.+)$/.exec(tool))) {
+        [action, body] = [`use ${m[1]} · ${m[2]}`, JSON.stringify(input)];
+    } else {
+        [action, body] = [`use ${tool || 'a tool'}`, JSON.stringify(input)];
+    }
+    let who = name || base(req?.cwd) || 'Claude Code';
+    return { title: `${who} wants to ${action}`, body: clip(typeof body === 'string' ? body : '') };
+}
+
+// The hook's HTTP response body for 'allow' | 'always' | 'deny' | 'none'.
+// "Always allow" sends Claude Code's own suggestions back unchanged, so the
+// rule lands where the terminal's option 2 would put it.
+export function decisionBody(kind, req) {
+    if (kind === 'none')
+        return '{}';
+    let decision = kind === 'deny'
+        ? { behavior: 'deny', message: 'Denied from NotchNux' }
+        : { behavior: 'allow' };
+    if (kind === 'always' && Array.isArray(req?.permission_suggestions) && req.permission_suggestions.length)
+        decision.updatedPermissions = req.permission_suggestions;
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
+}
+
+// ---- Hook wiring (used by Preferences), same contract as the status line:
+// pure settings in → settings out, other hooks untouched, Disconnect
+// restores the file exactly.
+const isOurHook = h => h?.type === 'http' && h.url === APPROVE_URL;
+
+export function isApproveConnected(settings) {
+    let list = settings?.hooks?.PermissionRequest;
+    return Array.isArray(list) && list.some(m => Array.isArray(m?.hooks) && m.hooks.some(isOurHook));
+}
+
+export function disconnectApproveHook(settings) {
+    if (!isApproveConnected(settings))
+        return settings;
+    let kept = settings.hooks.PermissionRequest
+        .map(m => (Array.isArray(m?.hooks) ? { ...m, hooks: m.hooks.filter(h => !isOurHook(h)) } : m))
+        .filter(m => !Array.isArray(m?.hooks) || m.hooks.length > 0);
+    let hooks = { ...settings.hooks };
+    if (kept.length)
+        hooks.PermissionRequest = kept;
+    else
+        delete hooks.PermissionRequest;
+    let out = { ...settings };
+    if (Object.keys(hooks).length)
+        out.hooks = hooks;
+    else
+        delete out.hooks;
+    return out;
+}
+
+// Connecting again replaces the token (Preferences re-connects when the
+// config lost it).
+export function connectApproveHook(settings, token) {
+    let s = disconnectApproveHook(settings);
+    let hooks = s.hooks ?? {};
+    let list = Array.isArray(hooks.PermissionRequest) ? hooks.PermissionRequest : [];
+    let entry = { hooks: [{ type: 'http', url: APPROVE_URL, timeout: 600, headers: { [TOKEN_HEADER]: token } }] };
+    return { ...s, hooks: { ...hooks, PermissionRequest: [...list, entry] } };
 }
