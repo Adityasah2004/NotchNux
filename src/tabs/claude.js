@@ -32,7 +32,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {
     SESSIONS_DIR, USAGE_PATH, SESSION_FILE, parseSession, procStat, isLive, alertFor,
     parseUsage, sortSessions, pillDots, fmtAge,
-    APPROVE_PATH, approveSocketPath, passThrough, describeRequest, decisionBody,
+    APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
 } from '../helpers/claude.js';
 import { readTextAsync } from '../helpers/productivity.js';
 import { fmt } from '../helpers/format.js';
@@ -47,8 +47,10 @@ const ALERT_MS = 4000;
 const DONE_GREY = 'rgba(255, 255, 255, 0.35)';
 const STATE_TEXT = { working: 'Working', approval: 'Needs approval', question: 'Has a question', done: 'Done' };
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
-// The hook times out after 600 s; a click after that would do nothing.
-const REQUEST_MAX_AGE_MS = 590 * 1000;
+// Gone before the hook times out (a click after that would do nothing), even
+// when the cut-off falls just after a sweep. Monotonic, like Claude Code's
+// timer: a suspend doesn't age a request.
+const REQUEST_MAX_AGE_US = (HOOK_TIMEOUT_S - SWEEP_S - 5) * 1e6;
 // A click this soon after a banner (re)appears is the tail of a double-click
 // meant for the one before it.
 const CLICK_GUARD_US = 500 * 1000;
@@ -141,7 +143,7 @@ const ClaudeFeatures = {
             c.monitor = Gio.File.new_for_path(SESSIONS_DIR).monitor_directory(Gio.FileMonitorFlags.NONE, null);
             c.monitorId = c.monitor.connect('changed', () => this._queueClaudeRead());
         } catch (e) {
-            logError(e, 'Claude sessions monitor');
+            logError('Claude sessions monitor', e);
         }
         c.sweepId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, SWEEP_S, () => {
             this._readClaude();
@@ -248,6 +250,9 @@ const ClaudeFeatures = {
             c.unseen.clear();
         c.sessions = next;
         c.usage = usage;
+        // A socket that couldn't be opened is retried with every read.
+        if (this._config.claudeApprove)
+            this._startClaudeApprove();
         this._sweepClaudeRequests();
         this._syncPillClaude();
         if (this._invalidateTab('claude'))
@@ -396,7 +401,7 @@ const ClaudeFeatures = {
 
         let c = this._claude;
         msg.pause();
-        let r = { req, msg, sessionId: String(req.session_id ?? ''), at: Date.now(), seenWaiting: false };
+        let r = { req, msg, sessionId: String(req.session_id ?? ''), at: GLib.get_monotonic_time(), seenWaiting: false };
         c.requests.push(r);
         // A session shows one dialog at a time: a new request means its
         // older ones were answered in the terminal. "No decision" is safe
@@ -429,13 +434,13 @@ const ClaudeFeatures = {
         let c = this._claude;
         if (!c.requests.length)
             return;
-        let now = Date.now();
+        let now = GLib.get_monotonic_time();
         for (let r of [...c.requests]) {
             let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
             let waiting = s?.state === 'approval' || s?.state === 'question';
             if (waiting)
                 r.seenWaiting = true;
-            if (now - r.at > REQUEST_MAX_AGE_MS || (r.seenWaiting && !waiting))
+            if (now - r.at > REQUEST_MAX_AGE_US || (r.seenWaiting && !waiting))
                 this._answerClaudeRequest(r, 'none');
         }
     },
