@@ -2431,6 +2431,15 @@
 .nn-cc-list {
     padding: 10px 14px 10px 14px;
 }
+.nn-cc-fan {
+    spacing: 8px;
+}
+.nn-cc-fan .nook-segmented {
+    margin: 0;
+}
+.nn-cc-fan-note {
+    padding: 0 2px;
+}
 .nn-cc-list.nn-cc-devcard {
     padding: 10px 8px 10px 8px;
 }

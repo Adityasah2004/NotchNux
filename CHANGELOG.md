@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — temperatures and fan control (beta)
+- Preferences → **Temperatures & fan**, all off by default and read from
+  the kernel's hardware sensors (`/sys/class/hwmon`):
+  - **Temperature in the pill**: one sensor (CPU, SSD or GPU, whichever
+    this computer has) next to the pill's stats, coloured as it warms up.
+  - **Temperatures in Tray**: every sensor that reports gets a meter in the
+    Tray's System card. A GPU that's asleep (or an NVIDIA card, which
+    doesn't report there) is left out rather than woken up.
+  - **Fan control (beta)**: Auto · Low · Med · High · Max · Off in Tray,
+    with the fan speed. It stays locked until you run
+    `sudo sh src/tools/fan-setup.sh` once (it lets your user set the fan's
+    `pwm` files; `--remove` undoes it). A manual level goes back to Auto
+    when the CPU reaches 85 °C or can't be read, when you turn the setting
+    off, and when NotchNux stops (screen lock, logout); it is never
+    restored at login. On ThinkPads the setup also turns on the firmware's
+    2-minute fan watchdog, so even a crash can't leave the fan off.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.

@@ -36,12 +36,12 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 | 📅 | **Calendar** | A scrollable day strip with your events pulled from GNOME Online Accounts — scroll the dates to jump between days. |
 | 🔔 | **Alerts** | Notification history, and a **peek** mode where the pill expands into a banner with action buttons the moment a notification arrives. |
 | 🗂️ | **Shelf** | A click-to-browse / paste-a-file scratch space, plus **Quick Share** to send files to your phone and other paired [GSConnect](https://github.com/GSConnect/gnome-shell-extension-gsconnect) devices. |
-| 🖥️ | **Tray / System** | A Control Center: Wi-Fi, Bluetooth, hotspot and airplane toggles with in-notch network and device pickers; Silence, Night Light, screenshot and lock tiles; volume and brightness sliders; device batteries; and live CPU, memory, disk and network. |
+| 🖥️ | **Tray / System** | A Control Center: Wi-Fi, Bluetooth, hotspot and airplane toggles with in-notch network and device pickers; Silence, Night Light, screenshot and lock tiles; volume and brightness sliders; device batteries; and live CPU, memory, disk and network. Optional: CPU, SSD and GPU temperatures, and fan levels (Auto · Low · Med · High · Max · Off, beta, [one-time setup](#fan-control-beta-optional)). |
 | 🏝️ | **Island alerts** | Volume, brightness, charging, low battery, headphones and a 5-minute event heads-up grow out of the pill for a moment, one at a time. |
 | 🫥 | **Hide when idle** | Optional: the notch tucks into the top edge until something is live, or you rest the pointer at the top centre. |
 | 🔲 | **Grid launcher** | Home plus up to five shortcuts in the header; everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
 | 📋 | **Clipboard** | The last 20 text clips with search and pins. Passwords are skipped; only pinned clips are saved. |
-| ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
+| ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU (plus, optionally, the CPU, SSD or GPU temperature) in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
 | 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |
 
 ### Collapsed pill indicators
@@ -140,6 +140,19 @@ dbus-run-session -- gnome-shell --devkit --wayland
 dbus-run-session -- gnome-shell --nested --wayland
 ```
 
+### Fan control (beta, optional)
+Temperatures need nothing extra. Setting the fan level from the Tray needs a one-time setup that you run yourself (NotchNux never runs it):
+```bash
+sudo sh ~/.local/share/gnome-shell/extensions/notchnux@adityasah.programs/src/tools/fan-setup.sh
+```
+Then turn on **Fan control (beta)** in Preferences → *Temperatures & fan*. The switch stays greyed out until the setup has run, and its Copy button gives you this same command.
+
+- It adds a udev rule (`/etc/udev/rules.d/90-notchnux-fan.rules`) that gives your user the fan's `pwm` files, and nothing else.
+- On a ThinkPad it also turns on the firmware's fan watchdog: a manual level nobody re-sends for 2 minutes goes back to Auto (NotchNux re-sends it every minute). This applies to levels set any other way too, such as `echo level 0 > /proc/acpi/ibm/fan`. If `thinkpad_acpi` has fan control off, the script turns it on in `/etc/modprobe.d/notchnux-fan.conf` and asks for one reboot.
+- `--no-watchdog` sets up without the ThinkPad watchdog; `--remove` undoes everything.
+
+NotchNux puts the fan back to Auto when the CPU reaches 85 °C or can't be read, when you turn the setting off, and when it stops (screen lock, logout). It never restores a manual level at login.
+
 ## 🕹️ Usage
 
 - **Hover or click the pill** to open the dashboard; click outside to collapse it.
@@ -177,6 +190,7 @@ Everything is stored locally, readable only by you (`0600` files in `0700` folde
   Bluetooth, brightness, weather fallbacks), start GNOME Shell with
   `NOTCHNUX_DEBUG=1` in its environment.
 - **Clipboard tab missing** → clipboard history is opt-in; enable it in Preferences → Tabs.
+- **Fan control (beta) greyed out** → run the [one-time setup](#fan-control-beta-optional), and reboot if it asks you to. It's hidden when no fan here can be set by software.
 
 ## 🤝 Contributing
 

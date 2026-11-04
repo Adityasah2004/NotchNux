@@ -1,7 +1,7 @@
 {
   "uuid": "notchnux@adityasah.programs",
   "name": "NotchNux",
-  "description": "A dynamic pill-shaped Notch and dashboard for GNOME: tasks, a focus timer, notes, music, calendar, weather, notifications, system controls, a file shelf and wallpaper rotation.\n\nClipboard: the optional Clipboard tab (off by default) keeps a local history of copied text; the Shelf and Notes only write to the clipboard when you press Copy. Clipboard data never leaves your machine.\n\nNetwork: the Weather tab queries Open-Meteo (and OpenStreetMap Nominatim to look up a city), and Music lyrics are looked up on LRCLIB, only when those tabs are used.",
+  "description": "A dynamic pill-shaped Notch and dashboard for GNOME: tasks, a focus timer, notes, music, calendar, weather, notifications, system controls, a file shelf and wallpaper rotation.\n\nClipboard: the optional Clipboard tab (off by default) keeps a local history of copied text; the Shelf and Notes only write to the clipboard when you press Copy. Clipboard data never leaves your machine.\n\nNetwork: the Weather tab queries Open-Meteo (and OpenStreetMap Nominatim to look up a city), and Music lyrics are looked up on LRCLIB, only when those tabs are used.\n\nSensors: optional temperatures read /sys/class/hwmon; optional fan control (beta) writes the fan's pwm files only after you run the included one-time setup script yourself.",
   "version": 8,
   "version-name": "1.6.1",
   "url": "https://github.com/Adityasah2004/NotchNux",

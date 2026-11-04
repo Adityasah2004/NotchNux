@@ -27,10 +27,19 @@ import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 import { addPressFeedback } from '../helpers/motion.js';
 import { accentHex, accentRgbStr } from '../helpers/widgets.js';
+import { logError } from '../helpers/log.js';
+import {
+    discoverHwmon, pickSensors, pickFan, readText, readTemp, tempLevel, SENSOR_KINDS, FAN_LEVELS, FAN_GUARD_C,
+    fanLevelOf, fanWrites, writeSysfs, fanUsable, fmtRpm,
+} from '../helpers/sensors.js';
 
 const NIGHT_LIGHT_SCHEMA = 'org.gnome.settings-daemon.plugins.color';
 const DEV_CAP = 3;
 const HOT = 85;   // meter turns amber past this
+// Fan (beta): how often a manual level checks the CPU, and re-sends itself
+// (a ThinkPad's fan watchdog hands the fan back after 120 s of silence).
+const FAN_TICK_S = 5;
+const FAN_RESEND_S = 60;
 
 function label(text, cls, props = {}) {
     let l = new St.Label({ text, style_class: cls, y_align: Clutter.ActorAlign.CENTER, ...props });
@@ -142,8 +151,18 @@ const TrayFeatures = {
         net.add_child(up);
         sysCard.add_child(net);
         this._trayMeters.net = { down, up };
+        this._trayMeters.temps = [];
+        if (this._config.trayTemps)
+            this._addTrayTemps(sysCard, this._trayMeters);
         lower.add_child(sysCard);
         panel.add_child(lower);
+
+        // ---- Row 3b: fan levels (beta), once the one-time setup ran ----
+        if (this._config.fanControl) {
+            let slot = new St.BoxLayout({ vertical: true, x_expand: true });
+            panel.add_child(slot);
+            this._addTrayFan(slot, ui);
+        }
 
         // ---- Row 4: mirrored top-bar indicators ----
         if (this._config.isFeatureEnabled('mirrorTray')) {
@@ -295,14 +314,15 @@ const TrayFeatures = {
         let val = label('', 'nn-cc-meter-val');
         row.add_child(val);
         parent.add_child(row);
-        return { fill, val, hot: null };
+        return { row, fill, val, hot: null };
     },
 
-    _setMeter(m, pct, animate) {
+    // `text` replaces the "42%" value; `hot` the amber-past-HOT rule.
+    _setMeter(m, pct, animate, text = null, hot = null) {
         if (!m) return;
         pct = Math.max(0, Math.min(100, Math.round(pct)));
-        m.val.set_text(`${pct}%`);
-        let hot = pct >= HOT;
+        m.val.set_text(text ?? `${pct}%`);
+        hot ??= pct >= HOT;
         if (hot !== m.hot) {
             m.hot = hot;
             m.fill.set_style(`background-color: ${hot ? '#ff9f0a' : accentHex()};`);
@@ -322,7 +342,213 @@ const TrayFeatures = {
         this._setMeter(m.disk, this._system.getDiskUsage(), animate);
         m.net.down.set_text(this._system.getNetDownLabel());
         m.net.up.set_text(this._system.getNetUpLabel());
+        this._updateTrayTemps(m, animate);
+        this._updateTrayFan();
         this._syncTraySliders();
+    },
+
+    // ---- Temperatures (Tray SYSTEM card) and fan levels (beta) ----
+
+    // Sensors, found once per session (helpers/sensors.js). ponytail: one
+    // that appears later (a hot-plugged drive) shows after the next login.
+    _ensureSensors() {
+        this._sensors ??= discoverHwmon()
+            .then(chips => ({ picked: pickSensors(chips), fan: pickFan(chips) }))
+            .catch(e => {
+                logError('Reading hardware sensors', e);
+                return { picked: {}, fan: null };
+            });
+        return this._sensors;
+    },
+
+    // One meter per sensor this computer has: the fill is °C out of 100.
+    async _addTrayTemps(card, meters) {
+        let { picked } = await this._ensureSensors();
+        if (this._destroyed || this._trayMeters !== meters)
+            return;
+        for (let [kind, name] of SENSOR_KINDS) {
+            if (!picked[kind])
+                continue;
+            // "CPU°" like the pill: "CPU temp" didn't fit the 56px name column.
+            let m = this._ccMeter(card, `${name}°`);
+            m.row.visible = false;   // until it reports
+            meters.temps.push({ kind, path: picked[kind].path, m });
+        }
+        this._updateTrayTemps(meters, false);
+    },
+
+    // A sensor that doesn't report (a sleeping dGPU) hides its meter.
+    async _updateTrayTemps(meters, animate) {
+        let readings = await Promise.all(meters.temps.map(t => readTemp(t.path)));
+        if (this._destroyed || this._trayMeters !== meters)
+            return;
+        let shown = false;
+        meters.temps.forEach((t, i) => {
+            let c = readings[i];
+            shown ||= t.m.row.visible !== (c !== null);
+            t.m.row.visible = c !== null;
+            if (c !== null)
+                this._setMeter(t.m, c, animate, `${Math.round(c)}°C`, tempLevel(t.kind, c) === 2);
+        });
+        if (shown)
+            this._refitTray();
+    },
+
+    // The sensor rows fill in after the Tray was measured: re-fit the open
+    // notch, or its bottom row is cut off.
+    _refitTray() {
+        if (this._activeTab === 'system')
+            this._resizeToContent();
+    },
+
+    // Shown only when the setup let this user write the fan's pwm files.
+    async _addTrayFan(slot, ui) {
+        let { fan } = await this._ensureSensors();
+        if (!(await fanUsable(fan)) || this._destroyed || this._trayUi !== ui)
+            return;
+        let card = new St.BoxLayout({ style_class: 'nn-cc-card nn-cc-list nn-cc-fan', vertical: true, x_expand: true });
+        let head = new St.BoxLayout({ x_expand: true });
+        head.add_child(label('FAN · BETA', 'nook-card-eyebrow', { x_expand: true }));
+        let rpm = label('', 'nook-card-meta');
+        head.add_child(rpm);
+        card.add_child(head);
+        let seg = new St.BoxLayout({ style_class: 'nook-segmented', x_expand: true });
+        let btns = {};
+        for (let [id, text] of FAN_LEVELS) {
+            let b = new St.Button({ style_class: 'nook-segment', label: text, can_focus: true, x_expand: true,
+                accessible_name: `Fan ${text}` });
+            b.connect('clicked', () => this._setFanLevel(id));
+            seg.add_child(b);
+            btns[id] = b;
+        }
+        card.add_child(seg);
+        let note = label('', 'nook-card-meta nn-cc-fan-note');
+        card.add_child(note);
+        slot.add_child(card);
+        ui.fan = { rpm, btns, note };
+        this._refitTray();
+        this._updateTrayFan();
+    },
+
+    // Reads the level back from the chip, so a change made elsewhere shows.
+    async _updateTrayFan() {
+        let ui = this._trayUi?.fan;
+        if (!ui)
+            return;
+        let { fan, picked } = await this._ensureSensors();
+        let [enable, pwm, ...rpms] = await Promise.all([readText(fan.enable), readText(fan.pwm), ...fan.fans.map(readText)]);
+        if (this._destroyed || this._trayUi?.fan !== ui)
+            return;
+        let level = fanLevelOf(enable, pwm);
+        for (let [id, b] of Object.entries(ui.btns)) {
+            if (id === level)
+                b.add_style_class_name('nook-segment-active');
+            else
+                b.remove_style_class_name('nook-segment-active');
+            // No CPU sensor, no guard: only Auto then.
+            b.reactive = id === 'auto' || !!picked.cpu;
+        }
+        ui.rpm.set_text(rpms.map(t => fmtRpm(parseInt(t) || 0)).join(' · '));
+        let st = this._fan;
+        let text = st?.error || (!picked.cpu ? 'No CPU sensor found, so only Auto is offered'
+            : level === 'auto' || level === null ? ''
+                : st?.level ? `Back to Auto at ${FAN_GUARD_C} °C, and when NotchNux stops or the screen locks`
+                    : 'Set outside NotchNux: no automatic return to Auto');
+        ui.note.set_text(text);
+        if (ui.note.visible !== !!text) {
+            ui.note.visible = !!text;
+            this._refitTray();
+        }
+    },
+
+    // Writes a level. NotchNux only ever undoes a level it set itself; Auto
+    // goes back to the automatic mode the firmware had before (boards differ).
+    async _setFanLevel(id) {
+        let { fan, picked } = await this._ensureSensors();
+        if (!fan || this._destroyed || (id !== 'auto' && !picked.cpu))
+            return;
+        let st = this._fan ??= { fan, level: null, autoEnable: '2', id: 0, busy: false, error: '', sentAt: 0 };
+        if (st.busy)
+            return;
+        st.busy = true;
+        try {
+            if (st.level === null && id !== 'auto') {
+                let mode = parseInt(await readText(fan.enable));
+                st.autoEnable = mode >= 2 ? String(mode) : '2';
+            }
+            for (let [path, value] of fanWrites(id, fan, st.autoEnable))
+                await writeSysfs(path, value);
+            st.level = id === 'auto' ? null : id;
+            st.sentAt = GLib.get_monotonic_time();
+            st.error = '';
+        } catch (e) {
+            st.error = `Couldn’t set the fan (${e.message})`;
+            logError('Setting the fan level', e);
+        } finally {
+            st.busy = false;
+        }
+        if (this._destroyed)
+            return;
+        this._syncFanGuard();
+        this._updateTrayFan();
+    },
+
+    // While NotchNux holds a manual level, even with Tray closed.
+    _syncFanGuard() {
+        let st = this._fan;
+        let want = !!st?.level;
+        if (want && !st.id) {
+            st.id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, FAN_TICK_S, () => {
+                this._fanGuardTick();
+                return GLib.SOURCE_CONTINUE;
+            });
+        } else if (!want && st?.id) {
+            GLib.Source.remove(st.id);
+            st.id = 0;
+        }
+    },
+
+    // Too hot, or the CPU can't be read: back to Auto. Otherwise re-send the
+    // level once a minute.
+    async _fanGuardTick() {
+        let st = this._fan;
+        if (!st?.level || st.busy)
+            return;
+        let { picked } = await this._ensureSensors();
+        let c = picked.cpu ? await readTemp(picked.cpu.path) : null;
+        if (this._destroyed || !st.level || st.busy)
+            return;
+        if (c === null || c >= FAN_GUARD_C) {
+            await this._setFanLevel('auto');
+            this._pushAlert({ kind: 'fan', icon: 'dialog-warning-symbolic', color: '#ff9f0a', title: 'Fan back to Auto',
+                value: c === null ? 'CPU temperature unreadable' : `CPU ${Math.round(c)} °C`, valueColor: '#ff9f0a', ms: 4000 });
+        } else if (GLib.get_monotonic_time() - st.sentAt >= FAN_RESEND_S * 1e6) {
+            this._setFanLevel(st.level);
+        }
+    },
+
+    // Fan control turned off in Preferences, or NotchNux stopping: Auto.
+    // `now`: a synchronous write, for disable() and logout, where an async
+    // one may never run. ponytail: sync on purpose (one tiny sysfs write).
+    _releaseFan(now = false) {
+        let st = this._fan;
+        if (!st)
+            return;
+        if (st.id)
+            GLib.Source.remove(st.id);
+        st.id = 0;
+        if (!st.level)
+            return;
+        if (!now) {
+            this._setFanLevel('auto');
+            return;
+        }
+        st.level = null;
+        try {
+            GLib.file_set_contents_full(st.fan.enable, new TextEncoder().encode(st.autoEnable), GLib.FileSetContentsFlags.NONE, 0o644);
+        } catch (e) {
+            logError('Putting the fan back to Auto', e);
+        }
     },
 
     _nightLightSettings() {

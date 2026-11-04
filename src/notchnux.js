@@ -377,6 +377,9 @@ export const NotchNux = GObject.registerClass({
             trayMirrorKey: this._config.trayMirrorKey,
             pinnedKey: JSON.stringify(this._config.pinnedTabs),
             keepAwake: this._config.keepAwake,
+            pillTemp: this._config.pillTemp,
+            trayTemps: this._config.trayTemps,
+            fanControl: this._config.fanControl,
         };
     }
 
@@ -464,6 +467,16 @@ export const NotchNux = GObject.registerClass({
         }
         if (next.keepAwake !== prev.keepAwake)
             this._setKeepAwake(next.keepAwake, { persist: false });
+        // Sensors group in prefs: the pill's temperature column, and the
+        // Tray's temperature meters / fan card (rebuilt on next show).
+        if (next.pillTemp !== prev.pillTemp) {
+            this._syncPillStats();
+            this._updateTuck();
+        }
+        if (next.fanControl !== prev.fanControl && !next.fanControl)
+            this._releaseFan();
+        if ((next.trayTemps !== prev.trayTemps || next.fanControl !== prev.fanControl) && this._invalidateTab('system'))
+            this._renderActiveTab();
 
         // Which indicators the Tray tab mirrors changed in prefs: repaint the
         // Tray tab so the row reflects the new selection. Only meaningful while
@@ -490,6 +503,8 @@ export const NotchNux = GObject.registerClass({
         if (!shellGone)
             this._closeScanOverlay();
         this._destroyLedge();
+        // A manual fan level never outlives NotchNux (screen lock, logout).
+        this._releaseFan(true);
         this._destroyProductivity();
         stopSpring(this);
         this._railTimeline?.stop();
