@@ -672,13 +672,15 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         page.add(group);
 
         for (const f of FEATURE_DEFS) {
-            // Plain text: labels like "Charging & low battery alerts" aren't markup.
+            // Plain text: labels like "Charging & low battery alerts" aren't
+            // markup. Subtitle after construction, or it's parsed before
+            // use_markup applies.
             const row = new Adw.SwitchRow({
                 title: f.label,
-                subtitle: f.description,
                 use_markup: false,
                 active: config.isFeatureEnabled(f.id),
             });
+            row.subtitle = f.description;
             row.connect('notify::active', () => {
                 config.setFeatureEnabled(f.id, row.get_active());
             });
