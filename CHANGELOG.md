@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — header shortcuts, 1 to 8
+- Preferences → Tabs → **Header shortcuts** sets how many tabs sit beside
+  Home, 1 to 8 (5 before, still the default). Lowering it hides the extra
+  shortcuts; raising it again brings them back until you next edit them in
+  the grid.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.
@@ -24,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The wallpaper thumbnail worker is killed when the extension is disabled
   instead of being left to finish on its own.
+- Preferences rows with "&" in their text show it again: "Volume &
+  brightness in the notch", "Charging & low battery alerts", and a
+  wallpaper folder, GSConnect device or mirrored indicator with "&" in its
+  name (they showed an empty title).
 
 ## [1.6.1] - 2026-11-01
 

@@ -18,7 +18,7 @@ import GObject from 'gi://GObject';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
+import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS, MAX_PINNED } from './src/helpers/config.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -615,6 +615,16 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             rowsById.set(id, row);
             listBox.append(row);
         }
+
+        // How many tabs sit beside Home; which ones is picked in the grid.
+        const pinRow = new Adw.SpinRow({
+            title: 'Header shortcuts',
+            subtitle: `Tabs beside Home in the dashboard header, 1 to ${MAX_PINNED}. Hold a tile in the grid to pick them.`,
+            adjustment: new Gtk.Adjustment({ lower: 1, upper: MAX_PINNED, step_increment: 1, page_increment: 1,
+                value: config.pinnedMax }),
+        });
+        pinRow.connect('notify::value', () => config.setPinnedMax(pinRow.get_value()));
+        group.add(pinRow);
     }
 
     // Wire up drag-and-drop reordering for a tab row. On drop we move the

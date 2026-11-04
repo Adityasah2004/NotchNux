@@ -1118,7 +1118,7 @@ export const NotchNux = GObject.registerClass({
         this._syncRail();
     }
 
-    // The header shows Home, up to MAX_PINNED shortcuts, and — while one is
+    // The header shows Home, up to pinnedMax shortcuts, and — while one is
     // open — the tab you reached through the grid. Everything else lives in
     // the grid (the launcher), one click away.
     _railIds() {

@@ -39,7 +39,7 @@ NotchNux replaces the default GNOME top-bar clock with a **living pill**. At a g
 | 🖥️ | **Tray / System** | A Control Center: Wi-Fi, Bluetooth, hotspot and airplane toggles with in-notch network and device pickers; Silence, Night Light, screenshot and lock tiles; volume and brightness sliders; device batteries; and live CPU, memory, disk and network. |
 | 🏝️ | **Island alerts** | Volume, brightness, charging, low battery, headphones and a 5-minute event heads-up grow out of the pill for a moment, one at a time. |
 | 🫥 | **Hide when idle** | Optional: the notch tucks into the top edge until something is live, or you rest the pointer at the top centre. |
-| 🔲 | **Grid launcher** | Home plus up to five shortcuts in the header; everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
+| 🔲 | **Grid launcher** | Home plus one to eight shortcuts in the header (five by default; Preferences → Tabs → *Header shortcuts*); everything else (and the toggles) behind the grid button. Hold a tile to pick shortcuts. |
 | 📋 | **Clipboard** | The last 20 text clips with search and pins. Passwords are skipped; only pinned clips are saved. |
 | ⏲️ | **Stopwatch, Keep Awake, Stats** | A stopwatch with laps, a keep-awake toggle, and memory/CPU in the pill. Two-finger swipe skips tracks; right-click the pill for a quick menu. |
 | 🎨 | **Theming** | Pick any accent color — the whole UI, dials and highlights recolor live. Reorder or hide dashboard tabs, and toggle individual features on/off, from a **native preferences window**. |
