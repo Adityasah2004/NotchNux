@@ -897,11 +897,14 @@ export const NotchNux = GObject.registerClass({
             x_expand: true,
             reactive: true,
             can_focus: false });
+        // Fills the button (no y_align): a horizontal box sizes height-first,
+        // so centring it took its one-line height and a wrapped body (a
+        // Claude command) spilled under the action buttons. The icon and the
+        // text still centre themselves.
         let row = new St.BoxLayout({
             style_class: 'nook-notif-peek-row',
             vertical: false,
-            x_expand: true,
-            y_align: Clutter.ActorAlign.CENTER });
+            x_expand: true });
 
         this._notifPeekIconBin = new St.Bin({
             style_class: 'nook-notif-peek-iconbin',
@@ -5243,7 +5246,13 @@ export const NotchNux = GObject.registerClass({
 
         this._peekNotification = notification;
         this._notifPeekTitle.set_text(title);
-        this._notifPeekBody.set_text(body);
+        // The command must read exactly as it runs: no hyphen of Pango's own
+        // where it wraps inside a word. Markup, because St resets a label's
+        // attributes on each style change; set_text turns markup off again.
+        if (this._peekSticky)
+            bodyText.set_markup(`<span insert_hyphens="false">${GLib.markup_escape_text(body, -1)}</span>`);
+        else
+            this._notifPeekBody.set_text(body);
         this._notifPeekBody.visible = body.length > 0;
         if (gicon && this._notifPeekIcon.set_gicon) {
             try { this._notifPeekIcon.set_gicon(gicon); }
@@ -5298,7 +5307,12 @@ export const NotchNux = GObject.registerClass({
     // Natural height of the banner content at the peek width, floored to the
     // designed height so a one-line notification still reads as a card.
     _measurePeekHeight() {
-        let [, nat] = this._notifBanner.get_preferred_height(PEEK_WIDTH);
+        // The banner lays out inside the island's padding, so measure it at
+        // that width: at the full width a wrapped body (a Claude command)
+        // came out a line short and the buttons covered its last line.
+        this._surface.ensure_style();
+        let node = this._surface.get_theme_node();
+        let [, nat] = this._notifBanner.get_preferred_height(PEEK_WIDTH - node.get_horizontal_padding());
         // The pill now stays pinned above the banner, so the peek box must be
         // tall enough for both. Add the pill height plus its bottom margin (10px,
         // set on .notchnux-island-peek .notchnux-pill-content in the stylesheet).
@@ -5307,7 +5321,7 @@ export const NotchNux = GObject.registerClass({
             let [, natPillH] = this._pill.get_preferred_height(PEEK_WIDTH);
             pillH = Math.ceil(natPillH) + 10;
         }
-        return Math.max(PEEK_HEIGHT, Math.ceil(nat) + pillH + 20);
+        return Math.max(PEEK_HEIGHT, Math.ceil(nat + node.get_vertical_padding()) + pillH);
     }
 
     // Re-fit the banner if its content changed while already showing.

@@ -80,6 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The wallpaper thumbnail worker is killed when the extension is disabled
   instead of being left to finish on its own.
+- A banner whose text wraps (a long Claude Code command) no longer hides
+  its last line under the action buttons, and it shows the command exactly,
+  without a hyphen where a long word wraps.
 
 ## [1.6.1] - 2026-11-01
 
