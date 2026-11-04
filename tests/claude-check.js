@@ -7,7 +7,7 @@ import Soup from 'gi://Soup?version=3.0';
 import {
     parseSession, procStat, isLive, alertFor, parseUsage, sortSessions, pillDots,
     SETTINGS_PATH, fmtAge, wrapCommand, unwrapCommand, isConnected, connectStatusLine, disconnectStatusLine,
-    SOCKET_NAME, approveSocketPath, approveCommand, passThrough, describeRequest, decisionBody,
+    SOCKET_NAME, approveSocketPath, approveCommand, passThrough, asksAtOnce, describeRequest, decisionBody,
     isApproveConnected, connectApproveHook, disconnectApproveHook,
     HOOK_TIMEOUT_S, settingsLayout, formatSettings,
     parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary,
@@ -113,6 +113,11 @@ ok(passThrough(req('Bash', {}, { agent_id: 'a1' })), 'subagent prompt goes to th
 for (let t of ['ExitPlanMode', 'AskUserQuestion', 'dialogFoo'])
     ok(passThrough(req(t)), `${t} goes to the terminal`);
 ok(!passThrough(req('Bash', { command: 'ls' })), 'main-session Bash is held');
+ok(asksAtOnce(req('Bash', {})), 'no permission_mode (older Claude Code): banner at once');
+for (let m of ['default', 'acceptEdits', 'plan'])
+    ok(asksAtOnce(req('Bash', {}, { permission_mode: m })), `${m}: the terminal is asking, banner at once`);
+for (let m of ['auto', 'bypassPermissions', 'dontAsk', 'somethingNew'])
+    ok(!asksAtOnce(req('Bash', {}, { permission_mode: m })), `${m}: banner waits until the session asks`);
 eq(describeRequest(req('Bash', { command: 'npm test' }), 'notchnux-bf'),
     { title: 'notchnux-bf wants to run a command', body: 'npm test', exact: true, always: null }, 'Bash');
 eq(describeRequest(req('Edit', { file_path: '/x/src/a.js' }), 'nn'), { title: 'nn wants to edit a.js', body: '/x/src/a.js', exact: false, always: null }, 'Edit');

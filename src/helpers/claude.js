@@ -251,6 +251,14 @@ export function passThrough(req) {
     return !!req?.agent_id || TERMINAL_ONLY.has(tool) || tool.startsWith('dialog');
 }
 
+// In these modes a PermissionRequest means the terminal is showing its
+// dialog, so the banner goes up at once. In the others (auto, …) Claude
+// Code may settle the request itself and leave the hook running, so the
+// banner waits until the session is seen asking. No mode (older Claude
+// Code): at once, as before.
+const ASKING_MODES = new Set(['default', 'acceptEdits', 'plan']);
+export const asksAtOnce = req => req?.permission_mode === undefined || ASKING_MODES.has(req.permission_mode);
+
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 const BODY_LINES = 4;
 const BODY_CHARS = 240;

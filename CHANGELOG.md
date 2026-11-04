@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preferences → Claude Code → **Approve from the notch**: permission prompts
   show on a banner with **Allow / Always allow / Deny** that stays until you
   answer, even during Do Not Disturb. The terminal prompt keeps working;
-  answering there clears the banner. Allow is offered only when the banner
+  answering there clears the banner, and clicking the banner (or Open
+  terminal) hands the prompt back to the terminal. In auto mode the banner
+  shows only once Claude Code really asks you, not for the requests its
+  auto mode settles by itself. Allow is offered only when the banner
   shows everything it would approve (file edits and unshown options go to
   the terminal), and Always allow shows the rule it adds. Connect adds a `PermissionRequest`
   hook to `~/.claude/settings.json` that hands each prompt to NotchNux with

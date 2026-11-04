@@ -42,7 +42,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {
     SESSIONS_DIR, USAGE_PATH, SESSION_FILE, parseSession, procStat, isLive, alertFor,
     parseUsage, sortSessions, pillDots, fmtAge,
-    APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, describeRequest, decisionBody,
+    APPROVE_PATH, HOOK_TIMEOUT_S, approveSocketPath, passThrough, asksAtOnce, describeRequest, decisionBody,
     MCP_AUTH_PATH, parseNeedsAuth, newAuthNames, parseMcpList, mcpSummary, claudeBinary,
     SAFE_MODES, rulesOf, removeRule, setDefaultMode, claudeSettingsFiles, readSettingsAsync, writeSettingsAsync,
     SETTINGS_PATH, parsePluginList, parseSkillMeta, setSkillOverride, skillSources, parseEnviron,
@@ -439,6 +439,7 @@ const ClaudeFeatures = {
             return;
         let pending = c.requests;
         c.requests = [];
+        c.shown = null;
         for (let r of pending)
             this._replyClaude(r.msg, 200, decisionBody('none'));
         // Closing the sockets at once would cut those replies off: stop taking
@@ -502,7 +503,8 @@ const ClaudeFeatures = {
 
         let c = this._claude;
         msg.pause();
-        let r = { req, msg, sessionId: String(req.session_id ?? ''), at: GLib.get_monotonic_time(), seenWaiting: false };
+        let r = { req, msg, sessionId: String(req.session_id ?? ''), at: GLib.get_monotonic_time(), wallAt: Date.now(),
+            seenWaiting: false, ready: asksAtOnce(req) };
         c.requests.push(r);
         // A session shows one dialog at a time: a new request means its
         // older ones were answered in the terminal. "No decision" is safe
@@ -522,15 +524,19 @@ const ClaudeFeatures = {
             return;
         c.requests.splice(i, 1);
         this._replyClaude(r.msg, 200, decisionBody(kind, r.req));
-        // The head is the one on screen: move on to the next, or spring back
-        // to the pill.
-        if (i === 0 && this._peekSticky && !this._presentClaudeRequest(true))
-            this._hideNotificationPeek();
+        // The one on screen: move on to the next, or spring back to the pill.
+        if (r === c.shown) {
+            c.shown = null;
+            if (this._peekSticky && !this._presentClaudeRequest(true))
+                this._hideNotificationPeek();
+        }
     },
 
-    // After each sessions read: a request whose session was seen waiting and
-    // has moved on was answered in the terminal; one older than the hook's
-    // timeout can't be answered any more.
+    // After each sessions read. A request is over when its session moved on:
+    // seen asking and not any more (answered in the terminal), or its status
+    // changed after the request came in without asking (auto mode settled
+    // it, the turn ended). Claude Code leaves the hook running either way.
+    // One older than the hook's timeout can't be answered any more.
     _sweepClaudeRequests() {
         let c = this._claude;
         if (!c.requests.length)
@@ -540,23 +546,32 @@ const ClaudeFeatures = {
             let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
             let waiting = s?.state === 'approval' || s?.state === 'question';
             if (waiting)
-                r.seenWaiting = true;
-            if (now - r.at > REQUEST_MAX_AGE_US || (r.seenWaiting && !waiting))
+                r.seenWaiting = r.ready = true;
+            let movedOn = !waiting && (r.seenWaiting || (s?.since ?? 0) > r.wallAt);
+            if (now - r.at > REQUEST_MAX_AGE_US || movedOn)
                 this._answerClaudeRequest(r, 'none');
         }
+        this._presentClaudeRequest();   // one that just became ready
     },
 
-    // Show the head of the queue on the sticky banner. `replace` swaps the
+    // Show the oldest ready request on the sticky banner. `replace` swaps the
     // banner already up. Returns whether a Claude banner is showing.
     _presentClaudeRequest(replace = false) {
         let c = this._claude;
-        let r = c?.requests[0];
+        let r = c?.requests.find(x => x.ready);
         if (!r || this.isExpanded || this._isExpanding || (this._peekSticky && !replace))
             return false;
         let s = [...c.sessions.values()].find(x => x.sessionId && x.sessionId === r.sessionId);
         let { title, body, exact, always } = describeRequest(r.req, s?.name);
-        let raise = () => s && this._raiseClaudeTerminal(s.pid);
+        // Clicking the banner or Open terminal hands the prompt back to the
+        // terminal (no decision) and brings it forward: the banner goes away.
+        let toTerminal = () => {
+            if (s)
+                this._raiseClaudeTerminal(s.pid);
+            this._answerClaudeRequest(r, 'none');
+        };
         r.shownAt = GLib.get_monotonic_time();
+        c.shown = r;
         let act = (label, fn) => ({ label, manualHide: true, callback: () => {
             if (GLib.get_monotonic_time() - r.shownAt >= CLICK_GUARD_US)
                 fn();
@@ -564,7 +579,7 @@ const ClaudeFeatures = {
         let answer = (label, kind) => act(label, () => this._answerClaudeRequest(r, kind));
         // Allow only what the banner shows in full; the rest is approved in
         // the terminal.
-        let actions = exact ? [answer('Allow', 'allow')] : [act('Open terminal', raise)];
+        let actions = exact ? [answer('Allow', 'allow')] : [act('Open terminal', toTerminal)];
         // Only a plain allow rule for this tool, and the banner says which.
         if (always) {
             actions.push(answer('Always allow', 'always'));
@@ -572,7 +587,7 @@ const ClaudeFeatures = {
         }
         actions.push(answer('Deny', 'deny'));
         this._showNotificationPeek(title, body, new Gio.ThemedIcon({ name: 'dialog-warning-symbolic' }), null, actions,
-            { sticky: true, onMainClick: raise });
+            { sticky: true, onMainClick: toTerminal });
         return !!this._peekSticky;
     },
 
