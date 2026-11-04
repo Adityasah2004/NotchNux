@@ -327,10 +327,10 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         const patch = (p) => config.setWallpaper(p);
 
         // Folder chooser. Shows the current folder as the subtitle.
-        const folderRow = new Adw.ActionRow({
-            title: 'Folder',
-            subtitle: wp.folder || 'No folder selected',
-        });
+        // A path ("Rock & Roll") isn't markup. Subtitle after construction:
+        // one given to the constructor is parsed before use_markup applies.
+        const folderRow = new Adw.ActionRow({ title: 'Folder', use_markup: false });
+        folderRow.subtitle = wp.folder || 'No folder selected';
         const folderBtn = new Gtk.Button({
             icon_name: 'folder-open-symbolic',
             valign: Gtk.Align.CENTER,
@@ -662,9 +662,11 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         page.add(group);
 
         for (const f of FEATURE_DEFS) {
+            // Plain text: labels like "Charging & low battery alerts" aren't markup.
             const row = new Adw.SwitchRow({
                 title: f.label,
                 subtitle: f.description,
+                use_markup: false,
                 active: config.isFeatureEnabled(f.id),
             });
             row.connect('notify::active', () => {
@@ -704,13 +706,16 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         const sorted = [...items].sort((a, b) =>
             String(a.label).localeCompare(String(b.label)));
         for (const it of sorted) {
+            // Other extensions' labels aren't markup (subtitle set after
+            // construction, or it's parsed before use_markup applies).
             const row = new Adw.SwitchRow({
                 title: it.label || it.id,
-                // Show the raw id as a subtitle so ambiguous entries (two icons
-                // with the same name) are still distinguishable.
-                subtitle: it.id,
+                use_markup: false,
                 active: config.isTrayMirrorEnabled(it.id),
             });
+            // Show the raw id as a subtitle so ambiguous entries (two icons
+            // with the same name) are still distinguishable.
+            row.subtitle = it.id;
             row.connect('notify::active', () => {
                 config.setTrayMirrorEnabled(it.id, row.get_active());
             });
@@ -794,6 +799,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                         title: d.name,
                         subtitle: ready ? 'Ready to receive'
                             : !d.paired ? 'Not paired' : 'Not connected',
+                        use_markup: false,   // a device name, e.g. "Tom & Jerry's phone"
                     });
                     row.add_prefix(new Gtk.Image({ icon_name: iconFor(d.type), valign: Gtk.Align.CENTER }));
                     if (ready) {
