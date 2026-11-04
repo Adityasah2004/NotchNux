@@ -32,6 +32,7 @@ import { PILL_HEIGHT } from '../helpers/island.js';
 import { fmtCountdown } from '../helpers/productivity.js';
 import { accentHex, accentRgbStr } from '../helpers/widgets.js';
 import { logError, logDebug } from '../helpers/log.js';
+import { readTemp, tempLevel } from '../helpers/sensors.js';
 
 // Dark-mode system colours: the surface is always black.
 export const SYS = {
@@ -589,7 +590,7 @@ export const LedgeFeatures = {
             return false;
         if (this._pillMic?.visible || this._pillCam?.visible)
             return false;
-        if (this._config.isFeatureEnabled('pillStats'))
+        if (this._config.isFeatureEnabled('pillStats') || this._config.pillTemp !== 'off')
             return false;
         return true;
     },
@@ -775,22 +776,34 @@ export const LedgeFeatures = {
         this._pillStatsBox = new St.BoxLayout({ style_class: 'nn-pill-stats', y_align: Clutter.ActorAlign.CENTER, visible: false });
         let mk = name => {
             let col = new St.BoxLayout({ vertical: true, y_align: Clutter.ActorAlign.CENTER, style_class: 'nn-pill-stat' });
-            col.add_child(new St.Label({ text: name, style_class: 'nn-pill-stat-cap' }));
+            let cap = new St.Label({ text: name, style_class: 'nn-pill-stat-cap' });
+            col.add_child(cap);
             let v = new St.Label({ text: '–', style_class: 'nn-pill-stat-val' });
             col.add_child(v);
             this._pillStatsBox.add_child(col);
-            return v;
+            return { col, cap, v };
         };
-        this._pillMemLabel = mk('MEM');
-        this._pillCpuLabel = mk('CPU');
+        let mem = mk('MEM'), cpu = mk('CPU'), temp = mk('');
+        this._pillMemLabel = mem.v;
+        this._pillCpuLabel = cpu.v;
+        this._pillLoadCols = [mem.col, cpu.col];
+        this._pillTemp = temp;
         this._pill.insert_child_at_index(this._pillStatsBox, 2);
     },
 
     // Stats are the lowest-priority activity: any other one replaces them.
+    // MEM/CPU come with "Stats in the pill", the temperature column with
+    // Preferences' pill sensor; either one shows the box.
     _syncPillStats() {
         if (!this._pillStatsBox)
             return;
-        let on = this._config.isFeatureEnabled('pillStats');
+        let load = this._config.isFeatureEnabled('pillStats');
+        let kind = this._config.pillTemp;
+        for (let col of this._pillLoadCols)
+            col.visible = load;
+        this._pillTemp.col.visible = kind !== 'off';
+        this._pillTemp.cap.set_text(`${kind.toUpperCase()}°`);
+        let on = load || kind !== 'off';
         if (on)
             this._startStatsTimer();
         else
@@ -807,14 +820,19 @@ export const LedgeFeatures = {
         if (this._statsId)
             return;
         let tick = () => {
-            this._system._updateCpuUsage?.();
-            let cpu = Math.round(this._system.getCpuUsage?.() ?? 0);
-            let mem = Math.round(this._system.getRamUsage?.() ?? 0);
-            // No animation on the numbers: a redraw every 2 s is all it costs.
-            this._pillCpuLabel.set_text(`${cpu}%`);
-            this._pillCpuLabel.set_style(`color: ${statColor(cpu)};`);
-            this._pillMemLabel.set_text(`${mem}%`);
-            this._pillMemLabel.set_style(`color: ${statColor(mem)};`);
+            if (this._config.isFeatureEnabled('pillStats')) {
+                this._system._updateCpuUsage?.();
+                let cpu = Math.round(this._system.getCpuUsage?.() ?? 0);
+                let mem = Math.round(this._system.getRamUsage?.() ?? 0);
+                // No animation on the numbers: a redraw every 2 s is all it costs.
+                this._pillCpuLabel.set_text(`${cpu}%`);
+                this._pillCpuLabel.set_style(`color: ${statColor(cpu)};`);
+                this._pillMemLabel.set_text(`${mem}%`);
+                this._pillMemLabel.set_style(`color: ${statColor(mem)};`);
+            }
+            let kind = this._config.pillTemp;
+            if (kind !== 'off')
+                this._tickPillTemp(kind);
         };
         tick();
         this._statsId = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, STATS_INTERVAL_S, () => {
@@ -828,6 +846,18 @@ export const LedgeFeatures = {
                 tick();
             return GLib.SOURCE_CONTINUE;
         });
+    },
+
+    // One async read of the chosen sensor; '–' when it isn't there or sleeps
+    // (a dGPU that's off).
+    async _tickPillTemp(kind) {
+        let path = (await this._ensureSensors()).picked[kind]?.path;
+        let c = path ? await readTemp(path) : null;
+        if (this._destroyed || this._config.pillTemp !== kind)
+            return;
+        let v = this._pillTemp.v;
+        v.set_text(c === null ? '–' : `${Math.round(c)}°`);
+        v.set_style(c === null ? null : `color: ${[SYS.green, SYS.yellow, SYS.red][tempLevel(kind, c)]};`);
     },
 
     _stopStatsTimer() {

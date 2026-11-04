@@ -19,6 +19,7 @@ import GObject from 'gi://GObject';
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
+import { discoverHwmon, pickSensors, pickFan, fanUsable, SENSOR_KINDS, FAN_GUARD_C } from './src/helpers/sensors.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -51,6 +52,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         this._addWallpaperGroup(page, config, window);
         this._addTabsGroup(page, config);
         this._addFeaturesGroup(page, config);
+        this._addSensorsGroup(page, config);
         this._addTrayMirrorGroup(page, config);
         this._addQuickShareGroup(page);
         this._addSystemGroup(page);
@@ -672,6 +674,76 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             });
             group.add(row);
         }
+    }
+
+    // ---- Temperatures & fan (helpers/sensors.js) ----
+    // The rows that depend on this computer's sensors fill in once they're
+    // found: the pill offers only sensors that exist, and fan control shows
+    // only with a controllable fan, locked until tools/fan-setup.sh ran.
+    _addSensorsGroup(page, config) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Temperatures &amp; fan',
+            description: 'Read from this computer’s hardware sensors (/sys/class/hwmon). Nothing leaves your machine.',
+        });
+        page.add(group);
+
+        const kinds = ['off'];
+        const model = Gtk.StringList.new(['Off']);
+        const pillRow = new Adw.ComboRow({
+            title: 'Temperature in the pill',
+            subtitle: 'One sensor next to the pill’s stats, read every 2 seconds',
+            model,
+        });
+        let filling = true;
+        pillRow.connect('notify::selected', () => {
+            if (!filling)
+                config.setPillTemp(kinds[pillRow.selected] ?? 'off');
+        });
+        group.add(pillRow);
+
+        const trayRow = new Adw.SwitchRow({
+            title: 'Temperatures in Tray',
+            subtitle: 'Every sensor that reports, in the Tray’s System card',
+            active: config.trayTemps,
+        });
+        trayRow.connect('notify::active', () => config.setTrayTemps(trayRow.active));
+        group.add(trayRow);
+
+        const setup = `sudo sh ${GLib.shell_quote(`${this.path}/src/tools/fan-setup.sh`)}`;
+        const fanRow = new Adw.SwitchRow({ title: 'Fan control (beta)', use_markup: false, active: config.fanControl,
+            sensitive: false, visible: false });
+        fanRow.connect('notify::active', () => config.setFanControl(fanRow.active));
+        const copy = new Gtk.Button({ icon_name: 'edit-copy-symbolic', valign: Gtk.Align.CENTER, visible: false,
+            tooltip_text: 'Copy the setup command' });
+        copy.add_css_class('flat');
+        copy.connect('clicked', () => Gdk.Display.get_default().get_clipboard().set(setup));
+        fanRow.add_suffix(copy);
+        group.add(fanRow);
+
+        discoverHwmon().then(async chips => {
+            const picked = pickSensors(chips);
+            for (const [id, name] of SENSOR_KINDS) {
+                if (picked[id]) {
+                    kinds.push(id);
+                    model.append(`${name} · ${picked[id].label}`);
+                }
+            }
+            pillRow.selected = Math.max(0, kinds.indexOf(config.pillTemp));
+            filling = false;
+            const fan = pickFan(chips);
+            if (!fan)
+                return;
+            const usable = await fanUsable(fan);
+            fanRow.visible = true;
+            fanRow.sensitive = usable;
+            copy.visible = !usable;
+            fanRow.subtitle = usable
+                ? `Auto · Low · Med · High · Max · Off in Tray. Back to Auto at ${FAN_GUARD_C} °C CPU, and when NotchNux stops or the screen locks.`
+                : `Locked until a one-time setup lets your user set the fan level. Run this in a terminal (the button copies it): ${setup}`;
+        }).catch(e => {
+            filling = false;
+            console.error('NotchNux: reading hardware sensors', e);
+        });
     }
 
     // ---- Mirrored indicators (Tray tab) ----
