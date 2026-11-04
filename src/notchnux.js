@@ -30,6 +30,7 @@ import { springTo, stopSpring, addPressFeedback } from './helpers/motion.js';
 import { installProductivity } from './tabs/productivity.js';
 import { installLedge, swapContent } from './tabs/ledge.js';
 import { installTray } from './tabs/tray.js';
+import { installClaude } from './tabs/claude.js';
 import { logError } from './helpers/log.js';
 
 // Configuration constants
@@ -180,6 +181,8 @@ export const NotchNux = GObject.registerClass({
         this._initProductivity();
         // Alerts, hide-when-idle, launcher, clipboard, lyrics, keep awake…
         this._initLedge();
+        // Claude Code sessions + usage (the pill's dots and the Claude tab).
+        this._initClaude();
         // Recolour the active-state chrome to match the persisted accent.
         this._applyAccentStyles();
         // Shoulders + the (hidden unless enabled) glass backdrop.
@@ -377,6 +380,7 @@ export const NotchNux = GObject.registerClass({
             trayMirrorKey: this._config.trayMirrorKey,
             pinnedKey: JSON.stringify(this._config.pinnedTabs),
             keepAwake: this._config.keepAwake,
+            claudeApprove: this._config.claudeApprove,
         };
     }
 
@@ -464,6 +468,9 @@ export const NotchNux = GObject.registerClass({
         }
         if (next.keepAwake !== prev.keepAwake)
             this._setKeepAwake(next.keepAwake, { persist: false });
+        // "Approve from the notch" connected / disconnected in prefs.
+        if (next.claudeApprove !== prev.claudeApprove)
+            this._syncClaudeMonitor();
 
         // Which indicators the Tray tab mirrors changed in prefs: repaint the
         // Tray tab so the row reflects the new selection. Only meaningful while
@@ -490,6 +497,7 @@ export const NotchNux = GObject.registerClass({
         if (!shellGone)
             this._closeScanOverlay();
         this._destroyLedge();
+        this._destroyClaude();
         this._destroyProductivity();
         stopSpring(this);
         this._railTimeline?.stop();
@@ -889,11 +897,14 @@ export const NotchNux = GObject.registerClass({
             x_expand: true,
             reactive: true,
             can_focus: false });
+        // Fills the button (no y_align): a horizontal box sizes height-first,
+        // so centring it took its one-line height and a wrapped body (a
+        // Claude command) spilled under the action buttons. The icon and the
+        // text still centre themselves.
         let row = new St.BoxLayout({
             style_class: 'nook-notif-peek-row',
             vertical: false,
-            x_expand: true,
-            y_align: Clutter.ActorAlign.CENTER });
+            x_expand: true });
 
         this._notifPeekIconBin = new St.Bin({
             style_class: 'nook-notif-peek-iconbin',
@@ -933,7 +944,11 @@ export const NotchNux = GObject.registerClass({
         // Clicking the main area = activate the notification (its default
         // action) and dismiss the peek.
         this._notifPeekMain.connect('clicked', () => {
-            this._activateCurrentNotification();
+            // A Claude approval banner raises the session's terminal and stays up.
+            if (this._peekMainClick)
+                this._peekMainClick();
+            else
+                this._activateCurrentNotification();
         });
 
         // Hovering anywhere on the banner pauses the auto-dismiss; leaving
@@ -993,12 +1008,21 @@ export const NotchNux = GObject.registerClass({
             btn.connect('clicked', () => {
                 // Run the app's action handler, then collapse. Guard it — a
                 // throwing callback must not leave the peek stuck open.
+                let failed = false;
                 try {
                     if (typeof action.callback === 'function') action.callback();
                 } catch (e) {
+                    failed = true;
                     logError('notification action failed', e);
                 }
-                this._hideNotificationPeek(true);
+                // manualHide: the callback shows what comes next itself (a
+                // Claude approval moves on to the next request, or hides with
+                // the spring back to the pill — the immediate path below
+                // leaves a collapsed island at peek height).
+                if (!action.manualHide)
+                    this._hideNotificationPeek(true);
+                else if (failed)
+                    this._hideNotificationPeek();
             });
             this._notifPeekActions.add_child(btn);
         }
@@ -1959,6 +1983,8 @@ export const NotchNux = GObject.registerClass({
         }
         if (tab === 'launcher')
             this._launcherEdit = false;
+        if (tab === 'claude')
+            this._leaveClaudeTab();
         this._releaseKeyboard?.();
     }
 
@@ -2006,6 +2032,7 @@ export const NotchNux = GObject.registerClass({
             case 'notifications': this._renderNotificationsTab(); break;
             case 'shelf': this._renderShelfTab(); break;
             case 'wallpaper': this._renderWallpaperTab(); break;
+            case 'claude': this._renderClaudeTab(); break;
             }
         } finally {
             this._mountTarget = null;
@@ -2067,6 +2094,9 @@ export const NotchNux = GObject.registerClass({
             break;
         case 'clipboard':
             this._clipUi?.fill();
+            break;
+        case 'claude':
+            this._claudeTabShown();
             break;
         case 'calendar':
         case 'weather':
@@ -2168,6 +2198,7 @@ export const NotchNux = GObject.registerClass({
             launcher: ['_launcherUi'],
             clipboard: ['_clipUi'],
             notes: ['_notesUi'],
+            claude: ['_claudeUi'],
         };
         for (let ref of REFS[tab] ?? [])
             this[ref] = null;
@@ -2544,6 +2575,8 @@ export const NotchNux = GObject.registerClass({
         if (this._pillMusicBox.visible)
             zones.push(this._pillMusicBox.get_preferred_width(-1)[1]);
         zones.push(this._pillClock.get_preferred_width(-1)[1]);
+        if (this._pillClaudeBox?.visible)
+            zones.push(this._pillClaudeBox.get_preferred_width(-1)[1]);
         if (this._pillBatteryBox && this._pillBatteryBox.visible)
             zones.push(this._pillBatteryBox.get_preferred_width(-1)[1]);
         if (this._pillNotifBox && this._pillNotifBox.visible)
@@ -2575,9 +2608,10 @@ export const NotchNux = GObject.registerClass({
         // gets its width back when they let go.
         if (this.isExpanded || this._peekActive || this._alertShowing || this._tucked)
             return;
-        let width = this._pillWidth();
-        let targetX = monitor.x + Math.floor((monitor.width - width) / 2);
-        springTo(this, { x: targetX, width }, { duration: 380, damping: 1 });
+        // The whole rest geometry, not just x/width: springTo stops the spring
+        // in flight, so a width change while a peek shrinks back (the Claude
+        // dots changing right after an approval) would freeze its height.
+        springTo(this, this._restGeometry(), { duration: 380, damping: 1 });
     }
 
     // Distribute the zones evenly. With the pill sized by _pillWidth to hold all
@@ -4338,6 +4372,9 @@ export const NotchNux = GObject.registerClass({
             case 'topScroll':
                 this._applyTopScroll();
                 break;
+            case 'claudeMonitor':
+                this._onClaudeFeatureToggled();
+                break;
             default:
                 this._onLedgeFeatureToggled(id, on);
         }
@@ -5183,13 +5220,39 @@ export const NotchNux = GObject.registerClass({
     // Morph pill → banner and start the auto-dismiss countdown. If a peek is
     // already showing, just swap its content and restart the timer (so a burst
     // of notifications keeps the banner up and current rather than flickering).
-    _showNotificationPeek(title, body, gicon, notification = null, actions = []) {
+    //
+    // opts.sticky: no auto-dismiss, hovering doesn't open the dashboard, and
+    // other peeks wait it out (Claude Code approvals). opts.onMainClick
+    // replaces activating the notification; the banner stays up.
+    _showNotificationPeek(title, body, gicon, notification = null, actions = [], opts = {}) {
         if (this._destroyed) return;
         if (!this._notifBanner) return;
+        // Nowhere to show it (docking, hotplug): touch nothing, or a sticky
+        // flag would outlive a banner that never appeared.
+        if (!Main.layoutManager.primaryMonitor) return;
+        // ponytail: while a sticky banner is up, other peeks (notifications,
+        // the Focus timer) are skipped, not queued; notifications still land
+        // in the Notifications tab. Queue them if that ever matters.
+        if (this._peekActive && this._peekSticky && !opts.sticky) return;
+
+        this._peekSticky = !!opts.sticky;
+        this._peekMainClick = opts.onMainClick ?? null;
+        // A sticky banner's body is a command / path: wrap it rather than cut
+        // it to one line (helpers/claude.js caps it at 4 lines).
+        let bodyText = this._notifPeekBody.clutter_text;
+        bodyText.line_wrap = this._peekSticky;
+        bodyText.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+        bodyText.set_ellipsize(this._peekSticky ? Pango.EllipsizeMode.NONE : Pango.EllipsizeMode.END);
 
         this._peekNotification = notification;
         this._notifPeekTitle.set_text(title);
-        this._notifPeekBody.set_text(body);
+        // The command must read exactly as it runs: no hyphen of Pango's own
+        // where it wraps inside a word. Markup, because St resets a label's
+        // attributes on each style change; set_text turns markup off again.
+        if (this._peekSticky)
+            bodyText.set_markup(`<span insert_hyphens="false">${GLib.markup_escape_text(body, -1)}</span>`);
+        else
+            this._notifPeekBody.set_text(body);
         this._notifPeekBody.visible = body.length > 0;
         if (gicon && this._notifPeekIcon.set_gicon) {
             try { this._notifPeekIcon.set_gicon(gicon); }
@@ -5212,7 +5275,6 @@ export const NotchNux = GObject.registerClass({
         this._peekActive = true;
 
         let monitor = Main.layoutManager.primaryMonitor;
-        if (!monitor) { this._peekActive = false; return; }
 
         // The pill stays pinned at the top; the banner grows in below it from the
         // same top-center pivot the expand animation uses, so the two motions feel
@@ -5245,7 +5307,12 @@ export const NotchNux = GObject.registerClass({
     // Natural height of the banner content at the peek width, floored to the
     // designed height so a one-line notification still reads as a card.
     _measurePeekHeight() {
-        let [, nat] = this._notifBanner.get_preferred_height(PEEK_WIDTH);
+        // The banner lays out inside the island's padding, so measure it at
+        // that width: at the full width a wrapped body (a Claude command)
+        // came out a line short and the buttons covered its last line.
+        this._surface.ensure_style();
+        let node = this._surface.get_theme_node();
+        let [, nat] = this._notifBanner.get_preferred_height(PEEK_WIDTH - node.get_horizontal_padding());
         // The pill now stays pinned above the banner, so the peek box must be
         // tall enough for both. Add the pill height plus its bottom margin (10px,
         // set on .notchnux-island-peek .notchnux-pill-content in the stylesheet).
@@ -5254,7 +5321,7 @@ export const NotchNux = GObject.registerClass({
             let [, natPillH] = this._pill.get_preferred_height(PEEK_WIDTH);
             pillH = Math.ceil(natPillH) + 10;
         }
-        return Math.max(PEEK_HEIGHT, Math.ceil(nat) + pillH + 20);
+        return Math.max(PEEK_HEIGHT, Math.ceil(nat + node.get_vertical_padding()) + pillH);
     }
 
     // Re-fit the banner if its content changed while already showing.
@@ -5273,6 +5340,8 @@ export const NotchNux = GObject.registerClass({
     _hideNotificationPeek(immediate = false) {
         if (!this._peekActive) return;
         this._peekActive = false;
+        this._peekSticky = false;
+        this._peekMainClick = null;
         // The shell expires transient notifications when their banner hides;
         // the peek replaced that banner, so do the same here.
         let shown = this._peekNotification;
@@ -5327,6 +5396,7 @@ export const NotchNux = GObject.registerClass({
 
     _armPeekDismissTimer() {
         this._clearPeekDismissTimer();
+        if (this._peekSticky) return;   // stays until answered
         this._peekDismissId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PEEK_DISMISS_MS, () => {
             this._peekDismissId = 0;
             // Don't yank the banner out from under the pointer — reschedule.
@@ -6132,10 +6202,12 @@ export const NotchNux = GObject.registerClass({
                 GLib.Source.remove(this._collapseTimeoutId);
                 this._collapseTimeoutId = null;
             }
-            if (!this.isExpanded && !this._expandTimeoutId) {
+            // Not over a sticky banner: reaching for its buttons would open
+            // the dashboard, which hides the banner.
+            if (!this.isExpanded && !this._expandTimeoutId && !this._peekSticky) {
                 this._expandTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 180, () => {
                     this._expandTimeoutId = null;
-                    if (this._pointerInside && !this.isExpanded && !this._anyOwnedMenuOpen())
+                    if (this._pointerInside && !this.isExpanded && !this._anyOwnedMenuOpen() && !this._peekSticky)
                         this.expand();
                     return GLib.SOURCE_REMOVE;
                 });
@@ -6181,7 +6253,7 @@ export const NotchNux = GObject.registerClass({
             this._openPillMenu();
             return Clutter.EVENT_STOP;
         }
-        if (event.get_button() === 1 && !this.isExpanded && !this._anyOwnedMenuOpen()) {
+        if (event.get_button() === 1 && !this.isExpanded && !this._anyOwnedMenuOpen() && !this._peekSticky) {
             this._untuckForExpand();
             this.expand();
         }
@@ -6533,3 +6605,4 @@ export const NotchNux = GObject.registerClass({
 installProductivity(NotchNux.prototype);
 installLedge(NotchNux.prototype);
 installTray(NotchNux.prototype);
+installClaude(NotchNux.prototype);

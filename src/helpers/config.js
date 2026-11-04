@@ -38,7 +38,8 @@ export const TAB_DEFS = [
     { id: 'notes',         label: 'Notes',    icon: 'document-edit-symbolic' },
     { id: 'clipboard',     label: 'Clipboard', icon: 'edit-paste-symbolic' },
     { id: 'studio',        label: 'Studio',   icon: 'camera-web-symbolic' },
-    { id: 'wallpaper',     label: 'Wallpaper', icon: 'preferences-desktop-wallpaper-symbolic' }
+    { id: 'wallpaper',     label: 'Wallpaper', icon: 'preferences-desktop-wallpaper-symbolic' },
+    { id: 'claude',        label: 'Claude',   icon: 'utilities-terminal-symbolic' }
 ];
 
 // Auto-enhancement strengths — the tuned defaults used when the user leaves
@@ -178,6 +179,7 @@ export const FEATURE_DEFS = [
     { id: 'pillStats',         label: 'Stats in the pill',    description: 'Show memory and CPU in the pill when nothing else is live. Read every 2 seconds, only while on.', default: false },
     { id: 'swipeGestures',     label: 'Swipe gestures',       description: 'Two-finger swipe sideways on the pill to skip tracks; swipe down to open, up to close.', default: true },
     { id: 'lyricsOnline',      label: 'Look up lyrics online', description: 'Fetch timed lyrics for the playing song from lrclib.net (sends the song’s title, artist, album and length).', default: true },
+    { id: 'claudeMonitor',     label: 'Claude Code in the pill', description: 'Show your Claude Code sessions and 5-hour usage in the pill, with an alert when one finishes or needs you. Reads ~/.claude/sessions on this computer.', default: false },
     { id: 'topScroll',         label: 'Scroll top edge to switch workspaces', description: 'Restore top-edge scroll-to-switch-workspace when the panel is hidden — scroll anywhere along the top of the screen to move between workspaces.', default: false }
 ];
 
@@ -264,6 +266,8 @@ export class ConfigStore {
         // Clipboard history reads everything the user copies, so it is
         // opt-in: off until enabled in Preferences → Tabs.
         tabs.clipboard = false;
+        // Claude Code monitor: only useful to Claude Code users, so opt-in too.
+        tabs.claude = false;
         let features = {};
         for (let f of FEATURE_DEFS)
             features[f.id] = f.default;
@@ -289,7 +293,12 @@ export class ConfigStore {
             // Keep Awake survives a lock/unlock (the extension is re-enabled).
             keepAwake: false,
             // Music tab shows synced lyrics in place of the vinyl + knob.
-            musicLyrics: false
+            musicLyrics: false,
+            // "Approve from the notch" connected in Preferences.
+            claudeApprove: false,
+            // Desktop id of the editor the Claude tab opens files in; '' =
+            // the first one installed (helpers/claude.js EDITORS).
+            claudeEditor: ''
         };
     }
 
@@ -341,6 +350,8 @@ export class ConfigStore {
                 data.pinnedTabs = this._cleanPinned(parsed.pinnedTabs ?? DEFAULT_PINNED);
                 data.keepAwake = !!parsed.keepAwake;
                 data.musicLyrics = !!parsed.musicLyrics;
+                data.claudeApprove = !!parsed.claudeApprove;
+                data.claudeEditor = typeof parsed.claudeEditor === 'string' ? parsed.claudeEditor : '';
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
             }
         } catch (e) {
@@ -480,6 +491,24 @@ export class ConfigStore {
     setMusicLyrics(on) {
         this._refresh();
         this._data.musicLyrics = !!on;
+        this._save();
+    }
+
+    get claudeApprove() {
+        return !!this._data.claudeApprove;
+    }
+    setClaudeApprove(on) {
+        this._refresh();
+        this._data.claudeApprove = !!on;
+        this._save();
+    }
+
+    get claudeEditor() {
+        return this._data.claudeEditor ?? '';
+    }
+    setClaudeEditor(id) {
+        this._refresh();
+        this._data.claudeEditor = String(id ?? '');
         this._save();
     }
 

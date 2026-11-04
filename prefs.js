@@ -15,10 +15,16 @@ import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import GioUnix from 'gi://GioUnix';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
+import {
+    SETTINGS_PATH, isConnected, connectStatusLine, disconnectStatusLine,
+    isApproveConnected, connectApproveHook, disconnectApproveHook, settingsLayout, formatSettings, parseSettings,
+    installedEditors,
+} from './src/helpers/claude.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -36,6 +42,33 @@ function readConfigFile(path) {
     }
 }
 
+// Claude Code's settings.json → { path, settings, layout } or { path, error }. A
+// symlinked file (dotfile managers) is followed so the write lands on the
+// real file instead of replacing the link. Never guesses: anything that
+// isn't a readable JSON object is an error and nothing gets written.
+function readClaudeSettings() {
+    let path = SETTINGS_PATH;
+    try {
+        if (GLib.file_test(path, GLib.FileTest.IS_SYMLINK))
+            path = GLib.canonicalize_filename(GLib.file_read_link(path), GLib.path_get_dirname(path));
+        let [, bytes] = Gio.File.new_for_path(path).load_contents(null);
+        let text = new TextDecoder().decode(bytes);
+        return { path, settings: parseSettings(text), layout: settingsLayout(text) };
+    } catch (e) {
+        if (e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+            return { path, settings: {}, layout: settingsLayout(null) };
+        return { path, error: `Can’t read ${path} (${e.message}). Nothing was changed.` };
+    }
+}
+
+// In the file's own layout (helpers/claude.js settingsLayout); the previous
+// file is kept as settings.json~.
+function writeClaudeSettings(path, settings, layout) {
+    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
+    let bytes = new TextEncoder().encode(formatSettings(settings, layout));
+    Gio.File.new_for_path(path).replace_contents(bytes, null, true, Gio.FileCreateFlags.NONE, null);
+}
+
 export default class NotchNuxPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const config = new ConfigStore({ readFile: readConfigFile });
@@ -51,6 +84,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         this._addWallpaperGroup(page, config, window);
         this._addTabsGroup(page, config);
         this._addFeaturesGroup(page, config);
+        this._addClaudeGroup(page, config);
         this._addTrayMirrorGroup(page, config);
         this._addQuickShareGroup(page);
         this._addSystemGroup(page);
@@ -671,6 +705,82 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                 config.setFeatureEnabled(f.id, row.get_active());
             });
             group.add(row);
+        }
+    }
+
+    // ---- Claude Code: let the notch see the usage limits ----
+    // Claude Code only hands its 5-hour / weekly usage to the status line
+    // command. Connect puts a small inline step in front of the user's own
+    // command (helpers/claude.js) that saves those numbers for the notch;
+    // Disconnect puts the original back exactly.
+    _addClaudeGroup(page, config) {
+        const group = new Adw.PreferencesGroup({
+            title: 'Claude Code',
+            description: 'Turn on the Claude tab in Tabs and “Claude Code in the pill” in Features to watch your sessions. To also see your 5-hour and weekly usage, connect Claude Code’s status line. To answer permission prompts from the notch, connect approvals.',
+        });
+        page.add(group);
+
+        // One Connect / Disconnect row over ~/.claude/settings.json.
+        // `change(settings, on)` → [new settings, what to do once written].
+        const addRow = (title, isOn, change, onText, offText) => {
+            const row = new Adw.ActionRow({ title, use_markup: false });
+            const btn = new Gtk.Button({ valign: Gtk.Align.CENTER });
+            row.add_suffix(btn);
+            group.add(row);
+
+            const refresh = (note = null) => {
+                const r = readClaudeSettings();
+                const on = !r.error && isOn(r.settings);
+                btn.label = on ? 'Disconnect' : 'Connect';
+                btn.sensitive = !r.error;
+                row.subtitle = note ?? r.error ?? (on ? onText : offText);
+            };
+            btn.connect('clicked', () => {
+                const r = readClaudeSettings();
+                if (r.error) {
+                    refresh();
+                    return;
+                }
+                const [next, done] = change(r.settings, isOn(r.settings));
+                try {
+                    writeClaudeSettings(r.path, next, r.layout);
+                } catch (e) {
+                    refresh(`Couldn’t write ${r.path} (${e.message}).`);
+                    return;
+                }
+                done?.();
+                refresh();
+            });
+            refresh();
+        };
+
+        addRow('Usage limits', isConnected,
+            (s, on) => [on ? disconnectStatusLine(s) : connectStatusLine(s)],
+            'Connected. Your own status line still runs as before.',
+            'Adds a step in front of your status line in ~/.claude/settings.json that saves the usage numbers to ~/.cache/notchnux. Your status line keeps working; the old file is kept as settings.json~.');
+
+        // Settings are written first, so a failed write leaves the notch's
+        // side as it was.
+        addRow('Approve from the notch', s => isApproveConnected(s) && config.claudeApprove,
+            (s, on) => on
+                ? [disconnectApproveHook(s), () => config.setClaudeApprove(false)]
+                : [connectApproveHook(s), () => config.setClaudeApprove(true)],
+            'Connected. Permission prompts show Allow / Deny on the notch; the terminal prompt keeps working.',
+            'Allow or deny Claude Code’s permission prompts from the notch. Adds a hook to ~/.claude/settings.json that hands each prompt to NotchNux through a private socket only your user can reach (needs curl). The terminal prompt keeps working.');
+
+        // Which editor the Claude tab's open button uses. Only installed
+        // ones are offered; none installed hides the row (and the button).
+        const editors = installedEditors(id => GioUnix.DesktopAppInfo.new(id));
+        if (editors.length) {
+            const cur = editors.findIndex(e => e.id === config.claudeEditor);
+            const editorRow = new Adw.ComboRow({
+                title: 'Editor',
+                subtitle: 'The Claude tab’s open button shows ~/.claude and the file for the view you’re on in this editor',
+                model: Gtk.StringList.new(editors.map(e => e.name)),
+                selected: Math.max(0, cur),
+            });
+            editorRow.connect('notify::selected', () => config.setClaudeEditor(editors[editorRow.selected]?.id ?? ''));
+            group.add(editorRow);
         }
     }
 

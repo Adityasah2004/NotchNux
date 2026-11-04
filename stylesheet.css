@@ -2495,3 +2495,100 @@
 .nn-cc-mirror-label {
     margin-bottom: 0;
 }
+
+/* ---- Claude Code: pill dots + Claude tab ---- */
+/* Dot colours are set inline (they follow the accent and session state). */
+.nn-pill-claude {
+    spacing: 6px;
+    padding-left: 6px;
+}
+.nn-pill-claude-dots {
+    spacing: 4px;
+}
+.nn-claude-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+}
+.nn-pill-claude-count {
+    spacing: 2px;
+    font-size: 10px;
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.75);
+}
+.nn-pill-claude-pct {
+    font-size: 11px;
+    font-weight: bold;
+    font-feature-settings: "tnum";
+}
+.nn-claude {
+    spacing: 10px;
+}
+.nn-claude-resets {
+    padding-top: 4px;
+}
+.nn-claude-scroll {
+    max-height: 300px;
+}
+.nn-claude-head {
+    spacing: 8px;
+    margin-bottom: 4px;
+    padding: 0 4px;
+}
+.nn-claude-note {
+    padding: 0 4px 4px;
+}
+.nn-claude-group {
+    padding: 10px 6px 2px;
+}
+.nn-claude-rule {
+    spacing: 10px;
+}
+.nn-claude-badge {
+    min-width: 34px;
+    font-size: 10.5px;
+    font-weight: bold;
+}
+.nn-claude-rule-text {
+    font-family: monospace;
+    font-size: 12px;
+}
+.nn-claude-mcp-sum {
+    padding: 8px 6px 2px;
+}
+.nn-claude-list {
+    spacing: 2px;
+}
+.nn-claude-session {
+    spacing: 4px;
+}
+.nn-claude-row {
+    padding: 7px 10px;
+    border-radius: 12px;
+    background-color: transparent;
+    transition: background-color 120ms ease-out;
+}
+.nn-claude-row:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+.nn-claude-row StBoxLayout {
+    spacing: 10px;
+}
+.nn-claude-row .nn-claude-col {
+    spacing: 1px;
+}
+.nn-claude-name {
+    font-size: 12.5px;
+    color: rgba(255, 255, 255, 0.92);
+}
+.nn-claude-state {
+    font-size: 11.5px;
+    font-weight: bold;
+}
+.nn-claude-age {
+    width: 52px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+    text-align: right;
+    font-feature-settings: "tnum";
+}

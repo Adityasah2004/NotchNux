@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Claude Code monitor (opt-in)
+- A **Claude** tab lists your running Claude Code sessions (working, needs
+  approval, has a question, done, and for how long) with your 5-hour and
+  weekly usage. Click a session to bring its terminal forward.
+- **Claude Code in the pill** (Features): one dot per session plus the
+  5-hour usage in the pill, and a short alert when a session finishes or
+  needs you.
+- Preferences → Claude Code → **Connect** adds a small step in front of your
+  status line in `~/.claude/settings.json` that saves the usage numbers to
+  `~/.cache/notchnux`; your status line keeps working, and **Disconnect**
+  restores the original. Sessions are read from `~/.claude/sessions`.
+  Nothing leaves your machine. Both are off by default.
+- Preferences → Claude Code → **Approve from the notch**: permission prompts
+  show on a banner with **Allow / Always allow / Deny** that stays until you
+  answer, even during Do Not Disturb. The terminal prompt keeps working;
+  answering there clears the banner, and clicking the banner (or Open
+  terminal) hands the prompt back to the terminal. In auto mode the banner
+  shows only once Claude Code really asks you, not for the requests its
+  auto mode settles by itself. Allow is offered only when the banner
+  shows everything it would approve (file edits and unshown options go to
+  the terminal), and Always allow shows the rule it adds. Connect adds a `PermissionRequest`
+  hook to `~/.claude/settings.json` that hands each prompt to NotchNux with
+  `curl` over a socket in your runtime folder, which only your user can
+  reach; NotchNux listens only while connected. A command too long to show
+  in full, prompts inside subagents, plan approvals and Claude's questions
+  are approved in the terminal.
+- The Claude tab has **Sessions · MCP** views. MCP lists servers that need
+  `/mcp` (a login, or a recent failure), read from Claude Code's own cache,
+  and a short alert says when one newly does. **Check now** runs `claude mcp
+  list` in the newest session's folder, with that session's own environment
+  (so servers see your terminal's PATH), and lists the failures with their
+  reason, then the connected servers with their command or URL. With no
+  session running, Check now waits for one: the desktop's PATH would fail
+  servers started through nvm & co., and Claude Code would then skip them in
+  every session for 15 minutes. Long lists scroll.
+- Sessions has a **Remote Control for new sessions** switch
+  (`remoteControlAtStartup` in `~/.claude/settings.json`; off removes the
+  key again). Each running session's row has **/rc** and **/rename**
+  buttons: Claude Code only takes those at the session's own prompt, so
+  they copy the command and bring its terminal forward.
+- An **open in editor** button (Preferences → Claude Code → Editor: VS Code,
+  Cursor or Antigravity, whichever is installed) opens `~/.claude` with the
+  current view's file (`settings.json`, or `~/.claude.json` for MCP), and
+  each Rules group has its own button for that file.
+- A **Rules** view switches the default permission mode for new sessions
+  (Default / Accept edits / Plan / Auto; never bypassPermissions) and lists
+  the allow / ask / deny rules from `~/.claude/settings.json` and each
+  running session's `.claude/settings*.json`. × asks once, then removes the
+  rule; files keep their own layout and the old copy is kept as `name~`.
+- A **Plugins** view turns plugins on or off with `claude plugin
+  enable/disable` (open sessions pick it up after `/reload-plugins`), and
+  personal skills (`~/.claude/skills`) and each running session's project
+  skills on or off through `skillOverrides`; turning one back on removes
+  the override, so the file returns to how it was. Skills follow Claude
+  Code's order (admin policy, the folder's local settings, its project
+  settings, then yours): a personal skill says where a running session's
+  folder decides otherwise, and those folder overrides are listed with a ×
+  to remove them.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.
@@ -24,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - The wallpaper thumbnail worker is killed when the extension is disabled
   instead of being left to finish on its own.
+- A banner whose text wraps (a long Claude Code command) no longer hides
+  its last line under the action buttons, and it shows the command exactly,
+  without a hyphen where a long word wraps.
 
 ## [1.6.1] - 2026-11-01
 

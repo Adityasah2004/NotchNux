@@ -74,7 +74,7 @@ function lbl(text, styleClass, props = {}) {
     return l;
 }
 
-function iconBtn(iconName, styleClass, onClick, name = '') {
+export function iconBtn(iconName, styleClass, onClick, name = '') {
     let b = new St.Button({ style_class: styleClass, can_focus: true, reactive: true,
         y_align: Clutter.ActorAlign.CENTER, accessible_name: name });
     b.set_child(new St.Icon({ icon_name: iconName, icon_size: 14 }));
@@ -92,7 +92,7 @@ function ago(ms) {
     return `${Math.round(s / 86400)}d`;
 }
 
-function statColor(pct) {
+export function statColor(pct) {
     return pct < 70 ? SYS.green : pct < 90 ? SYS.yellow : SYS.red;
 }
 
@@ -404,6 +404,9 @@ export const LedgeFeatures = {
 
     // Something that blocked alerts went away (collapse, peek hidden).
     _promoteAlert() {
+        // A held Claude Code approval goes first (tabs/claude.js).
+        if (this._presentClaudeRequest())
+            return;
         if (this._alertShowing || !this._canShowAlert() || !this._alerts.hasPending)
             return;
         if (this._alerts.promote())
@@ -590,6 +593,8 @@ export const LedgeFeatures = {
         if (this._pillMic?.visible || this._pillCam?.visible)
             return false;
         if (this._config.isFeatureEnabled('pillStats'))
+            return false;
+        if (this._claudeNeedsYou?.())
             return false;
         return true;
     },
