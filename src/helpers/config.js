@@ -183,10 +183,17 @@ export const FEATURE_DEFS = [
 
 const DEFAULT_ACCENT = '#7aa2ff';
 
-// Up to this many tabs sit beside Home in the dashboard header; everything
-// else is one click away in the grid.
-export const MAX_PINNED = 5;
+// Up to `pinnedMax` tabs (1–MAX_PINNED, set in Preferences) sit beside Home
+// in the dashboard header; everything else is one click away in the grid.
+export const MAX_PINNED = 8;
+export const DEFAULT_PINNED_MAX = 5;
 export const DEFAULT_PINNED = ['media', 'tasks', 'calendar', 'weather', 'system'];
+
+// A stored shortcut limit → an integer in 1–MAX_PINNED (default when unset).
+export function clampPinnedMax(n) {
+    let v = typeof n === 'number' || typeof n === 'string' ? Math.round(Number(n)) : NaN;
+    return Number.isFinite(v) && String(n).trim() !== '' ? Math.max(1, Math.min(MAX_PINNED, v)) : DEFAULT_PINNED_MAX;
+}
 
 // Accept #rgb / #rrggbb (with or without leading #), returns a normalized
 // lowercase "#rrggbb" string, or null if the input isn't a valid hex colour.
@@ -284,8 +291,10 @@ export class ConfigStore {
             // prefs process can render a picker for indicators it can't see
             // directly. Not user-authored; overwritten by the shell.
             trayMirrorItems: [],
-            // Shortcuts beside Home in the header (see MAX_PINNED).
+            // Shortcuts beside Home in the header: up to MAX_PINNED kept,
+            // the first pinnedMax shown.
             pinnedTabs: [...DEFAULT_PINNED],
+            pinnedMax: DEFAULT_PINNED_MAX,
             // Keep Awake survives a lock/unlock (the extension is re-enabled).
             keepAwake: false,
             // Music tab shows synced lyrics in place of the vinyl + knob.
@@ -339,6 +348,7 @@ export class ConfigStore {
                     : [];
                 data.accent = normalizeHex(parsed.accent) ?? DEFAULT_ACCENT;
                 data.pinnedTabs = this._cleanPinned(parsed.pinnedTabs ?? DEFAULT_PINNED);
+                data.pinnedMax = clampPinnedMax(parsed.pinnedMax);
                 data.keepAwake = !!parsed.keepAwake;
                 data.musicLyrics = !!parsed.musicLyrics;
                 data.tabOrder = this._reconcileOrder(parsed.tabOrder);
@@ -456,12 +466,23 @@ export class ConfigStore {
         }
         return out.slice(0, MAX_PINNED);
     }
+    // ponytail: the stored list keeps up to MAX_PINNED, so lowering the
+    // limit and raising it again brings shortcuts back, until the next edit
+    // in the grid saves only the ones shown.
     get pinnedTabs() {
-        return this._cleanPinned(this._data.pinnedTabs);
+        return this._cleanPinned(this._data.pinnedTabs).slice(0, this.pinnedMax);
     }
     setPinnedTabs(list) {
         this._refresh();
         this._data.pinnedTabs = this._cleanPinned(list);
+        this._save();
+    }
+    get pinnedMax() {
+        return clampPinnedMax(this._data.pinnedMax);
+    }
+    setPinnedMax(n) {
+        this._refresh();
+        this._data.pinnedMax = clampPinnedMax(n);
         this._save();
     }
 

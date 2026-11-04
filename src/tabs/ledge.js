@@ -27,7 +27,6 @@ import { AlertQueue, powerAlertFor } from '../helpers/alerts.js';
 import { ClipboardHistory } from '../helpers/clipboard.js';
 import { LyricsService, lineAt } from '../helpers/lyrics.js';
 import { springTo, addPressFeedback } from '../helpers/motion.js';
-import { MAX_PINNED } from '../helpers/config.js';
 import { PILL_HEIGHT } from '../helpers/island.js';
 import { fmtCountdown } from '../helpers/productivity.js';
 import { accentHex, accentRgbStr } from '../helpers/widgets.js';
@@ -1118,7 +1117,8 @@ export const LedgeFeatures = {
             let rgb = accentRgbStr();
             edit.label = this._launcherEdit ? 'Done' : 'Edit';
             edit.set_style(this._launcherEdit ? `background-color: ${accentHex()}; color: #000;` : null);
-            hint.set_text(this._launcherEdit ? `Shortcuts beside Home · ${pinned.length}/${MAX_PINNED}` : 'Hold a tile to pick shortcuts');
+            let max = this._config.pinnedMax;
+            hint.set_text(this._launcherEdit ? `Shortcuts beside Home · ${pinned.length}/${max}` : 'Hold a tile to pick shortcuts');
             for (let t of tiles) {
                 let on = t.e.tab ? pinned.includes(t.e.id) : this._toggleTileOn(t.e.id);
                 if (t.e.tab) {
@@ -1127,7 +1127,7 @@ export const LedgeFeatures = {
                     t.badgeIcon.icon_name = on ? 'object-select-symbolic' : 'list-add-symbolic';
                     t.badge.set_style(on ? `background-color: ${accentHex()}; color: #000;` : null);
                     t.iconBin.set_style(this._launcherEdit && on ? `border-color: rgba(${rgb}, 0.7);` : null);
-                    t.tile.opacity = this._launcherEdit && !on && pinned.length >= MAX_PINNED ? 120 : 255;
+                    t.tile.opacity = this._launcherEdit && !on && pinned.length >= max ? 120 : 255;
                     if (t.e.id === 'notifications') {
                         let n = 0;
                         try {
@@ -1174,7 +1174,7 @@ export const LedgeFeatures = {
         let pinned = this._config.pinnedTabs;
         if (pinned.includes(e.id))
             pinned = pinned.filter(id => id !== e.id);
-        else if (pinned.length < MAX_PINNED)
+        else if (pinned.length < this._config.pinnedMax)
             pinned = [...pinned, e.id];
         else
             return;

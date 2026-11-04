@@ -18,7 +18,7 @@ import GObject from 'gi://GObject';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
+import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS, MAX_PINNED } from './src/helpers/config.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
 const ACCENT_PRESETS = ['#7aa2ff', '#a78bfa', '#f472b6', '#f87171', '#fb923c', '#e8b06a', '#34d399', '#22d3ee'];
@@ -327,10 +327,10 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         const patch = (p) => config.setWallpaper(p);
 
         // Folder chooser. Shows the current folder as the subtitle.
-        const folderRow = new Adw.ActionRow({
-            title: 'Folder',
-            subtitle: wp.folder || 'No folder selected',
-        });
+        // A path ("Rock & Roll") isn't markup. Subtitle after construction:
+        // one given to the constructor is parsed before use_markup applies.
+        const folderRow = new Adw.ActionRow({ title: 'Folder', use_markup: false });
+        folderRow.subtitle = wp.folder || 'No folder selected';
         const folderBtn = new Gtk.Button({
             icon_name: 'folder-open-symbolic',
             valign: Gtk.Align.CENTER,
@@ -615,6 +615,16 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             rowsById.set(id, row);
             listBox.append(row);
         }
+
+        // How many tabs sit beside Home; which ones is picked in the grid.
+        const pinRow = new Adw.SpinRow({
+            title: 'Header shortcuts',
+            subtitle: `Tabs beside Home in the dashboard header, 1 to ${MAX_PINNED}. Hold a tile in the grid to pick them.`,
+            adjustment: new Gtk.Adjustment({ lower: 1, upper: MAX_PINNED, step_increment: 1, page_increment: 1,
+                value: config.pinnedMax }),
+        });
+        pinRow.connect('notify::value', () => config.setPinnedMax(pinRow.get_value()));
+        group.add(pinRow);
     }
 
     // Wire up drag-and-drop reordering for a tab row. On drop we move the
@@ -662,11 +672,15 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         page.add(group);
 
         for (const f of FEATURE_DEFS) {
+            // Plain text: labels like "Charging & low battery alerts" aren't
+            // markup. Subtitle after construction, or it's parsed before
+            // use_markup applies.
             const row = new Adw.SwitchRow({
                 title: f.label,
-                subtitle: f.description,
+                use_markup: false,
                 active: config.isFeatureEnabled(f.id),
             });
+            row.subtitle = f.description;
             row.connect('notify::active', () => {
                 config.setFeatureEnabled(f.id, row.get_active());
             });
@@ -704,13 +718,16 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
         const sorted = [...items].sort((a, b) =>
             String(a.label).localeCompare(String(b.label)));
         for (const it of sorted) {
+            // Other extensions' labels aren't markup (subtitle set after
+            // construction, or it's parsed before use_markup applies).
             const row = new Adw.SwitchRow({
                 title: it.label || it.id,
-                // Show the raw id as a subtitle so ambiguous entries (two icons
-                // with the same name) are still distinguishable.
-                subtitle: it.id,
+                use_markup: false,
                 active: config.isTrayMirrorEnabled(it.id),
             });
+            // Show the raw id as a subtitle so ambiguous entries (two icons
+            // with the same name) are still distinguishable.
+            row.subtitle = it.id;
             row.connect('notify::active', () => {
                 config.setTrayMirrorEnabled(it.id, row.get_active());
             });
@@ -794,6 +811,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                         title: d.name,
                         subtitle: ready ? 'Ready to receive'
                             : !d.paired ? 'Not paired' : 'Not connected',
+                        use_markup: false,   // a device name, e.g. "Tom & Jerry's phone"
                     });
                     row.add_prefix(new Gtk.Image({ icon_name: iconFor(d.type), valign: Gtk.Align.CENTER }));
                     if (ready) {
