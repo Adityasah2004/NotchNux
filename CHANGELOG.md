@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — GNOME 51 support
+- `shell-version` is now GNOME 50 and 51. GNOME 51 ("A Coruña") removed
+  several APIs the extension used:
+  - `St.BoxLayout`'s `vertical` property is gone; every box now uses
+    `orientation: Clutter.Orientation.VERTICAL/HORIZONTAL` (works on 50 too).
+  - `Shell.GLSLEffect` is gone; the three GLSL masks (island glass, wallpaper
+    slit deck, wallpaper reveal) now run on `Clutter.ShaderEffect` with a
+    `Cogl.Snippet` on 51 and keep the shell's `GLSLEffect` on 50. One shim
+    (`src/helpers/shadereffect.js`) picks the implementation at runtime.
+  - `Meta.BackgroundImageCache` and `MetaBackground.set_file()` are gone, so
+    the animated wallpaper reveal decodes the picture itself with glycin
+    (the loader GNOME 51 uses) and hands Mutter a texture. If glycin or the
+    texture API is missing, the wallpaper is swapped without the reveal
+    instead of failing.
+  - `PopupMenu.open()`/`close()` take an options object now.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.
@@ -18,12 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU, network, RAM and backlight readings, the lyrics cache and the live
   config reload are async too. (The prefs window, a separate process, still
   reads the config synchronously before each save.)
-- `shell-version` is now just GNOME 50, the only version it has been tested on.
+- `shell-version` now covers GNOME 50 and 51.
 - Added `pack.sh` to build the upload zip.
 
 ### Fixed
 - The wallpaper thumbnail worker is killed when the extension is disabled
   instead of being left to finish on its own.
+- The extension no longer refuses to load on systems without the GStreamer
+  plugins-base typelib (`GstApp` was imported but never used).
+- The wallpaper transition and the preferences window no longer throw a
+  `ReferenceError` in their error paths: both called `logError()` without
+  importing it, so a failure was reported as "logError is not defined".
 
 ## [1.6.1] - 2026-11-01
 

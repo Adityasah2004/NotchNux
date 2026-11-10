@@ -37,7 +37,7 @@ function iconButton(iconName, styleClass, onClick, accessibleName = null) {
 }
 
 function card(styleClass = '') {
-    return new St.BoxLayout({ style_class: `nook-card ${styleClass}`.trim(), vertical: true, x_expand: true });
+    return new St.BoxLayout({ style_class: `nook-card ${styleClass}`.trim(), orientation: Clutter.Orientation.VERTICAL, x_expand: true });
 }
 
 function eyebrow(text) {
@@ -227,14 +227,14 @@ export const ProductivityTabs = {
     // ------------------------------------------------------------ Home
 
     _renderHomeTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-home', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-home', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
 
         // Greeting + weather chip.
         let now = new Date();
         let hour = now.getHours();
         let greeting = hour < 5 ? 'Good night' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
         let head = new St.BoxLayout({ style_class: 'nook-home-head', x_expand: true });
-        let titles = new St.BoxLayout({ vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        let titles = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         titles.add_child(label(greeting, 'nook-home-greeting'));
         titles.add_child(label(fmt(now, { weekday: 'long', month: 'long', day: 'numeric' }), 'nook-home-date'));
         head.add_child(titles);
@@ -252,8 +252,8 @@ export const ProductivityTabs = {
         panel.add_child(head);
 
         let grid = new St.BoxLayout({ style_class: 'nook-home-grid', x_expand: true });
-        let left = new St.BoxLayout({ style_class: 'nook-home-col', vertical: true, x_expand: true });
-        let right = new St.BoxLayout({ style_class: 'nook-home-col nook-home-side', vertical: true });
+        let left = new St.BoxLayout({ style_class: 'nook-home-col', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
+        let right = new St.BoxLayout({ style_class: 'nook-home-col nook-home-side', orientation: Clutter.Orientation.VERTICAL });
         grid.add_child(left);
         grid.add_child(right);
         panel.add_child(grid);
@@ -286,7 +286,7 @@ export const ProductivityTabs = {
     // Next timed event today ("Up next"), or the rest of the day's count.
     _buildHomeAgenda() {
         let c = new St.Button({ style_class: 'nook-card nook-home-agenda', x_expand: true, can_focus: true });
-        let box = new St.BoxLayout({ vertical: true, x_expand: true });
+        let box = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         c.set_child(box);
         c.connect('clicked', () => this._switchTab('calendar'));
         addPressFeedback(c, 0.98);
@@ -316,7 +316,7 @@ export const ProductivityTabs = {
         let bar = new St.Widget({ style_class: 'nook-home-agenda-bar' });
         bar.set_style(`background-color: ${accentHex()};`);
         row.add_child(bar);
-        let text = new St.BoxLayout({ vertical: true, x_expand: true });
+        let text = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         text.add_child(label(next.title, 'nook-home-agenda-title'));
         let mins = Math.round((next.start - now) / 60000);
         let when = next.start <= now ? `until ${fmt(next.end, { hour: 'numeric', minute: '2-digit' })}`
@@ -337,7 +337,7 @@ export const ProductivityTabs = {
         head.add_child(count);
         c.add_child(head);
 
-        let list = new St.BoxLayout({ style_class: 'nook-home-task-list', vertical: true, x_expand: true });
+        let list = new St.BoxLayout({ style_class: 'nook-home-task-list', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         c.add_child(list);
 
         let entry = new St.Entry({ style_class: 'nook-input nook-input-compact', hint_text: 'Add a task…',
@@ -370,7 +370,7 @@ export const ProductivityTabs = {
     },
 
     _buildHomeFocus() {
-        let c = new St.BoxLayout({ style_class: 'nook-card nook-home-focus', vertical: false, x_expand: true });
+        let c = new St.BoxLayout({ style_class: 'nook-card nook-home-focus', orientation: Clutter.Orientation.HORIZONTAL, x_expand: true });
         let ringStack = new St.Widget({ layout_manager: new Clutter.BinLayout(), y_align: Clutter.ActorAlign.CENTER });
         let ring = new FocusRing(58, 5);
         ringStack.add_child(ring);
@@ -378,7 +378,7 @@ export const ProductivityTabs = {
         ringStack.add_child(time);
         c.add_child(ringStack);
 
-        let side = new St.BoxLayout({ vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        let side = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         let phase = eyebrow('FOCUS');
         side.add_child(phase);
         let action = new St.Button({ style_class: 'nook-pill-btn', x_align: Clutter.ActorAlign.START, can_focus: true });
@@ -412,7 +412,7 @@ export const ProductivityTabs = {
         let artBox = new St.Bin({ style_class: 'nook-home-art', y_align: Clutter.ActorAlign.CENTER });
         artBox.set_child(art);
         row.add_child(artBox);
-        let text = new St.BoxLayout({ vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        let text = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         let title = label('', 'nook-home-media-title');
         let artist = label('', 'nook-home-media-artist');
         text.add_child(title);
@@ -535,7 +535,7 @@ export const ProductivityTabs = {
     },
 
     _renderTasksTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-tasks', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-tasks', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         this._tasksView ??= 'open';
 
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
@@ -587,7 +587,7 @@ export const ProductivityTabs = {
         let scroll = new St.ScrollView({ style_class: 'nook-task-scroll', x_expand: true });
         scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
         scroll.set_overlay_scrollbars(true);
-        let list = new St.BoxLayout({ style_class: 'nook-task-list', vertical: true, x_expand: true });
+        let list = new St.BoxLayout({ style_class: 'nook-task-list', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         scroll.set_child(list);
         panel.add_child(scroll);
 
@@ -608,7 +608,7 @@ export const ProductivityTabs = {
             list.destroy_all_children();
             let items = view === 'open' ? open : done;
             if (items.length === 0) {
-                let empty = new St.BoxLayout({ style_class: 'nook-empty', vertical: true, x_expand: true });
+                let empty = new St.BoxLayout({ style_class: 'nook-empty', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
                 let ic = new St.Icon({ icon_name: view === 'open' ? 'checkbox-checked-symbolic' : 'task-due-symbolic',
                     icon_size: 26, style_class: 'nook-empty-icon', x_align: Clutter.ActorAlign.CENTER });
                 ic.set_style(`color: rgba(${accentRgbStr()}, 0.8);`);
@@ -637,7 +637,7 @@ export const ProductivityTabs = {
 
     _renderFocusTab() {
         this._swUi = null;
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-focus', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-focus', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
 
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
         head.add_child(this._buildFocusModeSwitch());
@@ -660,7 +660,7 @@ export const ProductivityTabs = {
         let ringStack = new St.Widget({ layout_manager: new Clutter.BinLayout() });
         let ring = new FocusRing(168, 11);
         ringStack.add_child(ring);
-        let center = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
+        let center = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER });
         let time = new St.Label({ style_class: 'nook-focus-time', x_align: Clutter.ActorAlign.CENTER });
         let sub = new St.Label({ style_class: 'nook-focus-sub', x_align: Clutter.ActorAlign.CENTER });
         center.add_child(time);
@@ -669,7 +669,7 @@ export const ProductivityTabs = {
         body.add_child(ringStack);
 
         // Right column: presets, controls, today's stats.
-        let side = new St.BoxLayout({ style_class: 'nook-focus-side', vertical: true, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        let side = new St.BoxLayout({ style_class: 'nook-focus-side', orientation: Clutter.Orientation.VERTICAL, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         side.add_child(eyebrow('LENGTH'));
         let presets = new St.BoxLayout({ style_class: 'nook-chip-row' });
         let presetBtns = {};
@@ -756,7 +756,7 @@ export const ProductivityTabs = {
     // ------------------------------------------------------------ Notes
 
     _renderNotesTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-notes', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-notes', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
 
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
         head.add_child(label('Notes', 'nook-section-title'));
@@ -797,7 +797,7 @@ export const ProductivityTabs = {
         let scroll = new St.ScrollView({ style_class: 'nook-notes-scroll', x_expand: true });
         scroll.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
         scroll.set_overlay_scrollbars(true);
-        let wrap = new St.BoxLayout({ vertical: true, x_expand: true });
+        let wrap = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let entry = new St.Entry({ style_class: 'nook-notes-entry', hint_text: 'Jot something down… it saves as you type.',
             can_focus: true, x_expand: true, text: this._prod.notes });
         let text = entry.clutter_text;

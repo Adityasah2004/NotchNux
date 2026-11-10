@@ -11,10 +11,11 @@
 // notch itself) and a small shader masks it to the island's rounded shape.
 
 import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
 import GObject from 'gi://GObject';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
+
+import { makeShaderEffect } from './shadereffect.js';
 
 // Solid island fill. The shoulders are painted in Cairo and must match it.
 export const ISLAND_RGB = [0, 0, 0];
@@ -45,22 +46,11 @@ if (p.x > shape.x || p.y > shape.y) {
 `;
 
 const RoundedMaskEffect = GObject.registerClass(
-class RoundedMaskEffect extends Shell.GLSLEffect {
-    _init() {
-        super._init();
-        this._sizeLoc = this.get_uniform_location('size');
-        this._shapeLoc = this.get_uniform_location('shape');
-        this._radiusLoc = this.get_uniform_location('radius');
-    }
-
-    vfunc_build_pipeline() {
-        this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, MASK_DECLARATIONS, MASK_CODE, false);
-    }
-
+class RoundedMaskEffect extends makeShaderEffect('NotchNuxRoundedMaskEffect', MASK_DECLARATIONS, MASK_CODE) {
     setShape(boxWidth, boxHeight, width, height, radius) {
-        this.set_uniform_float(this._sizeLoc, 2, [boxWidth, boxHeight]);
-        this.set_uniform_float(this._shapeLoc, 2, [width, height]);
-        this.set_uniform_float(this._radiusLoc, 1, [radius]);
+        this.setUniform('size', 2, [boxWidth, boxHeight]);
+        this.setUniform('shape', 2, [width, height]);
+        this.setUniform('radius', 1, [radius]);
         this.queue_repaint();
     }
 });

@@ -774,7 +774,7 @@ export const LedgeFeatures = {
     _buildPillStats() {
         this._pillStatsBox = new St.BoxLayout({ style_class: 'nn-pill-stats', y_align: Clutter.ActorAlign.CENTER, visible: false });
         let mk = name => {
-            let col = new St.BoxLayout({ vertical: true, y_align: Clutter.ActorAlign.CENTER, style_class: 'nn-pill-stat' });
+            let col = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, y_align: Clutter.ActorAlign.CENTER, style_class: 'nn-pill-stat' });
             col.add_child(new St.Label({ text: name, style_class: 'nn-pill-stat-cap' }));
             let v = new St.Label({ text: '–', style_class: 'nn-pill-stat-val' });
             col.add_child(v);
@@ -1026,7 +1026,7 @@ export const LedgeFeatures = {
     // ================================================================ launcher (grid)
 
     _renderLauncherTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nn-launcher', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nn-launcher', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
         let title = lbl('Everything', 'nook-section-title');
         head.add_child(title);
@@ -1042,7 +1042,7 @@ export const LedgeFeatures = {
         head.add_child(edit);
         panel.add_child(head);
 
-        let grid = new St.BoxLayout({ style_class: 'nn-grid', vertical: true, x_expand: true });
+        let grid = new St.BoxLayout({ style_class: 'nn-grid', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         panel.add_child(grid);
 
         let tabs = this._tabOrder.filter(id => id !== 'home' && this._tabs[id]);
@@ -1059,7 +1059,7 @@ export const LedgeFeatures = {
             }
             let tile = new St.Button({ style_class: 'nn-tile', can_focus: true, reactive: true,
                 accessible_name: e.label });
-            let col = new St.BoxLayout({ vertical: true, x_align: Clutter.ActorAlign.CENTER });
+            let col = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_align: Clutter.ActorAlign.CENTER });
             let iconStack = new St.Widget({ layout_manager: new Clutter.BinLayout(), x_align: Clutter.ActorAlign.CENTER });
             let iconBin = new St.Bin({ style_class: 'nn-tile-icon' });
             iconBin.set_child(new St.Icon({ icon_name: e.icon, icon_size: 20 }));
@@ -1211,7 +1211,7 @@ export const LedgeFeatures = {
     },
 
     _renderClipboardTab() {
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nn-clip', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nn-clip', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
         head.add_child(lbl('Clipboard', 'nook-section-title'));
         let search = new St.Entry({ style_class: 'nook-input nook-input-compact nn-clip-search', hint_text: 'Search',
@@ -1225,7 +1225,7 @@ export const LedgeFeatures = {
         head.add_child(clear);
         panel.add_child(head);
 
-        let list = new St.BoxLayout({ style_class: 'nn-clip-list', vertical: true, x_expand: true });
+        let list = new St.BoxLayout({ style_class: 'nn-clip-list', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         panel.add_child(list);
         let foot = lbl('', 'nook-card-meta');
         panel.add_child(foot);
@@ -1239,7 +1239,7 @@ export const LedgeFeatures = {
                 .sort((a, b) => (b.pinned - a.pinned) || (b.at - a.at))
                 .slice(0, CLIP_ROWS);
             if (shown.length === 0) {
-                let empty = new St.BoxLayout({ style_class: 'nook-empty', vertical: true, x_expand: true });
+                let empty = new St.BoxLayout({ style_class: 'nook-empty', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
                 empty.add_child(new St.Icon({ icon_name: 'edit-paste-symbolic', icon_size: 22, style_class: 'nook-dim', x_align: Clutter.ActorAlign.CENTER }));
                 empty.add_child(new St.Label({ text: q ? 'No matches' : 'Nothing copied yet', style_class: 'nook-empty-title', x_align: Clutter.ActorAlign.CENTER }));
                 empty.add_child(new St.Label({ text: q ? 'Try another word.' : 'Copy some text and it shows up here. Passwords are skipped.',
@@ -1262,7 +1262,7 @@ export const LedgeFeatures = {
     _buildClipRow(item) {
         let row = new St.BoxLayout({ style_class: 'nn-clip-row', x_expand: true, reactive: true, track_hover: true });
         let main = new St.Button({ style_class: 'nn-clip-main', x_expand: true, can_focus: true });
-        let col = new St.BoxLayout({ vertical: true, x_expand: true });
+        let col = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let text = lbl(item.text.replace(/\s+/g, ' ').trim().slice(0, 300), 'nn-clip-text');
         let meta = lbl([item.app, ago(item.at)].filter(Boolean).join(' · '), 'nook-card-meta');
         col.add_child(text);
@@ -1292,7 +1292,7 @@ export const LedgeFeatures = {
     _buildLyricsBlock(badge) {
         let block = new St.Widget({ style_class: 'nn-lyrics', layout_manager: new Clutter.BinLayout(),
             x_expand: true, clip_to_allocation: true });
-        let body = new St.BoxLayout({ style_class: 'nn-lyrics-body', vertical: true, x_expand: true,
+        let body = new St.BoxLayout({ style_class: 'nn-lyrics-body', orientation: Clutter.Orientation.VERTICAL, x_expand: true,
             y_align: Clutter.ActorAlign.CENTER });
         block.add_child(body);
         let lines = [];
@@ -1308,7 +1308,7 @@ export const LedgeFeatures = {
         let plainView = new St.ScrollView({ style_class: 'nn-lyrics-plain', x_expand: true, y_expand: true,
             visible: false, overlay_scrollbars: true });
         plainView.set_policy(St.PolicyType.NEVER, St.PolicyType.AUTOMATIC);
-        let plainBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        let plainBox = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let plain = new St.Label({ style_class: 'nn-lyrics-plain-text', x_expand: true });
         plain.clutter_text.line_wrap = true;
         plain.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
@@ -1546,7 +1546,7 @@ export const LedgeFeatures = {
 
     _renderStopwatchPanel() {
         this._focusUi = null;
-        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-focus nn-sw', vertical: true, x_expand: true });
+        let panel = new St.BoxLayout({ style_class: 'notchnux-panel nook-focus nn-sw', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         let head = new St.BoxLayout({ style_class: 'nook-section-head', x_expand: true });
         head.add_child(this._buildFocusModeSwitch());
         head.add_child(new St.Widget({ x_expand: true }));
@@ -1573,7 +1573,7 @@ export const LedgeFeatures = {
         body.add_child(controls);
         panel.add_child(body);
 
-        let laps = new St.BoxLayout({ style_class: 'nn-sw-laps', vertical: true, x_expand: true });
+        let laps = new St.BoxLayout({ style_class: 'nn-sw-laps', orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         panel.add_child(laps);
 
         let lapSig = '';

@@ -20,10 +20,12 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
-import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+import { makeShaderEffect } from './shadereffect.js';
+import { logError } from './log.js';
 
 export const TRANSITIONS = ['grow', 'wipe', 'fade', 'none'];
 export const TRANSITION_LABELS = ['Grow from notch', 'Slanted wipe', 'Fade', 'None'];
@@ -33,6 +35,12 @@ const DURATION = { grow: 1100, wipe: 950, fade: 700 };
 // (background.js FADE_ANIMATION_TIME); stay on top until that's over.
 const HANDOFF_MS = 1250;
 const LOAD_TIMEOUT_MS = 4000;
+
+// GNOME 50 hands out a Meta.BackgroundImageCache and MetaBackground.set_file()
+// loads the picture itself. GNOME 51 dropped both: backgrounds are textures
+// now, so we decode the file ourselves (glycin, the loader GNOME 51's own
+// background code uses) and hand Mutter a CoglTexture.
+const HAS_BACKGROUND_IMAGE_CACHE = typeof Meta.BackgroundImageCache !== 'undefined';
 
 const DECLS = `
 uniform vec2 size;
@@ -73,22 +81,17 @@ cogl_color_out = c * a;
 `;
 
 const RevealMask = GObject.registerClass(
-class RevealMask extends Shell.GLSLEffect {
+class RevealMask extends makeShaderEffect('NotchNuxRevealMask', DECLS, CODE) {
     _init(width, height, origin, mode) {
         super._init();
-        this._progLoc = this.get_uniform_location('progress');
-        this.set_uniform_float(this.get_uniform_location('size'), 2, [width, height]);
-        this.set_uniform_float(this.get_uniform_location('origin'), 2, origin);
-        this.set_uniform_float(this.get_uniform_location('mode'), 1, [mode]);
+        this.setUniform('size', 2, [width, height]);
+        this.setUniform('origin', 2, origin);
+        this.setUniform('mode', 1, [mode]);
         this.setProgress(0);
     }
 
-    vfunc_build_pipeline() {
-        this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, DECLS, CODE, false);
-    }
-
     setProgress(p) {
-        this.set_uniform_float(this._progLoc, 1, [p]);
+        this.setUniform('progress', 1, [p]);
         this.queue_repaint();
     }
 });
@@ -99,6 +102,117 @@ function easeInOutCubic(t) {
 
 function easeOutQuart(t) {
     return 1 - Math.pow(1 - t, 4);
+}
+
+// Map a glycin memory format to the Cogl one Mutter wants for a texture.
+function coglFormatFor(Gly, glyFormat) {
+    switch (glyFormat) {
+    case Gly.MemoryFormat.B8G8R8A8_PREMULTIPLIED:
+        return Cogl.PixelFormat.BGRA_8888_PRE;
+    case Gly.MemoryFormat.A8R8G8B8_PREMULTIPLIED:
+        return Cogl.PixelFormat.ARGB_8888_PRE;
+    case Gly.MemoryFormat.R8G8B8A8_PREMULTIPLIED:
+        return Cogl.PixelFormat.RGBA_8888_PRE;
+    case Gly.MemoryFormat.B8G8R8A8:
+        return Cogl.PixelFormat.BGRA_8888;
+    case Gly.MemoryFormat.A8R8G8B8:
+        return Cogl.PixelFormat.ARGB_8888;
+    case Gly.MemoryFormat.R8G8B8A8:
+        return Cogl.PixelFormat.RGBA_8888;
+    case Gly.MemoryFormat.A8B8G8R8:
+        return Cogl.PixelFormat.ABGR_8888;
+    case Gly.MemoryFormat.R8G8B8:
+        return Cogl.PixelFormat.RGB_888;
+    case Gly.MemoryFormat.B8G8B8:
+        return Cogl.PixelFormat.BGR_888;
+    case Gly.MemoryFormat.R16G16B16A16_PREMULTIPLIED:
+        return Cogl.PixelFormat.RGBA_16161616_PRE;
+    case Gly.MemoryFormat.R16G16B16A16:
+        return Cogl.PixelFormat.RGBA_16161616;
+    case Gly.MemoryFormat.R16G16B16A16_FLOAT:
+        return Cogl.PixelFormat.RGBA_FP_16161616;
+    case Gly.MemoryFormat.R32G32B32A32_PREMULTIPLIED:
+        return Cogl.PixelFormat.RGBA_FP_32323232_PRE;
+    case Gly.MemoryFormat.R32G32B32A32_FLOAT:
+        return Cogl.PixelFormat.RGBA_FP_32323232;
+    default:
+        throw new Error(`Unsupported glycin memory format: ${glyFormat}`);
+    }
+}
+
+// The colour space the picture was tagged with, as Mutter's colour state.
+// Null when the file carries no CICP info (or we cannot build one) — Mutter
+// then treats the texture as-is.
+function colorStateFor(cicp) {
+    if (!cicp)
+        return null;
+    try {
+        const clutterCicp = new Clutter.Cicp({
+            primaries: cicp.color_primaries,
+            transfer: cicp.transfer_characteristics,
+            matrix_coefficients: cicp.matrix_coefficients,
+            video_full_range_flag: cicp.video_full_range_flag,
+        });
+        return Clutter.ColorStateParams.new_from_cicp(global.stage.context, clutterCicp);
+    } catch (e) {
+        logError('wallpaper colour state', e);
+        return null;
+    }
+}
+
+// Decode `file` into a Cogl texture, the way GNOME 51's own background code
+// does it (glycin -> Cogl). Throws when glycin is missing or the picture
+// cannot be decoded; the caller then falls back to a plain wallpaper swap.
+async function loadWallpaperTexture(file) {
+    const {default: Gly} = await import('gi://Gly');
+
+    const stream = await file.read_async(GLib.PRIORITY_DEFAULT, null);
+    const loader = Gly.Loader.new_for_stream(stream);
+    loader.set_accepted_memory_formats(
+        Gly.MemoryFormatSelection.B8G8R8A8_PREMULTIPLIED |
+        Gly.MemoryFormatSelection.A8R8G8B8_PREMULTIPLIED |
+        Gly.MemoryFormatSelection.R8G8B8A8_PREMULTIPLIED |
+        Gly.MemoryFormatSelection.B8G8R8A8 |
+        Gly.MemoryFormatSelection.A8R8G8B8 |
+        Gly.MemoryFormatSelection.R8G8B8A8 |
+        Gly.MemoryFormatSelection.A8B8G8R8 |
+        Gly.MemoryFormatSelection.R8G8B8 |
+        Gly.MemoryFormatSelection.B8G8B8 |
+        Gly.MemoryFormatSelection.R16G16B16A16_PREMULTIPLIED |
+        Gly.MemoryFormatSelection.R16G16B16A16 |
+        Gly.MemoryFormatSelection.R16G16B16A16_FLOAT |
+        Gly.MemoryFormatSelection.R32G32B32A32_PREMULTIPLIED |
+        Gly.MemoryFormatSelection.R32G32B32A32_FLOAT
+    );
+
+    const image = loader.load();
+    const frame = image.next_frame();
+
+    const width = frame.get_width();
+    const height = frame.get_height();
+    const stride = frame.get_stride();
+    const bytes = frame.get_buf_bytes();
+    const format = frame.get_memory_format();
+    const colorState = colorStateFor(frame.get_color_cicp());
+
+    const ctx = global.stage.context.get_backend().get_cogl_context();
+    const components = Gly.memory_format_has_alpha(format)
+        ? Cogl.TextureComponents.RGBA
+        : Cogl.TextureComponents.RGB;
+
+    let texture = Cogl.Texture2D.new_with_size(ctx, width, height);
+    texture.set_components(components);
+    try {
+        texture.allocate();
+    } catch {
+        // Too big for one allocation: fall back to a sliced texture.
+        texture = Cogl.Texture2DSliced.new_with_size(ctx, width, height, Cogl.TEXTURE_MAX_WASTE);
+        texture.set_components(components);
+    }
+    if (!texture.set_data(coglFormatFor(Gly, format), stride, bytes.get_data(), 0))
+        throw new Error('Failed to set texture data');
+
+    return {texture, colorState};
 }
 
 export class WallpaperTransition {
@@ -142,40 +256,75 @@ export class WallpaperTransition {
         let run = {
             commit, committed: false, actors: [], masks: [],
             timeline: null, sources: [], imageSignal: null, image: null,
+            loaded: false,
         };
         this._run = run;
 
         try {
             let file = Gio.File.new_for_path(path);
-            let image = Meta.BackgroundImageCache.get_default().load(file);
-            let start = () => {
-                if (this._run !== run)
-                    return;
-                this._start(run, file, style);
-            };
-            if (image.is_loaded()) {
-                start();
-            } else {
-                run.image = image;
-                run.imageSignal = image.connect('loaded', () => {
-                    image.disconnect(run.imageSignal);
-                    run.imageSignal = null;
-                    start();
-                });
-                // Never hold the change hostage to a slow/broken decode.
-                run.sources.push(GLib.timeout_add(GLib.PRIORITY_DEFAULT, LOAD_TIMEOUT_MS, () => {
-                    if (this._run === run)
-                        this._finish(true);
-                    return GLib.SOURCE_REMOVE;
-                }));
-            }
+            if (HAS_BACKGROUND_IMAGE_CACHE)
+                this._loadWithImageCache(run, file, style);
+            else
+                this._loadWithTexture(run, file, style);
         } catch (e) {
-            logError(e, 'NotchNux: wallpaper transition');
+            logError('wallpaper transition', e);
             this._finish(true);
         }
     }
 
-    _start(run, file, style) {
+    // GNOME 50: Mutter loads the picture itself, we only wait for it.
+    _loadWithImageCache(run, file, style) {
+        let image = Meta.BackgroundImageCache.get_default().load(file);
+        let start = () => {
+            if (this._run !== run)
+                return;
+            run.loaded = true;
+            this._start(run, file, style, null);
+        };
+        if (image.is_loaded()) {
+            start();
+        } else {
+            run.image = image;
+            run.imageSignal = image.connect('loaded', () => {
+                image.disconnect(run.imageSignal);
+                run.imageSignal = null;
+                start();
+            });
+            // Never hold the change hostage to a slow/broken decode.
+            run.sources.push(GLib.timeout_add(GLib.PRIORITY_DEFAULT, LOAD_TIMEOUT_MS, () => {
+                if (this._run === run)
+                    this._finish(true);
+                return GLib.SOURCE_REMOVE;
+            }));
+        }
+    }
+
+    // GNOME 51: we decode the picture into a texture ourselves and Mutter
+    // only ever sees textures. If that fails (no glycin, broken picture) the
+    // wallpaper is swapped without the reveal.
+    _loadWithTexture(run, file, style) {
+        run.sources.push(GLib.timeout_add(GLib.PRIORITY_DEFAULT, LOAD_TIMEOUT_MS, () => {
+            if (this._run === run && !run.loaded)
+                this._finish(true);
+            return GLib.SOURCE_REMOVE;
+        }));
+
+        loadWallpaperTexture(file).then(({texture, colorState}) => {
+            if (this._run !== run)
+                return;
+            run.loaded = true;
+            this._start(run, file, style, {texture, colorState});
+        }).catch(e => {
+            if (this._run !== run)
+                return;
+            logError('wallpaper transition', e);
+            this._finish(true);
+        });
+    }
+
+    // `loaded` carries the decoded texture (GNOME 51); on GNOME 50 it is null
+    // and the background loads the file itself.
+    _start(run, file, style, loaded) {
         let group = Main.layoutManager._backgroundGroup;
         let parent = group.get_parent();
         let bgStyle = this._bgSettings.get_enum('picture-options');
@@ -185,7 +334,10 @@ export class WallpaperTransition {
         for (let i = 0; i < Main.layoutManager.monitors.length; i++) {
             let m = Main.layoutManager.monitors[i];
             let background = new Meta.Background({ meta_display: global.display });
-            background.set_file(file, bgStyle);
+            if (loaded)
+                background.set_texture(loaded.texture, bgStyle, loaded.colorState);
+            else
+                background.set_file(file, bgStyle);
             let actor = new Meta.BackgroundActor({
                 meta_display: global.display, monitor: i,
                 x: m.x, y: m.y, width: m.width, height: m.height,
@@ -236,7 +388,7 @@ export class WallpaperTransition {
         try {
             run.commit();
         } catch (e) {
-            logError(e, 'NotchNux: wallpaper commit');
+            logError('wallpaper commit', e);
         }
     }
 

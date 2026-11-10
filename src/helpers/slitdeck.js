@@ -19,14 +19,13 @@
 // outside the deck are hidden so they never paint.
 
 import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
-import Shell from 'gi://Shell';
 import St from 'gi://St';
 
+import { makeShaderEffect } from './shadereffect.js';
 import { springTo, stopSpring } from './motion.js';
 
 export const DECK_HEIGHT = 138;
@@ -61,19 +60,12 @@ cogl_color_out *= a;
 `;
 
 const SlitMask = GObject.registerClass(
-class SlitMask extends Shell.GLSLEffect {
+class SlitMask extends makeShaderEffect('NotchNuxSlitMask', DECLS, CODE) {
     _init() {
         super._init();
-        this._loc = {};
-        for (let u of ['size', 'left', 'wid', 'skew', 'dim'])
-            this._loc[u] = this.get_uniform_location(u);
-        this.set_uniform_float(this._loc.size, 2, [ACTOR_W, DECK_HEIGHT]);
-        this.set_uniform_float(this._loc.skew, 1, [SKEW]);
         this._last = '';
-    }
-
-    vfunc_build_pipeline() {
-        this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, DECLS, CODE, false);
+        this.setUniform('size', 2, [ACTOR_W, DECK_HEIGHT]);
+        this.setUniform('skew', 1, [SKEW]);
     }
 
     set(left, wid, dim) {
@@ -82,9 +74,9 @@ class SlitMask extends Shell.GLSLEffect {
         if (key === this._last)
             return;
         this._last = key;
-        this.set_uniform_float(this._loc.left, 1, [left]);
-        this.set_uniform_float(this._loc.wid, 1, [wid]);
-        this.set_uniform_float(this._loc.dim, 1, [dim]);
+        this.setUniform('left', 1, [left]);
+        this.setUniform('wid', 1, [wid]);
+        this.setUniform('dim', 1, [dim]);
         this.queue_repaint();
     }
 });
