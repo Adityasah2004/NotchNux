@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New setting "Battery percentage on pill" (Preferences → Tabs → Features):
+  turn off the percentage text and keep only the battery icon on the
+  collapsed pill.
+
 ### Changed — extensions.gnome.org readiness
 - Clipboard history is now opt-in for new installs (Preferences → Tabs);
   the metadata description declares clipboard and network use.
