@@ -18,6 +18,8 @@ import GObject from 'gi://GObject';
 
 import { ExtensionPreferences } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+import { logError } from './src/helpers/log.js';
+
 import { ConfigStore, TAB_DEFS, FEATURE_DEFS, WALLPAPER_DEFAULTS, ENHANCE_AUTO, ENHANCE_RANGE, normalizeHex, BLUR_PRESETS, BLUR_RADIUS_RANGE, BLUR_DEFAULTS } from './src/helpers/config.js';
 
 // Same preset swatches offered by the old in-notch Appearance section.
@@ -825,7 +827,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
                     ['gnome-extensions', 'prefs', 'gsconnect@andyholmes.github.io'],
                     Gio.SubprocessFlags.NONE);
             } catch (e) {
-                logError(e, 'NotchNux: failed to open GSConnect settings');
+                logError('failed to open GSConnect settings', e);
             }
         });
         group.add(manageRow);
@@ -843,7 +845,7 @@ export default class NotchNuxPreferences extends ExtensionPreferences {
             try {
                 Gio.Subprocess.new(['gnome-control-center', ...args], Gio.SubprocessFlags.NONE);
             } catch (e) {
-                logError(e, 'NotchNux: failed to open GNOME Settings');
+                logError('failed to open GNOME Settings', e);
             }
         };
 

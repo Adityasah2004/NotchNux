@@ -12,7 +12,6 @@
 // friendly display names plus the underlying device node.
 
 import Gst from 'gi://Gst';
-import GstApp from 'gi://GstApp';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import { logError, logDebug } from './log.js';
