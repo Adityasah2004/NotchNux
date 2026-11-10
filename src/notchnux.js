@@ -4312,6 +4312,9 @@ export const NotchNux = GObject.registerClass({
             case 'showBattery':
                 this._updateClock();
                 break;
+            case 'pillBatteryPercent':
+                this._updateClock();
+                break;
             case 'showPrivacy':
                 this._system.setPrivacyPolling(on);
                 this._updatePrivacyIndicators();
@@ -6505,6 +6508,9 @@ export const NotchNux = GObject.registerClass({
         if (bat.isCharging) iconName = 'battery-caution-charging-symbolic';
         else if (bat.percentage <= 20) iconName = 'battery-caution-symbolic';
         this._pillBatteryIcon.icon_name = iconName;
+        // The percentage is optional: the icon alone still tells you the state.
+        // A hidden label measures 0 px, so the pill just gets narrower.
+        this._pillBatteryLabel.visible = this._config.isFeatureEnabled('pillBatteryPercent');
         this._pillBatteryLabel.set_text(`${Math.round(bat.percentage)}%`);
 
         // The clock string ("16 Thu · 3:09 PM") and battery % ("9%"→"100%") both

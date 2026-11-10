@@ -161,6 +161,7 @@ export function blurPreset(id) {
 // is used when the config file has no opinion yet.
 export const FEATURE_DEFS = [
     { id: 'showBattery',       label: 'Battery on pill',      description: 'Show the battery indicator on the collapsed pill.',        default: true },
+    { id: 'pillBatteryPercent', label: 'Battery percentage on pill', description: 'Show the battery percentage next to the battery icon on the collapsed pill.', default: true },
     { id: 'showPrivacy',       label: 'Privacy indicators',   description: 'Show mic/camera in-use dots on the collapsed pill.',        default: true },
     { id: 'pillMarquee',       label: 'Scrolling track title', description: 'Scroll long track titles across the pill while playing.',  default: true },
     { id: 'weatherAutoRefresh', label: 'Auto-refresh weather', description: 'Periodically refresh weather in the background.',           default: true },
